@@ -424,6 +424,9 @@ fn run_reader(
     // The CLI's own classification of a failed request, which it puts on the synthetic
     // `assistant` event and not on `result` — the only place an unknown `--model` is named.
     let mut api_error: Option<String> = None;
+    // Set at the budget, applied only after `wait`. Publishing `Continue` earlier lets the
+    // scheduler reuse the worktree while this process is still in it.
+    let mut budget_hit = false;
 
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
@@ -431,6 +434,9 @@ fn run_reader(
         // one someone will want to look at later, and so is the whitespace it arrived with.
         if let Some(t) = transcript.as_mut() {
             t.write_line(&raw);
+        }
+        if budget_hit {
+            continue;
         }
 
         let line = raw.trim();
@@ -475,15 +481,11 @@ fn run_reader(
                 drop(g);
 
                 if max_turns_per_session > 0 && turns >= max_turns_per_session {
-                    let mut g = state.0.lock().unwrap();
-                    g.outcome =
-                        Some(Outcome::Continue { why: "session turn budget reached".into() });
-                    drop(g);
-                    // SIGTERM only: this is this module's own budget, not a failure, and the
-                    // caller (the scheduler) still owns the decision to hard-kill on a grace
-                    // timeout via `RunHandle::kill`.
+                    // Do not publish `Continue` yet, and do not stop reading. The verdict
+                    // waits until the child is reaped; the bytes after this turn are discarded
+                    // below so a late `result` cannot invent a token total and the pipe cannot fill.
+                    budget_hit = true;
                     let _ = kill(Pid::from_raw(-pid), Signal::SIGTERM);
-                    break;
                 }
             }
             Some("rate_limit_event") => {
@@ -532,7 +534,9 @@ fn run_reader(
     }
 
     let mut g = state.0.lock().unwrap();
-    if g.outcome.is_none() {
+    if budget_hit {
+        g.outcome = Some(Outcome::Continue { why: "session turn budget reached".into() });
+    } else if g.outcome.is_none() {
         let msg = if !saw_any_line {
             "process produced no output before exiting".to_string()
         } else if !saw_valid_line {
@@ -1141,6 +1145,19 @@ mod tests {
         // is the common way a run ends without one; it must read as unknown, not as zero.
         assert_eq!(h.progress().tokens, None);
 
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_budget_cut_drains_the_rest_of_stdout_and_reports_continue_only_when_the_child_is_gone() {
+        let ws = tmp_workspace("flood");
+        let w = ClaudeWorker::new(fixture("budget_then_flood.sh"), vec!["PATH".into()], 1);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+        assert_eq!(
+            wait_for_finish(&h),
+            Outcome::Continue { why: "session turn budget reached".into() }
+        );
+        assert_eq!(h.progress().tokens, None);
         std::fs::remove_dir_all(&ws).ok();
     }
 

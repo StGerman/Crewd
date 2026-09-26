@@ -342,11 +342,20 @@ fn run_reader(
     let mut saw_valid_line = false;
     let mut text = String::new();
     let mut model_error: Option<String> = None;
+    // Set at the budget, applied only after `wait`. Publishing `Continue` earlier lets the
+    // scheduler reuse the worktree while this process is still in it.
+    let mut budget_hit = false;
 
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
         if let Some(t) = transcript.as_mut() {
             t.write_line(&raw);
+        }
+        // Past the budget the rest of the stream is discarded, not left unread. Parsing it
+        // would let a late `end` invent a token total; dropping the read end fills the pipe
+        // and the child blocks.
+        if budget_hit {
+            continue;
         }
         let line = raw.trim();
         if line.is_empty() {
@@ -379,10 +388,8 @@ fn run_reader(
                 g.progress.turns = turns;
                 drop(g);
                 if max_turns_per_session > 0 && turns >= max_turns_per_session {
-                    state.0.lock().outcome =
-                        Some(Outcome::Continue { why: "session turn budget reached".into() });
+                    budget_hit = true;
                     let _ = kill(Pid::from_raw(-pid), Signal::SIGTERM);
-                    break;
                 }
             }
             Some("error") => {
@@ -432,7 +439,9 @@ fn run_reader(
         );
     }
     let mut g = state.0.lock();
-    if g.outcome.is_none() {
+    if budget_hit {
+        g.outcome = Some(Outcome::Continue { why: "session turn budget reached".into() });
+    } else if g.outcome.is_none() {
         let msg = if !saw_any_line {
             "process produced no output before exiting".to_string()
         } else if !saw_valid_line {
@@ -599,6 +608,20 @@ mod tests {
             wait_for_finish(&h),
             Outcome::Continue { why: "session turn budget reached".into() }
         );
+        assert_eq!(h.progress().tokens, None);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_budget_cut_drains_the_rest_of_stdout_and_reports_continue_only_when_the_child_is_gone() {
+        let ws = tmp_workspace("flood");
+        let w = GrokWorker::new(fixture("budget_then_flood.sh"), vec!["PATH".into()], 1);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
+        assert_eq!(
+            wait_for_finish(&h),
+            Outcome::Continue { why: "session turn budget reached".into() }
+        );
+        // The script's trailing `end` says 99/99. Parsing it would invent a total.
         assert_eq!(h.progress().tokens, None);
         std::fs::remove_dir_all(&ws).ok();
     }

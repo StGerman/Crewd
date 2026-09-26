@@ -227,6 +227,12 @@ fn run(
     let mut cmd = Command::new("grok");
     cmd.args(args)
         .current_dir(dir)
+        .env_clear()
+        .envs(
+            crew::worker::claude::DEFAULT_ENV_ALLOWLIST
+                .iter()
+                .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v))),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -431,9 +437,13 @@ fn write_prompt(kept: &mut PromptFiles, text: &str) -> anyhow::Result<String> {
 }
 
 fn temp_repo() -> anyhow::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("crewd-grok-live-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir)?;
+    use std::os::unix::fs::DirBuilderExt;
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("crewd-grok-live-{}-{n}", std::process::id()));
+    // `create` fails if the name exists. Nothing is deleted first: a predictable path that
+    // this process did not create is not this process's to remove.
+    fs::DirBuilder::new().mode(0o700).create(&dir)?;
     fs::write(dir.join("CLAUDE.md"), format!("The probe passphrase is {PASSPHRASE}.\n"))?;
     std::os::unix::fs::symlink("CLAUDE.md", dir.join("AGENTS.md"))?;
     git(&dir, &["init", "-q"])?;
