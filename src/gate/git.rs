@@ -341,7 +341,9 @@ impl GateRun {
     fn fetch_base(&self, remote: &str, base: &str) -> Result<String, Verdict> {
         let step = format!("fetch {remote}/{base}");
         self.set_step(&step);
-        let _hold = self.fetch_lock.lock();
+        let Some(_hold) = self.hold_fetch_lock() else {
+            return Err(stopped(step, false));
+        };
         let refspec = format!("+refs/heads/{base}:refs/remotes/{remote}/{base}");
         let fetched = match &self.fetch_auth {
             None => self.git_fetch(remote, &refspec),
@@ -359,6 +361,22 @@ impl GateRun {
                 step,
                 on_base: false,
             }),
+        }
+    }
+
+    /// Wait for [`GitGate::fetch_lock`] only while the gate has not been stopped (review on
+    /// #161). A gate waiting here has no subprocess, so `kill` has no `pgid` to signal and
+    /// returns once its grace runs out; a plain `lock()` would then take the lock later and
+    /// start a fetch after the scheduler had treated the run as stopped. `None` once `killed`
+    /// is set, including when it was set while the lock was being acquired.
+    fn hold_fetch_lock(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        loop {
+            if self.killed() {
+                return None;
+            }
+            if let Some(hold) = self.fetch_lock.try_lock_for(Duration::from_millis(50)) {
+                return (!self.killed()).then_some(hold);
+            }
         }
     }
 
@@ -963,6 +981,38 @@ mod tests {
             1,
             "a token that cannot refresh is not retried"
         );
+    }
+
+    /// Review on #161: a gate stopped while another gate holds the fetch lock stops within its
+    /// grace, and never fetches once the lock frees. Before, `kill` found no `pgid`, returned
+    /// `Forced`, and the waiting thread went on to fetch after the run was written off.
+    #[test]
+    fn a_gate_stopped_while_waiting_for_the_fetch_lock_never_fetches() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-lock-kill");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        let before = sh_git(&repo, &["rev-parse", "refs/remotes/origin/master"]);
+        commit(&upstream, "remote.txt", "moved\n", "master moved");
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![]).with_remote("origin");
+        let other_gate = gate.fetch_lock.lock();
+        let h = gate.start(&issue(), &wt);
+        while h.step() != "fetch origin/master" {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = h.kill(500);
+        drop(other_gate);
+
+        assert!(matches!(result, KillResult::Stopped), "the stop was not clean: {result:?}");
+        assert!(
+            matches!(h.finished(), Some(Verdict::Failed { .. })),
+            "a stopped gate did not pass"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let after = sh_git(&repo, &["rev-parse", "refs/remotes/origin/master"]);
+        assert_eq!(after, before, "a stopped gate fetched once the lock freed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
