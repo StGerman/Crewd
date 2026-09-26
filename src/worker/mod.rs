@@ -163,8 +163,9 @@ pub trait RunHandle: Send + Sync {
         Vec::new()
     }
     /// Set once the run's stream reported a rejected, account-wide rate limit. Defaulted to
-    /// `None` rather than required alongside `finished()`: only [`crate::worker::claude`] ever
-    /// sees this on the wire, and every other implementation is correct reporting nothing.
+    /// `None` rather than required alongside `finished()`: only [`crate::worker::claude`] has
+    /// shown this event. The grok 1.0.41 probe did not emit one, so [`crate::worker::grok`]
+    /// is correct reporting nothing until a rejection is recorded.
     fn rate_limit(&self) -> Option<RateLimitSignal> {
         None
     }

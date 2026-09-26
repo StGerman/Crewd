@@ -125,9 +125,7 @@ this scope; a literal per-issue quarantine here would be quarantining tickets a 
 nothing to do with.
 
 `Worker` gets its real implementation in [src/worker/claude.rs](../src/worker/claude.rs):
-`ClaudeWorker`, over `claude -p --output-format stream-json`. [src/worker/grok.rs](../src/worker/grok.rs)
-is the same contract over `grok --output-format streaming-json` (#120), checked against `grok 1.0.41`:
-a turn is a `usage` event, totals come only from `end`, and a Grok run is spawned with no broker tools. Two things there were confirmed
+`ClaudeWorker`, over `claude -p --output-format stream-json`. Two things there were confirmed
 against a real install rather than assumed, because guessing wrong would have meant a worker
 that silently never worked: there is no `--max-turns` flag, so the per-session turn budget is
 self-enforced — the reader thread counts `assistant` events and sends `SIGTERM` once the count
@@ -139,7 +137,10 @@ not inherited that way: `worker.model` and `worker.effort` become `--model` and 
 every attempt, a resumed one included, and each run row records what it was given (#36). Both
 unset passes neither flag, which is the old behaviour exactly; `crew.github.toml` pins them.
 `--fallback-model` is deliberately never passed — it would make the recorded model possibly
-wrong. `Outcome`
+wrong. [src/worker/grok.rs](../src/worker/grok.rs) is the same contract over
+`grok --output-format streaming-json` (#120), checked against `grok 1.0.41`: a turn is a
+`usage` event, not an `assistant` event, totals come only from `end`, and a Grok run is
+spawned with no broker tools. `Outcome`
 beyond done/failed — `Continue`, `Blocked` — has no structural signal from the CLI to key off,
 so the worker's prompt asks the agent to end its final message with `CREW_OUTCOME:
 continue: <reason>` or `CREW_OUTCOME: blocked: <reason>`; the module doc has the reasoning,

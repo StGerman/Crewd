@@ -27,7 +27,7 @@
 //!   (`grok-4.7`); `end.modelUsage` named `grok-4.7-build` for that same run.
 
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +102,10 @@ impl RunHandle for GrokRun {
         self.state.0.lock().verdicts.clone()
     }
 
+    // No `rate_limit` field. grok 1.0.41 did not emit a rejection, and the trait default is
+    // the report for a worker that has not shown one. A Claude-shaped parser here would be a
+    // guess.
+
     fn kill(&self, grace_ms: u64) -> super::KillResult {
         let already_finished = self.state.0.lock().outcome.is_some();
         if self.state.0.lock().reaped {
@@ -164,17 +168,15 @@ impl Worker for GrokWorker {
             Session::Resume(_) => "--resume",
         };
 
-        let prompt_path = std::env::temp_dir().join(format!(
-            "crewd-grok-{}-{}",
-            std::process::id(),
-            session.id()
-        ));
-        if let Err(e) = std::fs::write(&prompt_path, &prompt) {
-            return finished(Outcome::Failed {
-                class: ErrorClass::AgentCrash,
-                msg: format!("writing the prompt: {e}"),
-            });
-        }
+        let prompt_path = match write_prompt_file(&prompt) {
+            Ok(path) => path,
+            Err(e) => {
+                return finished(Outcome::Failed {
+                    class: ErrorClass::AgentCrash,
+                    msg: format!("writing the prompt: {e}"),
+                });
+            }
+        };
 
         let mut cmd = Command::new(&self.bin);
         cmd.current_dir(workspace)
@@ -233,7 +235,7 @@ impl Worker for GrokWorker {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let _ = std::fs::remove_file(&prompt_path);
+                remove_prompt(&prompt_path);
                 if let Some(t) = transcript.as_mut() {
                     t.write_line(
                         &serde_json::json!({
@@ -263,6 +265,52 @@ impl Worker for GrokWorker {
             });
         }
         Arc::new(GrokRun { state, pid, sent_term: AtomicBool::new(false) })
+    }
+}
+
+/// A private file for the prompt. `create_new` refuses a path that already exists, symlink
+/// included, and the mode is set at creation so the umask cannot widen it. The directory is
+/// `0700` and named with a counter, the same shape as the push-credential file.
+fn write_prompt_file(contents: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("crewd-grok-{}-{n}", std::process::id()));
+    let mut dirs = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dirs.mode(0o700);
+    }
+    dirs.create(&dir)?;
+    let path = dir.join("prompt");
+    let mut file = create_private_file(&path).inspect_err(|_| {
+        let _ = std::fs::remove_dir(&dir);
+    })?;
+    if let Err(e) = file.write_all(contents.as_bytes()) {
+        remove_prompt(&path);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+fn remove_prompt(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
     }
 }
 
@@ -364,7 +412,7 @@ fn run_reader(
 
     let status = child.wait();
     let stderr_tail = stderr_thread.join().unwrap_or_default();
-    let _ = std::fs::remove_file(&prompt_path);
+    remove_prompt(&prompt_path);
     if let Some(t) = transcript.as_mut() {
         let exit = match &status {
             Ok(s) => s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
@@ -631,5 +679,30 @@ mod tests {
         std::fs::remove_dir_all(&ws).ok();
         std::fs::remove_dir_all(&ws2).ok();
         std::fs::remove_dir_all(&ws3).ok();
+    }
+
+    /// `fs::write` follows a symlink already at the path and creates the file at the umask.
+    /// The prompt holds the issue body, so neither is acceptable.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_file_is_private_and_does_not_follow_a_planted_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tmp_workspace("prompt-priv");
+        let path = dir.join("prompt");
+        let mut file = create_private_file(&path).unwrap();
+        use std::io::Write;
+        file.write_all(b"secret").unwrap();
+        drop(file);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the prompt must not be group- or world-readable");
+
+        std::fs::remove_file(&path).unwrap();
+        let stolen = dir.join("stolen");
+        std::fs::write(&stolen, b"original").unwrap();
+        symlink(&stolen, &path).unwrap();
+        assert!(create_private_file(&path).is_err(), "create_new must refuse the symlink");
+        assert_eq!(std::fs::read(&stolen).unwrap(), b"original");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
