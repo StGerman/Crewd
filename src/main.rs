@@ -140,12 +140,12 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
+    // The repository's canonical HTTPS URL, not the remote's: a `pushurl` or an SSH alias there
+    // would send the push out on the operator's key (#64). The gate fetches its base from it too.
+    let app_url = format!("https://github.com/{}/{}.git", cfg.tracker.owner, cfg.tracker.repo);
     let mut workspace = GitWorktreeWorkspace::new(&ws_root, &repo)?;
     if let Some(app) = &app {
-        // The repository's canonical HTTPS URL, not the remote's: a `pushurl` or an SSH alias
-        // there would send the push out on the operator's key (#64).
-        let url = format!("https://github.com/{}/{}.git", cfg.tracker.owner, cfg.tracker.repo);
-        workspace = workspace.with_push_credentials(app.clone(), url);
+        workspace = workspace.with_push_credentials(app.clone(), app_url.clone());
     }
     let workspace = Arc::new(workspace);
 
@@ -295,11 +295,20 @@ async fn main() -> anyhow::Result<()> {
     let gate: Option<Arc<dyn Gate>> = if cfg.gate.enabled {
         let repo = repo.canonicalize().with_context(|| format!("resolving {}", repo.display()))?;
         tracing::info!(
-            base = cfg.gate.base.as_deref().unwrap_or("HEAD"),
+            base = cfg.gate_base().as_deref().unwrap_or("HEAD"),
             commands = cfg.gate.commands.len(),
             "handoff gate on: done runs are rebased and re-gated before release"
         );
-        Some(Arc::new(GitGate::new(repo, cfg.gate.base.clone(), cfg.gate.commands.clone())))
+        let mut gate = GitGate::new(repo, cfg.gate_base(), cfg.gate.commands.clone());
+        // With delivery on, the base is the remote's: the one the pull request merges into. It
+        // is fetched as the push is made, so a host with no ambient credential can do both.
+        if cfg.delivery.enabled {
+            gate = gate.with_remote(cfg.delivery.remote.clone());
+            if let Some(app) = &app {
+                gate = gate.with_fetch_credentials(app.clone(), app_url.clone());
+            }
+        }
+        Some(Arc::new(gate))
     } else {
         tracing::warn!("handoff gate off: done runs are released as the agent left them");
         None

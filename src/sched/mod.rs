@@ -789,7 +789,8 @@ impl Scheduler {
         verdict: Verdict,
     ) -> anyhow::Result<Outcome> {
         let identifier = r.issue.identifier.as_str();
-        let base = self.cfg.gate.base.as_deref();
+        let base = self.cfg.gate_base();
+        let base = base.as_deref();
         Ok(match verdict {
             Verdict::NoCommits => {
                 tracing::info!(

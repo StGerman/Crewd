@@ -120,7 +120,7 @@ max_bytes_per_run = 8388608
 keep_runs = 50
 
 # The handoff gate (src/gate/). Before a `Done` is believed, the run's branch is rebased onto
-# `base` and these commands run in its worktree, in order, exec'd directly — each entry is an
+# `base` — fetched from `delivery.remote` first, never the local copy — and these commands run in its worktree, in order, exec'd directly — each entry is an
 # argv, not a shell line. A conflict parks the issue blocked, naming the paths; a failing
 # command sends its output back to the agent as a continuation; `max_failures` consecutive
 # failures park it blocked instead, so the gate cannot become a runaway of its own. The three

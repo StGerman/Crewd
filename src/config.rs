@@ -131,8 +131,11 @@ pub struct Config {
 pub struct GateConfig {
     #[serde(default = "d_gate_enabled")]
     pub enabled: bool,
-    /// The ref a finished branch is rebased onto, resolved in `workspace.repo`. Unset means that
-    /// repository's current HEAD — the same commit worktrees are branched from, only now.
+    /// The ref a finished branch is rebased onto, resolved in `workspace.repo`. With delivery on
+    /// it is fetched from `delivery.remote` first and `<remote>/<base>` is used, since the local
+    /// branch lags until someone pulls (#134). Unset means `delivery.base` with delivery on (see
+    /// [`Config::gate_base`]) and otherwise that repository's current HEAD — the same commit
+    /// worktrees are branched from, only now.
     #[serde(default)]
     pub base: Option<String>,
     /// Each command is an argv, exec'd directly in the worktree with no shell: `["cargo",
@@ -537,6 +540,14 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// The ref the gate rebases onto: `gate.base`, or with delivery on and no `gate.base`,
+    /// `delivery.base`. The daemon checkout's `HEAD` is only the answer when nothing will be
+    /// merged anywhere; with delivery on it may be any branch the operator has checked out,
+    /// and the pull request targets `delivery.base` whatever it is (#134).
+    pub fn gate_base(&self) -> Option<String> {
+        self.gate.base.clone().or_else(|| self.delivery.enabled.then(|| self.delivery.base.clone()))
+    }
+
     /// Parse and preflight a config, then check the host has what `tracker.github_app` names.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let cfg = Self::parse(path)?;
@@ -879,6 +890,20 @@ mod tests {
         c.tracker.dispatch_label = Some("  ".into());
         c.normalize();
         assert_eq!(c.tracker.dispatch_label, None, "blank is unset, not a label nothing carries");
+    }
+
+    /// Review on #161: with delivery on and `gate.base` unset, the gate rebased onto whatever
+    /// the daemon's checkout had checked out while the pull request targeted `delivery.base`.
+    #[test]
+    fn with_delivery_on_an_unset_gate_base_is_the_base_pull_requests_target() {
+        let mut c = base();
+        c.gate.base = None;
+        assert_eq!(c.gate_base(), None, "delivery off: the checkout's HEAD, as before");
+        c.delivery.enabled = true;
+        c.delivery.base = "main".into();
+        assert_eq!(c.gate_base().as_deref(), Some("main"));
+        c.gate.base = Some("release".into());
+        assert_eq!(c.gate_base().as_deref(), Some("release"), "an explicit base still wins");
     }
 
     #[test]
