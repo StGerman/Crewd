@@ -409,6 +409,9 @@ summary has no thread. A red CI or
 an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
 due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 `Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".
+A pull request the provider reports unable to merge is not waited on at all, since GitHub runs no
+CI on it: delivery charges a round and re-gates the branch as if its `Done` were new, so the
+gate's rebase and its conflict rule decide what follows (#159).
 The handoff gate's failing output travels the same way, as `Feedback::Gate`: `launch` builds one
 `Feedback` from delivery's structured row when there is one and from the retry reason otherwise,
 so `Worker::spawn` has a single parameter for the question and `feedback_help` in the worker is

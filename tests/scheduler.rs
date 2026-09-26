@@ -2832,6 +2832,100 @@ fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_
     assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
 }
 
+/// A delivery harness with a gate that passes in a second, and CI that never reports, so any
+/// CI wait delivery starts is visible on the row.
+fn gated_delivery_harness() -> (Harness, Arc<FakeForge>, Arc<FakeGate>) {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    forge.set_ci_default(None);
+    (h, forge, gate)
+}
+
+/// #159: GitHub runs no CI on a pull request that cannot merge, so waiting for it ended at the
+/// CI timeout with "CI reported nothing". The conflict is the gate's to answer, at once, for one
+/// round, and a re-gate that passes is delivered again without an agent turn being spent.
+#[test]
+fn a_pull_request_the_provider_reports_conflicting_is_re_gated_rather_than_awaiting_ci() {
+    let (mut h, forge, gate) = gated_delivery_harness();
+    forge.set_mergeable_default(Some(false));
+
+    // Dispatch, the agent's `Done` goes to the gate, the gate passes and delivery opens a pull
+    // request the provider says cannot merge.
+    run_once(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(gate.starts_for("iss-1").len(), 2, "the conflicting branch is gated again");
+    assert_eq!(h.sched.gating_count(), 1);
+    assert_eq!(d.stage, crew::store::DeliveryStage::Redispatched);
+    assert_eq!((d.rounds_pr, d.rounds_issue), (1, 1), "one delivery round, charged once");
+    assert_eq!(d.ci_pending, None, "no CI wait starts on a pull request that cannot merge");
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Running);
+
+    // The re-gate passes: the rebased branch is pushed to the same pull request, and only now
+    // is CI waited on — for the new head.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Awaiting);
+    assert_eq!(d.ci_pending.map(|(head, _)| head), Some(FakeForge::head_after_publish(2)));
+    assert_eq!(forge.open_prs().len(), 1, "the same pull request, updated");
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 1, "no agent run was spent on it");
+    assert_eq!(d.rounds_issue, 1);
+}
+
+/// #159: `mergeable: null` is the provider still computing after a push, not a conflict.
+#[test]
+fn a_pull_request_whose_mergeability_is_unknown_keeps_waiting() {
+    let (mut h, forge, gate) = gated_delivery_harness();
+    forge.set_mergeable_default(None);
+
+    run_once(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let reads = forge.pr_reads();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert!(forge.pr_reads() > reads, "asked again on the next poll");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Awaiting, "still waiting on CI");
+    assert!(d.ci_pending.is_some(), "the CI wait runs as for any mergeable pull request");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (0, 0));
+    assert_eq!(gate.starts_for("iss-1").len(), 1, "not re-gated");
+    assert_eq!(h.sched.gating_count() + h.sched.running_count(), 0);
+}
+
+/// With no gate to re-run, the conflict goes to the agent as a round of its own rather than
+/// waiting on CI that will not come.
+#[test]
+fn a_conflicting_pull_request_with_no_gate_is_handed_back_to_the_agent() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci_default(None);
+    forge.set_mergeable_default(Some(false));
+
+    run_once(&mut h);
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Redispatched);
+    assert_eq!(d.ci_pending, None);
+    assert!(
+        matches!(&h.worker.feedback_for("iss-1")[1], Some(Feedback::Gate { output }) if output.contains("cannot merge")),
+        "{:?}",
+        h.worker.feedback_for("iss-1")
+    );
+}
+
 const HOUR_MS: u64 = 60 * 60 * 1_000;
 
 fn copilot_running() -> CiStatus {

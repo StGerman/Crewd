@@ -43,15 +43,17 @@
 //! the request-then-read runs again before the pull request can read as ready (#47).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::Scheduler;
 use super::review_summary::{summary_findings, verdict_comment};
+use super::{Gating, Running, Scheduler};
 use crate::clock::{Mono, Wall};
 use crate::forge::{
     CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, summary_review_id,
 };
-use crate::model::{Feedback, ReviewVerdict, Verdict};
+use crate::model::{Feedback, Outcome, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
+use crate::worker::{KillResult, Progress, RunHandle};
 
 pub use libcrew::DeliveryView;
 use libcrew::fmt::{fmt_ms, timestamp};
@@ -68,6 +70,23 @@ impl From<&DeliveryRecord> for DeliveryView {
             review_error: d.review_error.clone(),
             handoff_reason: d.handoff_reason.clone(),
         }
+    }
+}
+
+/// The run a re-gate stands in for. Its agent said `Done` before the branch was delivered, and
+/// the gate is what turns that into a verdict again; there is no process, no turn and no run row
+/// of its own, so `finish_run` on its id touches nothing and it adds no turns.
+struct Regated;
+
+impl RunHandle for Regated {
+    fn progress(&self) -> Progress {
+        Progress::default()
+    }
+    fn finished(&self) -> Option<Outcome> {
+        Some(Outcome::Done)
+    }
+    fn kill(&self, _grace_ms: u64) -> KillResult {
+        KillResult::AlreadyDone
     }
 }
 
@@ -395,6 +414,13 @@ impl Scheduler {
 
         self.resolve_settled_threads(issue_id, number)?;
 
+        // GitHub runs no CI on a pull request that cannot merge, so a CI wait here could only
+        // end at the timeout with a reason that is false (#159). Ahead of the review request
+        // too: the re-gate rebases, and a reviewer asked now would be asked about a stale head.
+        if pr.mergeable == Some(false) {
+            return self.regate(issue_id, st, &d, &pr);
+        }
+
         if !d.review_requested && !self.cfg.delivery.reviewers.is_empty() {
             for r in &self.cfg.delivery.reviewers {
                 forge.request_review(number, r)?;
@@ -570,14 +596,7 @@ impl Scheduler {
         handed_comments: Option<Vec<String>>,
         what: &str,
     ) -> Result<(), StepError> {
-        let cfg = &self.cfg.delivery;
-        if d.rounds_pr >= cfg.max_rounds_per_pr || d.rounds_issue >= cfg.max_rounds_per_issue {
-            let reason = format!(
-                "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
-                d.rounds_pr, d.rounds_issue
-            );
-            tracing::warn!(issue_id, pr = ?d.pr_number, "{reason}; handing off");
-            self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+        if self.rounds_spent(issue_id, d, what)? {
             return Ok(());
         }
         let json = serde_json::to_string(&feedback)?;
@@ -585,7 +604,7 @@ impl Scheduler {
         let (rp, ri) = self.store.open_delivery_round(
             self.clock.as_ref(),
             issue_id,
-            &json,
+            Some(&json),
             handed.as_deref(),
         )?;
         // The same path a `Continue` takes: unparked, a retry due now, the session resumed.
@@ -603,6 +622,94 @@ impl Scheduler {
             issue_id, pr = ?d.pr_number, kind = feedback.label(), rounds_pr = rp, rounds_issue = ri,
             "handing back to an agent: {what}"
         );
+        Ok(())
+    }
+
+    /// Whether either round bound is reached, handing the pull request to the operator if so.
+    fn rounds_spent(
+        &mut self,
+        issue_id: &str,
+        d: &DeliveryRecord,
+        what: &str,
+    ) -> Result<bool, StepError> {
+        let cfg = &self.cfg.delivery;
+        if d.rounds_pr < cfg.max_rounds_per_pr && d.rounds_issue < cfg.max_rounds_per_issue {
+            return Ok(false);
+        }
+        let reason = format!(
+            "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
+            d.rounds_pr, d.rounds_issue
+        );
+        tracing::warn!(issue_id, pr = ?d.pr_number, "{reason}; handing off");
+        self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+        Ok(true)
+    }
+
+    /// The pull request cannot merge into its base: send the branch back through the gate as if
+    /// the run's `Done` were re-gated (#159), so the gate's rebase decides what happens next —
+    /// a pass is delivered again, a conflict goes to the agent or a human by #111's rule, and a
+    /// branch that already merged the base is not rebased (#122). One round, like any
+    /// hand-back, so a base that keeps moving is bounded by the same `max_rounds_*`.
+    ///
+    /// The re-gate claims the issue and holds a slot, as every gate does; with none free it
+    /// waits for the next poll uncharged. With no gate at all the agent is told instead.
+    fn regate(
+        &mut self,
+        issue_id: &str,
+        st: &IssueState,
+        d: &DeliveryRecord,
+        pr: &PullRequest,
+    ) -> Result<(), StepError> {
+        let what = format!("pull request #{} cannot merge into {}", pr.number, pr.base);
+        let Some(gate) = self.gate.clone() else {
+            let output = format!(
+                "{what}: the base moved under it and the two conflict. Merge or rebase onto {} \
+                 and finish again.",
+                pr.base
+            );
+            return self.open_round(issue_id, d, Feedback::Gate { output }, None, &what);
+        };
+        let Some(issue) = self.seen.get(issue_id).cloned() else {
+            tracing::debug!(issue_id, "{what}; issue not seen yet, re-gating next poll");
+            return Ok(());
+        };
+        let reserved = self.reservations().map_err(StepError::Other)?;
+        if self.global_slots(&reserved) == 0 || self.state_slots(&issue.state_key(), &reserved) == 0
+        {
+            tracing::debug!(issue_id, "{what}; no slot to gate in, re-gating next poll");
+            return Ok(());
+        }
+        if self.rounds_spent(issue_id, d, &what)? {
+            return Ok(());
+        }
+        let (rp, ri) = self.store.open_delivery_round(self.clock.as_ref(), issue_id, None, None)?;
+        self.store.unpark(self.clock.as_ref(), issue_id)?;
+        if !self.store.claim(self.clock.as_ref(), issue_id)? {
+            return Err(StepError::Other(anyhow::anyhow!(
+                "{issue_id}: released issue refused a claim"
+            )));
+        }
+        let workspace = self.workspace.path_for(issue_id, &st.identifier);
+        let handle = gate.start(&issue, &workspace);
+        let now = self.clock.mono();
+        tracing::info!(
+            issue_id, pr = pr.number, rounds_pr = rp, rounds_issue = ri,
+            workspace = %workspace.display(), "{what}; re-gating instead of awaiting CI"
+        );
+        let run = Running {
+            run_id: format!("{issue_id}-regate-{}", self.clock.wall().0),
+            state_at_start: issue.state.clone(),
+            issue,
+            handle: Arc::new(Regated),
+            started: now,
+            workspace,
+            transcript: None,
+            last_progress: Progress::default(),
+            last_progress_at: now,
+            verdicts: Vec::new(),
+            _broker: None,
+        };
+        self.gating.insert(issue_id.to_string(), Gating { run, handle, started: now });
         Ok(())
     }
 

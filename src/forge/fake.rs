@@ -96,6 +96,8 @@ struct Inner {
     /// reads alone, and a test has to see that it is polled at all.
     pr_reads: u32,
     stacked_on: Option<String>,
+    /// What a newly opened pull request reports as `mergeable`.
+    mergeable: Option<bool>,
 }
 
 pub struct FakeForge {
@@ -115,6 +117,7 @@ impl FakeForge {
                 next_number: 100,
                 ci_default: Some(CiStatus::Success),
                 attach_reviewers: true,
+                mergeable: Some(true),
                 commits: vec!["do the work".into()],
                 ..Default::default()
             }),
@@ -259,6 +262,18 @@ impl FakeForge {
         }
     }
 
+    /// What every pull request opened from now on reports as `mergeable`.
+    pub fn set_mergeable_default(&self, mergeable: Option<bool>) {
+        self.inner.lock().unwrap().mergeable = mergeable;
+    }
+
+    /// The base moves under an open pull request, or the provider finishes computing.
+    pub fn set_mergeable(&self, number: u64, mergeable: Option<bool>) {
+        if let Some(rec) = self.inner.lock().unwrap().prs.get_mut(&number) {
+            rec.pr.mergeable = mergeable;
+        }
+    }
+
     /// The operator closes or merges it outside the orchestrator.
     pub fn set_state(&self, number: u64, state: PrState) {
         if let Some(rec) = self.inner.lock().unwrap().prs.get_mut(&number) {
@@ -311,10 +326,12 @@ impl Publisher for FakeForge {
         g.published.insert(branch.to_string());
         g.publishes += 1;
         let head_sha = Self::head_after_publish(g.publishes);
-        // The pull request open for this branch moves with the push, as the real one does.
+        // The pull request open for this branch moves with the push, as the real one does. A
+        // push is the gate's rebased branch, so it merges again.
         for rec in g.prs.values_mut() {
             if rec.spec.head == branch && rec.pr.state == PrState::Open {
                 rec.pr.head_sha = head_sha.clone();
+                rec.pr.mergeable = Some(true);
             }
         }
         Ok(Published { head_sha, commits: g.commits.clone() })
@@ -389,6 +406,7 @@ impl Forge for FakeForge {
             base: spec.base.clone(),
             state: PrState::Open,
             requested_reviewers: vec![],
+            mergeable: g.mergeable,
         };
         g.prs.insert(
             number,

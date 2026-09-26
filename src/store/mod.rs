@@ -1498,13 +1498,14 @@ impl Store {
     }
 
     /// Hand the issue back to an agent with `feedback_json`, charging one round against both
-    /// bounds. Returns the counts *after* charging, so the caller compares them to the limits
+    /// bounds. `None` for a round the gate answers rather than delivery (#159), whose brief
+    /// travels on the retry reason and must not be outranked by a delivery row. Returns the counts *after* charging, so the caller compares them to the limits
     /// it holds — the store does not know the limits, and should not: they are config.
     pub fn open_delivery_round(
         &self,
         clock: &dyn Clock,
         issue_id: &str,
-        feedback_json: &str,
+        feedback_json: Option<&str>,
         handed_comments_json: Option<&str>,
     ) -> rusqlite::Result<(u32, u32)> {
         let conn = self.conn.lock().unwrap();
@@ -1702,8 +1703,8 @@ mod delivery_tests {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
         s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
-        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}", None).unwrap(), (1, 1));
-        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}", None).unwrap(), (2, 2));
+        assert_eq!(s.open_delivery_round(&c, "iss-1", Some("{}"), None).unwrap(), (1, 1));
+        assert_eq!(s.open_delivery_round(&c, "iss-1", Some("{}"), None).unwrap(), (2, 2));
 
         // The same pull request, pushed again: both counts stand.
         s.begin_delivery(&c, "iss-1", None).unwrap();
@@ -1745,7 +1746,7 @@ mod delivery_tests {
     fn feedback_is_handed_to_exactly_one_launch() {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
-        s.open_delivery_round(&c, "iss-1", "\"ci\"", None).unwrap();
+        s.open_delivery_round(&c, "iss-1", Some("\"ci\""), None).unwrap();
         assert_eq!(s.take_delivery_feedback(&c, "iss-1").unwrap().as_deref(), Some("\"ci\""));
         assert_eq!(s.take_delivery_feedback(&c, "iss-1").unwrap(), None);
     }
