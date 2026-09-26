@@ -1,0 +1,160 @@
+{"commands":["compact","always-approve","context","hooks-trust","hooks-list","hooks-add","hooks-remove","hooks-untrust","plugins","reload-plugins","session-info","feedback","deep-research","workflow","goal","loop","supacode-cli","built-in-browser","chrome-browser","computer-use","user:deep-research","doc-coauthoring","user:docs","google-workspace","import-memory","morning","build-with-ai","bundled:code-review","create-skill","create-workflow","design","execute-plan","game-assets","bundled:imagine","bundled:implement","learn","long-running-background-tasks","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles","statusline","threejs-frame-conventions","ask-matt","diagnosing-bugs","grill-with-docs","triage","improve-codebase-architecture","setup-matt-pocock-skills","tdd","to-spec","to-tickets","wayfinder","mattpocock-skills:implement","prototype","research","domain-modeling","codebase-design","mattpocock-skills:code-review","resolving-merge-conflicts","wizard","grill-me","grilling","handoff","teach","to-questionnaire","wait-what","writing-for-agents","access-protected-vercel-deployment","ai-gateway","ai-sdk","upstream","auth","bootstrap","build-agents","cdn-caching","chat-sdk","create-a-backend","custom-metrics","deployments-cicd","env-vars","eve","flags-sdk","knowledge-update","vercel:marketplace","microfrontends","next-cache-components","next-forge","next-upgrade","nextjs","queues","react-best-practices","routing-middleware","runtime-cache","shadcn","turbopack","vercel-agent","vercel-cli","vercel-connect","vercel-firewall","vercel-functions","vercel-sandbox","vercel-services","vercel-storage","verification","vercel:workflow","learn-traces"],"tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","send_feedback","image_gen","image_edit","image_to_video","reference_to_video","write"],"type":"available_commands"}
+{"commands":["compact","always-approve","context","hooks-trust","hooks-list","hooks-add","hooks-remove","hooks-untrust","plugins","reload-plugins","session-info","feedback","deep-research","workflow","goal","loop","supacode-cli","built-in-browser","chrome-browser","computer-use","user:deep-research","doc-coauthoring","user:docs","google-workspace","import-memory","morning","build-with-ai","bundled:code-review","create-skill","create-workflow","design","execute-plan","game-assets","bundled:imagine","bundled:implement","learn","long-running-background-tasks","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles","statusline","threejs-frame-conventions","ask-matt","diagnosing-bugs","grill-with-docs","triage","improve-codebase-architecture","setup-matt-pocock-skills","tdd","to-spec","to-tickets","wayfinder","mattpocock-skills:implement","prototype","research","domain-modeling","codebase-design","mattpocock-skills:code-review","resolving-merge-conflicts","wizard","grill-me","grilling","handoff","teach","to-questionnaire","wait-what","writing-for-agents","access-protected-vercel-deployment","ai-gateway","ai-sdk","upstream","auth","bootstrap","build-agents","cdn-caching","chat-sdk","create-a-backend","custom-metrics","deployments-cicd","env-vars","eve","flags-sdk","knowledge-update","vercel:marketplace","microfrontends","next-cache-components","next-forge","next-upgrade","nextjs","queues","react-best-practices","routing-middleware","runtime-cache","shadcn","turbopack","vercel-agent","vercel-cli","vercel-connect","vercel-firewall","vercel-functions","vercel-sandbox","vercel-services","vercel-storage","verification","vercel:workflow","learn-traces"],"tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","send_feedback","image_gen","image_edit","image_to_video","reference_to_video","write"],"type":"available_commands"}
+{"data":"The","type":"thought"}
+{"data":" user","type":"thought"}
+{"data":" wants","type":"thought"}
+{"data":" me","type":"thought"}
+{"data":" to","type":"thought"}
+{"data":" append","type":"thought"}
+{"data":" a","type":"thought"}
+{"data":" second","type":"thought"}
+{"data":" line","type":"thought"}
+{"data":" \"","type":"thought"}
+{"data":"res","type":"thought"}
+{"data":"umed","type":"thought"}
+{"data":"\"","type":"thought"}
+{"data":" to","type":"thought"}
+{"data":" notes","type":"thought"}
+{"data":".txt","type":"thought"}
+{"data":" and","type":"thought"}
+{"data":" commit","type":"thought"}
+{"data":" it","type":"thought"}
+{"data":" with","type":"thought"}
+{"data":" the","type":"thought"}
+{"data":" message","type":"thought"}
+{"data":" \"","type":"thought"}
+{"data":"probe","type":"thought"}
+{"data":" resume","type":"thought"}
+{"data":"\".","type":"thought"}
+{"data":" Then","type":"thought"}
+{"data":" end","type":"thought"}
+{"data":" my","type":"thought"}
+{"data":" final","type":"thought"}
+{"data":" message","type":"thought"}
+{"data":" with","type":"thought"}
+{"data":" exactly","type":"thought"}
+{"data":":\n","type":"thought"}
+{"data":"I'll","type":"text"}
+{"data":" append","type":"text"}
+{"data":" `","type":"text"}
+{"data":"res","type":"text"}
+{"data":"umed","type":"text"}
+{"data":"`","type":"text"}
+{"data":" to","type":"text"}
+{"data":" `","type":"text"}
+{"data":"notes","type":"text"}
+{"data":".txt","type":"text"}
+{"data":"`","type":"text"}
+{"data":" and","type":"text"}
+{"data":" commit","type":"text"}
+{"data":" it","type":"text"}
+{"data":" with","type":"text"}
+{"data":" the","type":"text"}
+{"data":" message","type":"text"}
+{"data":" \"","type":"text"}
+{"data":"probe","type":"text"}
+{"data":" resume","type":"text"}
+{"data":"\".","type":"text"}
+{"commands":["compact","always-approve","context","hooks-trust","hooks-list","hooks-add","hooks-remove","hooks-untrust","plugins","reload-plugins","session-info","feedback","deep-research","workflow","goal","loop","supacode-cli","built-in-browser","chrome-browser","computer-use","user:deep-research","doc-coauthoring","user:docs","google-workspace","import-memory","morning","build-with-ai","bundled:code-review","create-skill","create-workflow","design","execute-plan","game-assets","bundled:imagine","bundled:implement","learn","long-running-background-tasks","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles","statusline","threejs-frame-conventions","ask-matt","diagnosing-bugs","grill-with-docs","triage","improve-codebase-architecture","setup-matt-pocock-skills","tdd","to-spec","to-tickets","wayfinder","mattpocock-skills:implement","prototype","research","domain-modeling","codebase-design","mattpocock-skills:code-review","resolving-merge-conflicts","wizard","grill-me","grilling","handoff","teach","to-questionnaire","wait-what","writing-for-agents","access-protected-vercel-deployment","ai-gateway","ai-sdk","upstream","auth","bootstrap","build-agents","cdn-caching","chat-sdk","create-a-backend","custom-metrics","deployments-cicd","env-vars","eve","flags-sdk","knowledge-update","vercel:marketplace","microfrontends","next-cache-components","next-forge","next-upgrade","nextjs","queues","react-best-practices","routing-middleware","runtime-cache","shadcn","turbopack","vercel-agent","vercel-cli","vercel-connect","vercel-firewall","vercel-functions","vercel-sandbox","vercel-services","vercel-storage","verification","vercel:workflow","learn-traces"],"tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","send_feedback","image_gen","image_edit","image_to_video","reference_to_video","write","MCP_DOCKER__code-mode","MCP_DOCKER__fetch","MCP_DOCKER__fetch_content","MCP_DOCKER__mcp-activate-profile","MCP_DOCKER__mcp-add","MCP_DOCKER__mcp-config-set","MCP_DOCKER__mcp-create-profile","MCP_DOCKER__mcp-exec","MCP_DOCKER__mcp-find","MCP_DOCKER__mcp-remove","MCP_DOCKER__search"],"type":"available_commands"}
+{"signature":"redacted","type":"usage","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":23936,"input_tokens":204,"output_tokens":141,"reasoning_tokens":65}}
+{"content":[],"kind":"read","locations":[],"rawInput":{"target_file":"/private/tmp/probe/notes.txt"},"status":"pending","title":"read_file","toolCallId":"call-3d2013a4-ce14-4764-920b-3003529eb491-3","toolName":"read_file","type":"tool_call"}
+{"content":[],"locations":[{"path":"/private/tmp/probe/notes.txt"}],"rawOutput":null,"status":null,"toolCallId":"call-3d2013a4-ce14-4764-920b-3003529eb491-3","type":"tool_call_update"}
+{"content":[{"content":{"text":"1\u2192CREW_PROBE_PHRASE_ORANGE\n","type":"text"},"type":"content"}],"locations":[],"rawOutput":{"FileContent":{"absolute_path":"/private/tmp/probe/notes.txt","content":"1\u2192CREW_PROBE_PHRASE_ORANGE\n","content_concise":"1\u2192CREW_PROBE_PHRASE_ORANGE\n","offset":null,"raw_output":"CREW_PROBE_PHRASE_ORANGE\n","total_lines":2},"type":"ReadFile"},"status":"completed","toolCallId":"call-3d2013a4-ce14-4764-920b-3003529eb491-3","type":"tool_call_update"}
+{"data":"I'll","type":"thought"}
+{"data":" append","type":"thought"}
+{"data":" \"","type":"thought"}
+{"data":"res","type":"thought"}
+{"data":"umed","type":"thought"}
+{"data":"\"","type":"thought"}
+{"data":" as","type":"thought"}
+{"data":" a","type":"thought"}
+{"data":" second","type":"thought"}
+{"data":" line","type":"thought"}
+{"data":" and","type":"thought"}
+{"data":" commit","type":"thought"}
+{"data":".","type":"thought"}
+{"commands":["compact","always-approve","context","hooks-trust","hooks-list","hooks-add","hooks-remove","hooks-untrust","plugins","reload-plugins","session-info","feedback","deep-research","workflow","goal","loop","supacode-cli","built-in-browser","chrome-browser","computer-use","user:deep-research","doc-coauthoring","user:docs","google-workspace","import-memory","morning","build-with-ai","bundled:code-review","create-skill","create-workflow","design","execute-plan","game-assets","bundled:imagine","bundled:implement","learn","long-running-background-tasks","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles","statusline","threejs-frame-conventions","ask-matt","diagnosing-bugs","grill-with-docs","triage","improve-codebase-architecture","setup-matt-pocock-skills","tdd","to-spec","to-tickets","wayfinder","mattpocock-skills:implement","prototype","research","domain-modeling","codebase-design","mattpocock-skills:code-review","resolving-merge-conflicts","wizard","grill-me","grilling","handoff","teach","to-questionnaire","wait-what","writing-for-agents","access-protected-vercel-deployment","ai-gateway","ai-sdk","upstream","auth","bootstrap","build-agents","cdn-caching","chat-sdk","create-a-backend","custom-metrics","deployments-cicd","env-vars","eve","flags-sdk","knowledge-update","vercel:marketplace","microfrontends","next-cache-components","next-forge","next-upgrade","nextjs","queues","react-best-practices","routing-middleware","runtime-cache","shadcn","turbopack","vercel-agent","vercel-cli","vercel-connect","vercel-firewall","vercel-functions","vercel-sandbox","vercel-services","vercel-storage","verification","vercel:workflow","learn-traces"],"tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","send_feedback","image_gen","image_edit","image_to_video","reference_to_video","write","MCP_DOCKER__code-mode","MCP_DOCKER__fetch","MCP_DOCKER__fetch_content","MCP_DOCKER__mcp-activate-profile","MCP_DOCKER__mcp-add","MCP_DOCKER__mcp-config-set","MCP_DOCKER__mcp-create-profile","MCP_DOCKER__mcp-exec","MCP_DOCKER__mcp-find","MCP_DOCKER__mcp-remove","MCP_DOCKER__search"],"type":"available_commands"}
+{"signature":"redacted","type":"usage","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":24064,"input_tokens":241,"output_tokens":103,"reasoning_tokens":13}}
+{"content":[],"kind":"edit","locations":[],"rawInput":{"file_path":"/private/tmp/probe/notes.txt","new_string":"CREW_PROBE_PHRASE_ORANGE\nresumed\n","old_string":"CREW_PROBE_PHRASE_ORANGE\n"},"status":"pending","title":"search_replace","toolCallId":"call-58e41465-f93e-4cf9-913b-62e79a92845f-4","toolName":"search_replace","type":"tool_call"}
+{"content":[{"_meta":{"new_line":1,"old_line":1},"newText":"CREW_PROBE_PHRASE_ORANGE\nresumed\n","oldText":"CREW_PROBE_PHRASE_ORANGE\n","path":"/private/tmp/probe/notes.txt","type":"diff"}],"locations":[{"path":"/private/tmp/probe/notes.txt"}],"rawOutput":null,"status":null,"toolCallId":"call-58e41465-f93e-4cf9-913b-62e79a92845f-4","type":"tool_call_update"}
+{"content":[{"_meta":{"details":[{"context_after":"","context_before":"","line_prefix":"","new_line":1,"new_string":"CREW_PROBE_PHRASE_ORANGE\nresumed\n","old_line":1,"old_string":"CREW_PROBE_PHRASE_ORANGE\n"}]},"newText":"CREW_PROBE_PHRASE_ORANGE\nresumed\n","oldText":"CREW_PROBE_PHRASE_ORANGE\n","path":"/private/tmp/probe/notes.txt","type":"diff"}],"locations":[],"rawOutput":{"EditsApplied":{"absolute_path":"/private/tmp/probe/notes.txt","edits":{"details":[{"context_after":"","context_before":"","line_prefix":"","new_line":1,"new_string":"CREW_PROBE_PHRASE_ORANGE\nresumed\n","old_line":1,"old_string":"CREW_PROBE_PHRASE_ORANGE\n"}]},"new_string":"CREW_PROBE_PHRASE_ORANGE\nresumed\n","old_string":"CREW_PROBE_PHRASE_ORANGE\n","tool_output_for_prompt":"The file /private/tmp/probe/notes.txt has been updated successfully.","tool_output_for_prompt_concise":"The file /private/tmp/probe/notes.txt has been updated."},"type":"SearchReplace"},"status":"completed","toolCallId":"call-58e41465-f93e-4cf9-913b-62e79a92845f-4","type":"tool_call_update"}
+{"data":"Now","type":"thought"}
+{"data":" commit","type":"thought"}
+{"data":" with","type":"thought"}
+{"data":" message","type":"thought"}
+{"data":" \"","type":"thought"}
+{"data":"probe","type":"thought"}
+{"data":" resume","type":"thought"}
+{"data":"\"","type":"thought"}
+{"commands":["compact","always-approve","context","hooks-trust","hooks-list","hooks-add","hooks-remove","hooks-untrust","plugins","reload-plugins","session-info","feedback","deep-research","workflow","goal","loop","supacode-cli","built-in-browser","chrome-browser","computer-use","user:deep-research","doc-coauthoring","user:docs","google-workspace","import-memory","morning","build-with-ai","bundled:code-review","create-skill","create-workflow","design","execute-plan","game-assets","bundled:imagine","bundled:implement","learn","long-running-background-tasks","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles","statusline","threejs-frame-conventions","ask-matt","diagnosing-bugs","grill-with-docs","triage","improve-codebase-architecture","setup-matt-pocock-skills","tdd","to-spec","to-tickets","wayfinder","mattpocock-skills:implement","prototype","research","domain-modeling","codebase-design","mattpocock-skills:code-review","resolving-merge-conflicts","wizard","grill-me","grilling","handoff","teach","to-questionnaire","wait-what","writing-for-agents","access-protected-vercel-deployment","ai-gateway","ai-sdk","upstream","auth","bootstrap","build-agents","cdn-caching","chat-sdk","create-a-backend","custom-metrics","deployments-cicd","env-vars","eve","flags-sdk","knowledge-update","vercel:marketplace","microfrontends","next-cache-components","next-forge","next-upgrade","nextjs","queues","react-best-practices","routing-middleware","runtime-cache","shadcn","turbopack","vercel-agent","vercel-cli","vercel-connect","vercel-firewall","vercel-functions","vercel-sandbox","vercel-services","vercel-storage","verification","vercel:workflow","learn-traces"],"tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","send_feedback","image_gen","image_edit","image_to_video","reference_to_video","write","MCP_DOCKER__code-mode","MCP_DOCKER__fetch","MCP_DOCKER__fetch_content","MCP_DOCKER__mcp-activate-profile","MCP_DOCKER__mcp-add","MCP_DOCKER__mcp-config-set","MCP_DOCKER__mcp-create-profile","MCP_DOCKER__mcp-exec","MCP_DOCKER__mcp-find","MCP_DOCKER__mcp-remove","MCP_DOCKER__search"],"type":"available_commands"}
+{"signature":"redacted","type":"usage","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":24192,"input_tokens":274,"output_tokens":64,"reasoning_tokens":8}}
+{"content":[],"kind":"execute","locations":[],"rawInput":{"command":"git add notes.txt && git commit -m \"probe resume\" && git status && git log -2 --oneline && echo '---' && cat notes.txt","description":"Commit notes.txt second line as probe resume"},"status":"pending","title":"run_terminal_command","toolCallId":"call-cbcebc6c-437d-4a66-a5b8-948e90615c21-5","toolName":"run_terminal_command","type":"tool_call"}
+{"content":[{"content":{"text":"Commit notes.txt second line as probe resume","type":"text"},"type":"content"}],"locations":[],"rawOutput":null,"status":null,"toolCallId":"call-cbcebc6c-437d-4a66-a5b8-948e90615c21-5","type":"tool_call_update"}
+{"content":[{"content":{"text":"","type":"text"},"type":"content"}],"locations":[],"rawOutput":{"command":"git add notes.txt && git commit -m \"probe resume\" && git status && git log -2 --oneline && echo '---' && cat notes.txt","current_dir":"/private/tmp/probe","description":null,"exit_code":0,"output":[],"output_file":"","output_for_prompt":"","signal":null,"timed_out":false,"total_bytes":0,"truncated":false,"type":"Bash"},"status":"in_progress","toolCallId":"call-cbcebc6c-437d-4a66-a5b8-948e90615c21-5","type":"tool_call_update"}
+{"content":[{"content":{"text":"[main 155b207] probe resume\n 1 file changed, 1 insertion(+)\nOn branch main\nnothing to commit, working tree clean\n155b207 probe resume\nfb21461 probe\n---\nCREW_PROBE_PHRASE_ORANGE\nresumed\n","type":"text"},"type":"content"}],"locations":[],"rawOutput":{"command":"git add notes.txt && git commit -m \"probe resume\" && git status && git log -2 --oneline && echo '---' && cat notes.txt","current_dir":"/private/tmp/probe","description":null,"exit_code":0,"output_file":"","output_for_prompt":"[main 155b207] probe resume\n 1 file changed, 1 insertion(+)\nOn branch main\nnothing to commit, working tree clean\n155b207 probe resume\nfb21461 probe\n---\nCREW_PROBE_PHRASE_ORANGE\nresumed\n","signal":null,"timed_out":false,"total_bytes":185,"truncated":false,"type":"Bash"},"status":"in_progress","toolCallId":"call-cbcebc6c-437d-4a66-a5b8-948e90615c21-5","type":"tool_call_update"}
+{"content":[{"content":{"text":"[main 155b207] probe resume\n 1 file changed, 1 insertion(+)\nOn branch main\nnothing to commit, working tree clean\n155b207 probe resume\nfb21461 probe\n---\nCREW_PROBE_PHRASE_ORANGE\nresumed\n","type":"text"},"type":"content"}],"locations":[],"rawOutput":{"command":"git add notes.txt && git commit -m \"probe resume\" && git status && git log -2 --oneline && echo '---' && cat notes.txt","current_dir":"/private/tmp/probe","description":"Commit notes.txt second line as probe resume","exit_code":0,"output_file":"/tmp/probe/.grok/sessions/%2Fprivate%2Fvar%2Ffolders%2Fgq%2F01qsvgvn2xb7cq6yb9kb_khm0000gn%2FT%2Fcrewd-grok-live-95967/41b99f82-e4c5-4914-b836-c7955b05764a/terminal/call-cbcebc6c-437d-4a66-a5b8-948e90615c21-5.log","output_for_prompt":"exit: 0\n[main 155b207] probe resume\n 1 file changed, 1 insertion(+)\nOn branch main\nnothing to commit, working tree clean\n155b207 probe resume\nfb21461 probe\n---\nCREW_PROBE_PHRASE_ORANGE\nresumed\n","signal":null,"timed_out":false,"total_bytes":185,"truncated":false,"type":"Bash"},"status":"completed","toolCallId":"call-cbcebc6c-437d-4a66-a5b8-948e90615c21-5","type":"tool_call_update"}
+{"data":"Done","type":"thought"}
+{"data":".","type":"thought"}
+{"data":" End","type":"thought"}
+{"data":" with","type":"thought"}
+{"data":" the","type":"thought"}
+{"data":" exact","type":"thought"}
+{"data":" line","type":"thought"}
+{"data":" requested","type":"thought"}
+{"data":".","type":"thought"}
+{"data":" Keep","type":"thought"}
+{"data":" the","type":"thought"}
+{"data":" message","type":"thought"}
+{"data":" concise","type":"thought"}
+{"data":".","type":"thought"}
+{"data":"`","type":"text"}
+{"data":"notes","type":"text"}
+{"data":".txt","type":"text"}
+{"data":"`","type":"text"}
+{"data":" now","type":"text"}
+{"data":" has","type":"text"}
+{"data":" a","type":"text"}
+{"data":" second","type":"text"}
+{"data":" line","type":"text"}
+{"data":",","type":"text"}
+{"data":" `","type":"text"}
+{"data":"res","type":"text"}
+{"data":"umed","type":"text"}
+{"data":"`,","type":"text"}
+{"data":" and","type":"text"}
+{"data":" that","type":"text"}
+{"data":" change","type":"text"}
+{"data":" is","type":"text"}
+{"data":" committed","type":"text"}
+{"data":" on","type":"text"}
+{"data":" `","type":"text"}
+{"data":"main","type":"text"}
+{"data":"`","type":"text"}
+{"data":" as","type":"text"}
+{"data":" `","type":"text"}
+{"data":"155","type":"text"}
+{"data":"b","type":"text"}
+{"data":"207","type":"text"}
+{"data":"`","type":"text"}
+{"data":" with","type":"text"}
+{"data":" the","type":"text"}
+{"data":" message","type":"text"}
+{"data":" \"","type":"text"}
+{"data":"probe","type":"text"}
+{"data":" resume","type":"text"}
+{"data":"\".","type":"text"}
+{"data":"\n\n","type":"text"}
+{"data":"CRE","type":"text"}
+{"data":"W","type":"text"}
+{"data":"_","type":"text"}
+{"data":"OUT","type":"text"}
+{"data":"COME","type":"text"}
+{"data":":","type":"text"}
+{"data":" blocked","type":"text"}
+{"data":":","type":"text"}
+{"data":" probe","type":"text"}
+{"data":"-","type":"text"}
+{"data":"resume","type":"text"}
+{"commands":["compact","always-approve","context","hooks-trust","hooks-list","hooks-add","hooks-remove","hooks-untrust","plugins","reload-plugins","session-info","feedback","deep-research","workflow","goal","loop","supacode-cli","built-in-browser","chrome-browser","computer-use","user:deep-research","doc-coauthoring","user:docs","google-workspace","import-memory","morning","build-with-ai","bundled:code-review","create-skill","create-workflow","design","execute-plan","game-assets","bundled:imagine","bundled:implement","learn","long-running-background-tasks","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles","statusline","threejs-frame-conventions","ask-matt","diagnosing-bugs","grill-with-docs","triage","improve-codebase-architecture","setup-matt-pocock-skills","tdd","to-spec","to-tickets","wayfinder","mattpocock-skills:implement","prototype","research","domain-modeling","codebase-design","mattpocock-skills:code-review","resolving-merge-conflicts","wizard","grill-me","grilling","handoff","teach","to-questionnaire","wait-what","writing-for-agents","access-protected-vercel-deployment","ai-gateway","ai-sdk","upstream","auth","bootstrap","build-agents","cdn-caching","chat-sdk","create-a-backend","custom-metrics","deployments-cicd","env-vars","eve","flags-sdk","knowledge-update","vercel:marketplace","microfrontends","next-cache-components","next-forge","next-upgrade","nextjs","queues","react-best-practices","routing-middleware","runtime-cache","shadcn","turbopack","vercel-agent","vercel-cli","vercel-connect","vercel-firewall","vercel-functions","vercel-sandbox","vercel-services","vercel-storage","verification","vercel:workflow","learn-traces"],"tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","send_feedback","image_gen","image_edit","image_to_video","reference_to_video","write","MCP_DOCKER__code-mode","MCP_DOCKER__fetch","MCP_DOCKER__fetch_content","MCP_DOCKER__mcp-activate-profile","MCP_DOCKER__mcp-add","MCP_DOCKER__mcp-config-set","MCP_DOCKER__mcp-create-profile","MCP_DOCKER__mcp-exec","MCP_DOCKER__mcp-find","MCP_DOCKER__mcp-remove","MCP_DOCKER__search"],"type":"available_commands"}
+{"signature":"redacted","type":"usage","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":24448,"input_tokens":154,"output_tokens":62,"reasoning_tokens":14}}
+{"modelUsage":{"grok-4.7-build":{"cacheCreationInputTokens":0,"cacheReadInputTokens":96640,"costUSD":0.01777724,"inputTokens":873,"modelCalls":4,"outputTokens":370}},"num_turns":4,"requestId":"34f50fb4-4f5f-4f00-b24d-d9ad19bfff0a","sessionId":"41b99f82-e4c5-4914-b836-c7955b05764a","stopReason":"end_turn","total_cost_usd":0.01777724,"total_cost_usd_ticks":177772400,"type":"end","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":96640,"input_tokens":873,"output_tokens":370,"reasoning_tokens":100,"total_tokens":97883}}
