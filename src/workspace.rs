@@ -221,13 +221,13 @@ impl std::fmt::Debug for PushAuth {
 /// that goes looking: a worker runs as the same user, and the App's private key, from which any
 /// number of tokens can be minted, is a file that user can read for the daemon's whole life.
 /// Only a separate uid would change that, the same limit the broker's module doc records.
-struct PushCredentialFile {
+pub(crate) struct PushCredentialFile {
     dir: PathBuf,
     file: PathBuf,
 }
 
 impl PushCredentialFile {
-    fn new(token: &str) -> std::io::Result<Self> {
+    pub(crate) fn new(token: &str) -> std::io::Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -251,7 +251,7 @@ impl PushCredentialFile {
     /// Config for one `git` invocation. The empty `credential.helper` first clears every helper
     /// configured anywhere else — the operator's keychain included, which would otherwise be
     /// consulted first and, on success, be handed the installation token to store.
-    fn git_config(&self) -> Vec<String> {
+    pub(crate) fn git_config(&self) -> Vec<String> {
         [
             "credential.helper=".to_string(),
             format!("credential.helper=store --file={}", self.file.display()),
@@ -284,7 +284,7 @@ fn classify_push(remote: &str, branch: &str, text: &str) -> ForgeError {
 
 /// What git prints when the remote refused the credential it sent: `Authentication failed` is
 /// git's own wording for a 401 over HTTPS, and `Invalid username or token` is GitHub's.
-fn is_auth_refusal(stderr: &str) -> bool {
+pub(crate) fn is_auth_refusal(stderr: &str) -> bool {
     stderr.contains("Authentication failed") || stderr.contains("Invalid username or token")
 }
 

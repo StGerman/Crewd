@@ -805,8 +805,8 @@ mod tests {
             }],
         };
         for prompt in [
-            build_prompt(&issue(), None, Some(&fb), &[]),
-            build_continuation_prompt(&issue(), None, Some(&fb), &[], false),
+            build_prompt(&issue(), None, std::slice::from_ref(&fb), &[]),
+            build_continuation_prompt(&issue(), None, std::slice::from_ref(&fb), &[], false),
         ] {
             assert!(prompt.contains("CI is red"), "{prompt}");
             assert!(prompt.contains("fmt + clippy + test"));
@@ -816,7 +816,7 @@ mod tests {
             );
             assert!(prompt.contains("https://github.com/o/r/pull/9"));
         }
-        assert!(!build_prompt(&issue(), None, None, &[]).contains("CI is red"));
+        assert!(!build_prompt(&issue(), None, &[], &[]).contains("CI is red"));
     }
 
     #[test]
@@ -832,12 +832,12 @@ mod tests {
                     .into(),
             },
         ];
-        insta::assert_snapshot!("new_prompt_with_wip", build_prompt(&issue(), None, None, &wip));
+        insta::assert_snapshot!("new_prompt_with_wip", build_prompt(&issue(), None, &[], &wip));
         insta::assert_snapshot!(
             "continuation_prompt_with_wip",
-            build_continuation_prompt(&issue(), None, None, &wip, false)
+            build_continuation_prompt(&issue(), None, &[], &wip, false)
         );
-        insta::assert_snapshot!("new_prompt_without_wip", build_prompt(&issue(), None, None, &[]));
+        insta::assert_snapshot!("new_prompt_without_wip", build_prompt(&issue(), None, &[], &[]));
     }
 
     /// #109: a Decisions section written into #105's description after its session started was
@@ -850,11 +850,11 @@ mod tests {
         };
         insta::assert_snapshot!(
             "continuation_prompt_body_changed",
-            build_continuation_prompt(&edited, None, None, &[], true)
+            build_continuation_prompt(&edited, None, &[], &[], true)
         );
         insta::assert_snapshot!(
             "continuation_prompt_body_unchanged",
-            build_continuation_prompt(&edited, None, None, &[], false)
+            build_continuation_prompt(&edited, None, &[], &[], false)
         );
     }
 
@@ -869,7 +869,34 @@ mod tests {
         };
         insta::assert_snapshot!(
             "continuation_prompt_after_conflict",
-            build_continuation_prompt(&issue(), None, Some(&fb), &[], false)
+            build_continuation_prompt(&issue(), None, std::slice::from_ref(&fb), &[], false)
+        );
+    }
+
+    /// #160: a conflict brief that interrupted a review hand-back once went out alone, and the
+    /// comments came back as a second round.
+    #[test]
+    fn a_conflict_brief_and_the_review_it_interrupted_share_one_prompt() {
+        let fb = [
+            Feedback::Gate {
+                output: "the handoff gate's rebase onto master conflicted in CLAUDE.md.".into(),
+            },
+            Feedback::Review {
+                pr_url: "https://github.com/o/r/pull/9".into(),
+                comments: vec![crate::forge::ReviewComment {
+                    id: "4059939692".into(),
+                    author: "Copilot".into(),
+                    path: Some("src/config.rs".into()),
+                    line: Some(79),
+                    body: "This field is missing `#[serde(default)]`".into(),
+                    url: None,
+                }],
+                unanswered_before: vec![],
+            },
+        ];
+        insta::assert_snapshot!(
+            "continuation_prompt_conflict_then_review",
+            build_continuation_prompt(&issue(), None, &fb, &[], false)
         );
     }
 
@@ -887,7 +914,7 @@ mod tests {
             }],
             unanswered_before: vec!["4059939600".into()],
         };
-        let prompt = build_prompt(&issue(), None, Some(&fb), &[]);
+        let prompt = build_prompt(&issue(), None, std::slice::from_ref(&fb), &[]);
         assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
         assert!(prompt.contains("missing `#[serde(default)]`"));
         assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");

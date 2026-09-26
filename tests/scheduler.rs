@@ -1379,11 +1379,11 @@ fn a_resume_after_a_rebase_conflict_is_handed_the_conflict_rather_than_a_turn_bu
     assert!(matches!(h.worker.sessions_for("iss-1")[1], Session::Resume(_)));
     assert_eq!(
         h.worker.feedback_for("iss-1")[1],
-        Some(Feedback::Conflict {
+        vec![Feedback::Conflict {
             base: "master".into(),
             base_sha: BASE.into(),
             paths: vec!["src/store/schema.rs".into()]
-        }),
+        }],
         "the resumed run is told what blocked the last one"
     );
 
@@ -1397,7 +1397,7 @@ fn a_resume_after_a_rebase_conflict_is_handed_the_conflict_rather_than_a_turn_bu
     h.sched.tick().unwrap();
     let feedback = h.worker.feedback_for("iss-1");
     assert_eq!(feedback.len(), 3, "dispatched a third time: {feedback:?}");
-    assert_eq!(feedback[2], None, "the conflict was taken by the run it was queued for");
+    assert!(feedback[2].is_empty(), "the conflict was taken by the run it was queued for");
 }
 
 const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1434,7 +1434,7 @@ fn a_conflict_confined_to_agent_resolvable_paths_is_handed_back_to_the_agent() {
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 1, "the continuation is dispatched");
     assert!(matches!(h.worker.sessions_for("iss-1")[1], Session::Resume(_)));
-    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+    let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
     assert!(output.contains("CLAUDE.md"), "which paths: {output}");
@@ -1495,7 +1495,7 @@ fn a_conflict_resolved_by_merging_the_base_is_not_re_raised_by_the_gate() {
     h.clock.advance_ms(5_000);
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 1, "the continuation is dispatched");
-    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+    let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
     assert!(output.contains("git merge "), "a merge is offered as a resolution: {output}");
@@ -1539,7 +1539,7 @@ fn a_conflict_brief_with_no_configured_base_names_the_commit_not_head() {
     h.sched.tick().unwrap();
     h.clock.advance_ms(5_000);
     h.sched.tick().unwrap();
-    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+    let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
     assert!(output.contains(&format!("git rebase {BASE}")), "{output}");
@@ -1582,7 +1582,7 @@ fn a_schema_conflict_brief_names_the_released_migration_rule() {
     h.sched.tick().unwrap();
     h.clock.advance_ms(5_000);
     h.sched.tick().unwrap();
-    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+    let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
     assert!(output.contains("never be edited") && output.contains("RELEASED"), "{output}");
@@ -1673,8 +1673,8 @@ fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
     let sessions = h.worker.sessions_for("iss-1");
     assert!(matches!(sessions[1], Session::Resume(_)), "into the same conversation");
     let feedback = h.worker.feedback_for("iss-1");
-    assert_eq!(feedback[0], None, "a first dispatch has nothing to explain");
-    let Some(Feedback::Gate { output }) = &feedback[1] else {
+    assert!(feedback[0].is_empty(), "a first dispatch has nothing to explain");
+    let [Feedback::Gate { output }] = &feedback[1][..] else {
         panic!("the continuation must be told why it exists, by the gate: {:?}", feedback[1]);
     };
     assert!(output.contains("cargo test"), "which step: {output}");
@@ -1704,8 +1704,8 @@ fn a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_reb
     h.sched.tick().unwrap();
 
     // Delivery folded the gate's brief into `Feedback::Gate`; the fact under test is the same.
-    let brief = match &h.worker.feedback_for("iss-1")[1] {
-        Some(Feedback::Gate { output }) => output.clone(),
+    let brief = match &h.worker.feedback_for("iss-1")[1][..] {
+        [Feedback::Gate { output }] => output.clone(),
         other => panic!("the continuation must be told why it exists, got {other:?}"),
     };
     assert!(
@@ -2983,9 +2983,9 @@ fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_
     assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
     let fb = h.worker.feedback_for("iss-1");
     assert_eq!(fb.len(), 2, "one first run, one fix round: {fb:?}");
-    assert!(fb[0].is_none(), "the first run had nothing to be told");
-    match &fb[1] {
-        Some(Feedback::Ci { failures, .. }) => {
+    assert!(fb[0].is_empty(), "the first run had nothing to be told");
+    match &fb[1][..] {
+        [Feedback::Ci { failures, .. }] => {
             assert!(
                 failures[0].detail.contains("E0308"),
                 "the cause reaches the agent: {failures:?}"
@@ -3095,7 +3095,7 @@ fn a_conflicting_pull_request_with_no_gate_is_handed_back_to_the_agent() {
     assert_eq!(d.stage, crew::store::DeliveryStage::Redispatched);
     assert_eq!(d.ci_pending, None);
     assert!(
-        matches!(&h.worker.feedback_for("iss-1")[1], Some(Feedback::Gate { output }) if output.contains("cannot merge")),
+        matches!(&h.worker.feedback_for("iss-1")[1][..], [Feedback::Gate { output }] if output.contains("cannot merge")),
         "{:?}",
         h.worker.feedback_for("iss-1")
     );
@@ -3332,8 +3332,8 @@ fn each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and
 
     // Handed to a run as work, not as text: the round is dispatched with both comments.
     assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
-    match &h.worker.feedback_for("iss-1")[1] {
-        Some(Feedback::Review { comments, .. }) => {
+    match &h.worker.feedback_for("iss-1")[1][..] {
+        [Feedback::Review { comments, .. }] => {
             assert_eq!(comments.len(), 2, "{comments:?}");
         }
         other => panic!("expected review feedback, got {other:?}"),
@@ -3563,8 +3563,8 @@ const COPILOT: &str = "copilot-pull-request-reviewer[bot]";
 
 /// The review ids a round was handed, in order.
 fn handed_ids(h: &Harness, id: &str, run: usize) -> Vec<String> {
-    match &h.worker.feedback_for(id)[run] {
-        Some(Feedback::Review { comments, .. }) => comments.iter().map(|c| c.id.clone()).collect(),
+    match &h.worker.feedback_for(id)[run][..] {
+        [Feedback::Review { comments, .. }] => comments.iter().map(|c| c.id.clone()).collect(),
         other => panic!("expected review feedback, got {other:?}"),
     }
 }
@@ -3591,8 +3591,8 @@ fn a_finding_only_in_a_review_summary_is_handed_back_to_the_agent() {
     h.sched.tick().unwrap();
 
     assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
-    match &h.worker.feedback_for("iss-1")[1] {
-        Some(Feedback::Review { comments, .. }) => {
+    match &h.worker.feedback_for("iss-1")[1][..] {
+        [Feedback::Review { comments, .. }] => {
             assert_eq!(comments.len(), 1, "{comments:?}");
             assert_eq!(comments[0].id, format!("review-{review}"), "keyed by the review");
             assert!(comments[0].body.contains("Previously missed"), "handed over whole");
@@ -3806,8 +3806,8 @@ fn an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_ou
     let d = delivery_of(&h, "iss-1");
     assert_eq!(d.stage, crew::store::DeliveryStage::Redispatched, "{d:?}");
     assert_eq!(d.rounds_pr, 2);
-    match &h.worker.feedback_for("iss-1")[2] {
-        Some(Feedback::Review { comments, unanswered_before, .. }) => {
+    match &h.worker.feedback_for("iss-1")[2][..] {
+        [Feedback::Review { comments, unanswered_before, .. }] => {
             let ids: Vec<&str> = comments.iter().map(|c| c.id.as_str()).collect();
             assert_eq!(ids, vec![bogus.as_str()], "only the unsettled comment is handed back");
             assert_eq!(unanswered_before, &vec![bogus.clone()], "named as left unanswered");
@@ -4245,7 +4245,7 @@ fn a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 1);
     assert!(
-        matches!(&h.worker.feedback_for("iss-1")[1], Some(Feedback::Gate { output }) if output.contains("cargo test")),
+        matches!(&h.worker.feedback_for("iss-1")[1][..], [Feedback::Gate { output }] if output.contains("cargo test")),
         "{:?}",
         h.worker.feedback_for("iss-1")
     );
@@ -4263,6 +4263,74 @@ fn a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes
     assert!(matches!(ops.first(), Some(Op::Publish { .. })), "pushed after the pass: {ops:?}");
     assert!(ops.iter().any(|o| matches!(o, Op::OpenPr { .. })), "and opened: {ops:?}");
     assert_eq!(forge.open_prs().len(), 1);
+}
+
+/// #160, as on PR #133: a review round's run said `Done`, its gate hit a conflict the agent may
+/// resolve, and the brief went out alone — so the next run fixed only the conflict and delivery
+/// handed the same comments back as a second round. The brief and the comments go in one prompt,
+/// and the round is charged once.
+#[test]
+fn a_review_hand_back_preempted_by_a_conflict_brief_is_carried_in_the_same_prompt_and_charged_once()
+{
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        resolvable,
+    );
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    gate.set_default(GateScript::passes_in(1_000));
+
+    // First run, gated and delivered; a reviewer comments on the pull request.
+    run_once(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+
+    // Round one is dispatched with the comment; its gate then conflicts on a resolvable path.
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["CLAUDE.md".into()],
+        base_sha: BASE.into(),
+    }));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
+    assert_eq!(handed_ids(&h, "iss-1", 1), vec![c.clone()]);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "the round's run said done and is being gated");
+
+    // The next run answers the comment and resolves the conflict, both from one prompt.
+    gate.set_default(GateScript::passes_in(1_000));
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c.clone(),
+        verdict: Verdict::Accepted,
+        detail: "abc1234".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    let fb = h.worker.feedback_for("iss-1");
+    assert_eq!(fb.len(), 3, "the conflict was sent back to an agent: {fb:?}");
+    let [Feedback::Gate { output }, Feedback::Review { comments, .. }] = &fb[2][..] else {
+        panic!("the brief first, then the comments it interrupted: {:?}", fb[2]);
+    };
+    assert!(output.contains("CLAUDE.md"), "the brief names the conflict: {output}");
+    assert_eq!(comments.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![c.clone()]);
+
+    // It finishes, the gate passes, delivery settles the comment: no second round is charged.
+    for _ in 0..4 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.rounds_pr, 1, "one round of review, whatever interrupted it: {d:?}");
+    assert_eq!(d.rounds_issue, 1);
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready, "{d:?}");
+    assert!(h.sched.store().verdicts_for("iss-1").unwrap().contains_key(&c));
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 3, "and no fourth run");
 }
 
 /// #108. A gate conflict is a human's problem, and once the human has resolved it the issue has
@@ -4565,7 +4633,7 @@ fn a_remote_branch_conflicting_outside_resolvable_paths_blocks_before_the_run() 
     let fb = h.worker.feedback_for("iss-1");
     assert_eq!(fb.len(), 2, "the unblocked run is dispatched");
     assert!(
-        matches!(&fb[1], Some(Feedback::Gate { output }) if output.contains("git merge 0perat0r")),
+        matches!(fb[1].first(), Some(Feedback::Gate { output }) if output.contains("git merge 0perat0r")),
         "{fb:?}"
     );
 }
@@ -4590,7 +4658,7 @@ fn a_remote_branch_conflicting_only_in_resolvable_paths_is_handed_to_the_agent()
     let fb = h.worker.feedback_for("iss-1");
     assert_eq!(fb.len(), 2);
     assert!(
-        matches!(&fb[1], Some(Feedback::Gate { output }) if output.contains("git merge 0perat0r") && output.contains("CLAUDE.md")),
+        matches!(fb[1].first(), Some(Feedback::Gate { output }) if output.contains("git merge 0perat0r") && output.contains("CLAUDE.md")),
         "{fb:?}"
     );
 }

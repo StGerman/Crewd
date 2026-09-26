@@ -21,8 +21,10 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use super::{Gate, GateHandle, Verdict};
+use crate::credentials::Credentials;
 use crate::model::Issue;
 use crate::worker::KillResult;
+use crate::workspace::PushCredentialFile;
 
 /// How much of a failing command's output travels back to the agent. The tail, not the head:
 /// `cargo test` prints its `failures:` section and summary last, and a compiler stops at the
@@ -35,12 +37,56 @@ pub struct GitGate {
     /// The ref to rebase onto, resolved in `repo`. `None` means `repo`'s own HEAD — the same
     /// commit `GitWorktreeWorkspace::prepare` branches from, now rather than then.
     base: Option<String>,
+    /// The remote `base` is fetched from before it is resolved, when delivery names one. `repo`'s
+    /// own `base` moves only when someone pulls, and a gate that resolved it passed #50 "on the
+    /// base" five seconds before its pull request opened conflicting (#134).
+    remote: Option<String>,
+    fetch_auth: Option<FetchAuth>,
+    /// Held across the fetch. Two gates share `repo` and both update the same remote-tracking
+    /// ref; the one that loses `cannot lock ref` would be charged a gate failure.
+    fetch_lock: Arc<parking_lot::Mutex<()>>,
     commands: Vec<Vec<String>>,
+}
+
+/// The credential and URL the base is fetched with, when the push has them: the same pair
+/// `GitWorktreeWorkspace::with_push_credentials` pushes with, so a host whose only credential
+/// is the orchestrator's can gate what it can deliver.
+#[derive(Clone)]
+struct FetchAuth {
+    creds: Arc<dyn Credentials>,
+    url: String,
 }
 
 impl GitGate {
     pub fn new(repo: impl Into<PathBuf>, base: Option<String>, commands: Vec<Vec<String>>) -> Self {
-        Self { repo: repo.into(), base, commands }
+        Self {
+            repo: repo.into(),
+            base,
+            remote: None,
+            fetch_auth: None,
+            fetch_lock: Arc::new(parking_lot::Mutex::new(())),
+            commands,
+        }
+    }
+
+    /// Fetch from `url` with `creds` instead of from the remote's own URL on the operator's
+    /// ambient credential. The fetched commit still lands in `refs/remotes/<remote>/<base>`.
+    /// A refused token is retried once: the cache would keep serving it until its refresh
+    /// margin, which is how a push already treats the same credential (#64).
+    pub fn with_fetch_credentials(
+        mut self,
+        creds: Arc<dyn Credentials>,
+        url: impl Into<String>,
+    ) -> Self {
+        self.fetch_auth = Some(FetchAuth { creds, url: url.into() });
+        self
+    }
+
+    /// Gate against `remote`'s copy of the base rather than `repo`'s. Ignored with no base set:
+    /// `HEAD` names nothing to fetch.
+    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
+        self.remote = Some(remote.into());
+        self
     }
 }
 
@@ -117,6 +163,9 @@ impl Gate for GitGate {
             state: state.clone(),
             repo: self.repo.clone(),
             base: self.base.clone(),
+            remote: self.remote.clone(),
+            fetch_auth: self.fetch_auth.clone(),
+            fetch_lock: self.fetch_lock.clone(),
             commands: self.commands.clone(),
             workspace: workspace.to_path_buf(),
             identifier: issue.identifier.clone(),
@@ -155,6 +204,9 @@ struct GateRun {
     state: Shared,
     repo: PathBuf,
     base: Option<String>,
+    remote: Option<String>,
+    fetch_auth: Option<FetchAuth>,
+    fetch_lock: Arc<parking_lot::Mutex<()>>,
     commands: Vec<Vec<String>>,
     workspace: PathBuf,
     identifier: String,
@@ -181,8 +233,15 @@ impl GateRun {
     }
 
     fn gate(&self) -> Verdict {
-        let base_label = self.base.as_deref().unwrap_or("HEAD");
         let ws = &self.workspace;
+        let base_label = match (self.base.as_deref(), self.remote.as_deref()) {
+            (Some(base), Some(remote)) => match self.fetch_base(remote, base) {
+                Ok(tracking) => tracking,
+                Err(verdict) => return verdict,
+            },
+            (base, _) => base.unwrap_or("HEAD").to_string(),
+        };
+        let base_label = base_label.as_str();
 
         // Resolved in `repo`, not in the worktree: the worktree's HEAD is the run's own branch,
         // and a bare `HEAD` there would rebase the branch onto itself and call it current.
@@ -270,6 +329,81 @@ impl GateRun {
             }
         }
         Verdict::Passed { rebased }
+    }
+
+    /// Fetch `base` into `refs/remotes/<remote>/<base>`. Resolving the local ref instead passed
+    /// a branch on a stale base (#134), so a failed fetch ends the gate and never falls back.
+    /// The refspec names that one ref — the operator's branch is not moved — and
+    /// `--no-write-fetch-head` leaves the `FETCH_HEAD` a merge of theirs is waiting on.
+    /// `--no-auto-gc` stops the detached `git maintenance` that would otherwise lock this
+    /// repository under the next gate. [`GitGate::fetch_lock`] is held for the fetch: two gates
+    /// share `repo`, and the one that loses `cannot lock ref` would be charged a gate failure.
+    fn fetch_base(&self, remote: &str, base: &str) -> Result<String, Verdict> {
+        let step = format!("fetch {remote}/{base}");
+        self.set_step(&step);
+        let Some(_hold) = self.hold_fetch_lock() else {
+            return Err(stopped(step, false));
+        };
+        let refspec = format!("+refs/heads/{base}:refs/remotes/{remote}/{base}");
+        let fetched = match &self.fetch_auth {
+            None => self.git_fetch(remote, &refspec),
+            Some(auth) => self.fetch_with_credential(auth, &refspec),
+        };
+        match fetched {
+            Ok(_) if self.killed() => Err(stopped(step, false)),
+            Ok(_) => Ok(format!("refs/remotes/{remote}/{base}")),
+            Err(e) => Err(Verdict::Failed {
+                output: format!(
+                    "cannot fetch the base `{base}` from `{remote}` in {}; the gate does not \
+                     fall back to the local ref, which may be behind the pull request's base: {e}",
+                    self.repo.display()
+                ),
+                step,
+                on_base: false,
+            }),
+        }
+    }
+
+    /// Wait for [`GitGate::fetch_lock`] only while the gate has not been stopped (review on
+    /// #161). A gate waiting here has no subprocess, so `kill` has no `pgid` to signal and
+    /// returns once its grace runs out; a plain `lock()` would then take the lock later and
+    /// start a fetch after the scheduler had treated the run as stopped. `None` once `killed`
+    /// is set, including when it was set while the lock was being acquired.
+    fn hold_fetch_lock(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        loop {
+            if self.killed() {
+                return None;
+            }
+            if let Some(hold) = self.fetch_lock.try_lock_for(Duration::from_millis(50)) {
+                return (!self.killed()).then_some(hold);
+            }
+        }
+    }
+
+    /// One fetch with the push's credential. A refusal is retried once, on a fresh token, as
+    /// the push is (#64): an installation token revoked before its expiry stays cached until
+    /// the refresh margin, most of an hour, and every later gate would fail on it.
+    fn fetch_with_credential(&self, auth: &FetchAuth, refspec: &str) -> Result<String, String> {
+        retry_auth_refusal(
+            || self.killed(),
+            auth.creds.as_ref(),
+            || self.spawn_authed_fetch(auth, refspec),
+        )
+    }
+
+    /// Dropping the token file any earlier deletes it out from under `git`.
+    fn spawn_authed_fetch(&self, auth: &FetchAuth, refspec: &str) -> Result<String, String> {
+        let token = auth.creds.token().map_err(|e| e.to_string())?;
+        let file = PushCredentialFile::new(&token).map_err(|e| e.to_string())?;
+        let args = authed_fetch_args(&file, &auth.url, refspec);
+        let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.git(&self.repo, &argrefs)
+    }
+
+    fn git_fetch(&self, repository: &str, refspec: &str) -> Result<String, String> {
+        let args = fetch_args(repository, refspec);
+        let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.git(&self.repo, &argrefs)
     }
 
     /// Rebase the worktree onto `base_sha`: whether that moved any commits, or the verdict a
@@ -414,6 +548,35 @@ impl GateRun {
             combined.push('\n');
         }
         Err(tail(&combined, OUTPUT_CAP))
+    }
+}
+
+/// `git fetch` rewrites `FETCH_HEAD` and then detaches `git maintenance run --auto`, which
+/// locks this same repository under whatever gate or rebase runs next.
+fn fetch_args(repository: &str, refspec: &str) -> Vec<String> {
+    ["fetch", "--quiet", "--no-tags", "--no-auto-gc", "--no-write-fetch-head", repository, refspec]
+        .map(str::to_string)
+        .to_vec()
+}
+
+fn authed_fetch_args(file: &PushCredentialFile, url: &str, refspec: &str) -> Vec<String> {
+    let mut args = file.git_config();
+    args.extend(fetch_args(url, refspec));
+    args
+}
+
+/// One more attempt after an authentication refusal, and only then. `killed` is read after the
+/// first attempt: a gate already stopped must not start another fetch.
+fn retry_auth_refusal(
+    killed: impl Fn() -> bool,
+    creds: &dyn Credentials,
+    mut attempt: impl FnMut() -> Result<String, String>,
+) -> Result<String, String> {
+    match attempt() {
+        Err(e) if !killed() && crate::workspace::is_auth_refusal(&e) && creds.invalidate() => {
+            attempt()
+        }
+        other => other,
     }
 }
 
@@ -597,6 +760,284 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `repo_and_worktree`, with `repo` cloned from an `upstream` that stands in for the remote
+    /// its pull requests merge into. Returns `(dir, upstream, repo, worktree)`.
+    fn clone_and_worktree(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (dir, upstream, _) = repo_and_worktree(tag);
+        let repo = dir.join("clone");
+        sh_git(&dir, &["clone", "-q", upstream.to_str().unwrap(), repo.to_str().unwrap()]);
+        sh_git(&repo, &["config", "user.email", "test@example.com"]);
+        sh_git(&repo, &["config", "user.name", "test"]);
+        let repo = repo.canonicalize().unwrap();
+        let ws = GitWorktreeWorkspace::new(dir.join("clone-workspaces"), &repo).unwrap();
+        let wt = ws.prepare("iss-1", "MT-1").unwrap().path;
+        (dir, upstream, repo, wt)
+    }
+
+    /// The guard for #134: the daemon's own `master` lagged the remote's by a merged pull
+    /// request, the gate passed on it, and the pull request opened conflicting. Resolve the
+    /// local ref instead of fetching and this passes.
+    #[test]
+    fn the_gate_rebases_onto_the_remote_base_not_a_stale_local_ref() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("remote-base");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&upstream, "base.txt", "merged meanwhile\n", "another pull request merged");
+        let local_master = sh_git(&repo, &["rev-parse", "master"]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])])
+            .with_remote("origin");
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        let remote_master = sh_git(&upstream, &["rev-parse", "master"]);
+        assert_eq!(
+            verdict,
+            Verdict::Conflict { paths: vec!["base.txt".into()], base_sha: remote_master }
+        );
+        assert!(!wt.join("gate-ran").exists(), "a conflicted branch is not gated");
+        assert_eq!(
+            sh_git(&repo, &["rev-parse", "master"]),
+            local_master,
+            "the operator's local master is fetched past, never moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review on #161: delivery pushes with the App's token to the canonical URL, so a host
+    /// with no ambient credential for the remote could deliver and yet fail every gate fetch.
+    /// The remote's own URL here leads nowhere; only the push URL reaches the base.
+    #[test]
+    fn the_base_is_fetched_from_the_push_url_with_the_push_credential() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-auth");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&upstream, "base.txt", "merged meanwhile\n", "another pull request merged");
+        sh_git(&repo, &["remote", "set-url", "origin", dir.join("nowhere").to_str().unwrap()]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![])
+            .with_remote("origin")
+            .with_fetch_credentials(
+                Arc::new(crate::credentials::StaticToken::new("ghs_token")),
+                upstream.to_str().unwrap(),
+            );
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        let remote_master = sh_git(&upstream, &["rev-parse", "master"]);
+        assert_eq!(
+            verdict,
+            Verdict::Conflict { paths: vec!["base.txt".into()], base_sha: remote_master.clone() }
+        );
+        assert_eq!(sh_git(&repo, &["rev-parse", "origin/master"]), remote_master);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review on #161: the fetch runs in the operator's checkout, and `git fetch` rewrites
+    /// `FETCH_HEAD` — the commit a merge they have not finished is waiting on.
+    #[test]
+    fn fetching_the_base_leaves_the_operators_fetch_head() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-head");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        commit(&upstream, "remote.txt", "moved\n", "master moved");
+        let sentinel = "operator FETCH_HEAD\n";
+        std::fs::write(repo.join(".git/FETCH_HEAD"), sentinel).unwrap();
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![]).with_remote("origin");
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        assert!(matches!(verdict, Verdict::Passed { rebased: true }), "{verdict:?}");
+        assert_eq!(std::fs::read_to_string(repo.join(".git/FETCH_HEAD")).unwrap(), sentinel);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review on #161: what `git credential fill` answers for the fetch's own config is the
+    /// push token, ahead of a helper configured on the checkout. The token is not in argv.
+    #[test]
+    fn the_gate_fetch_resolves_the_push_token_ahead_of_an_ambient_helper() {
+        const TOKEN: &str = "ghs_gate_token_that_must_not_leak";
+        let (dir, repo, _wt) = repo_and_worktree("fetch-token");
+        sh_git(&repo, &["config", "credential.helper", "!printf 'password=from-the-operator\\n'"]);
+        let file = PushCredentialFile::new(TOKEN).unwrap();
+        let args = authed_fetch_args(
+            &file,
+            "https://github.com/o/r.git",
+            "+refs/heads/master:refs/remotes/origin/master",
+        );
+        assert!(args.iter().all(|a| !a.contains(TOKEN)), "the token is in argv: {args:?}");
+        let config: Vec<&str> =
+            args.iter().take_while(|a| a.as_str() != "fetch").map(String::as_str).collect();
+        let mut fill = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&config)
+            .args(["credential", "fill"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            fill.stdin.take().unwrap().write_all(b"protocol=https\nhost=github.com\n\n").unwrap();
+        }
+        let out = fill.wait_with_output().unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            stdout.contains(&format!("password={TOKEN}")),
+            "stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!stdout.contains("from-the-operator"), "{stdout}");
+        drop(file);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review on #161: a revoked installation token is what the push retries once. The same
+    /// refusal on the fetch has to do the same, or every gate until the refresh margin fails
+    /// on a credential that will not change. Anything else, and a gate already stopped, is not
+    /// a reason to fetch again.
+    #[test]
+    fn a_fetch_refused_for_authentication_is_retried_once_on_a_fresh_token() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::credentials::{CredentialError, Credentials};
+
+        struct Rotating(AtomicU32);
+        impl Credentials for Rotating {
+            fn token(&self) -> Result<String, CredentialError> {
+                Ok(format!("tok-{}", self.0.load(Ordering::SeqCst)))
+            }
+            fn invalidate(&self) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let refused =
+            || Err("fatal: Authentication failed for 'https://github.com/o/r.git/'".into());
+        let creds = Rotating(AtomicU32::new(0));
+        let attempts = AtomicU32::new(0);
+        let fetched = retry_auth_refusal(
+            || false,
+            &creds,
+            || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if creds.token().unwrap() == "tok-1" {
+                    Ok(format!("fetched on attempt {n}"))
+                } else {
+                    refused()
+                }
+            },
+        );
+        assert_eq!(fetched.unwrap(), "fetched on attempt 1");
+
+        let attempts = AtomicU32::new(0);
+        let fetched = retry_auth_refusal(
+            || false,
+            &creds,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                refused()
+            },
+        );
+        assert!(fetched.is_err(), "a second refusal is the answer");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "one retry, not a loop");
+
+        let attempts = AtomicU32::new(0);
+        let _ = retry_auth_refusal(
+            || false,
+            &creds,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("cannot lock ref".into())
+            },
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "only an authentication refusal is retried");
+
+        let attempts = AtomicU32::new(0);
+        let _ = retry_auth_refusal(
+            || true,
+            &creds,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                refused()
+            },
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "a stopped gate does not fetch again");
+
+        let attempts = AtomicU32::new(0);
+        let _ = retry_auth_refusal(
+            || false,
+            &crate::credentials::StaticToken::new("t"),
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                refused()
+            },
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a token that cannot refresh is not retried"
+        );
+    }
+
+    /// Review on #161: a gate stopped while another gate holds the fetch lock stops within its
+    /// grace, and never fetches once the lock frees. Before, `kill` found no `pgid`, returned
+    /// `Forced`, and the waiting thread went on to fetch after the run was written off.
+    #[test]
+    fn a_gate_stopped_while_waiting_for_the_fetch_lock_never_fetches() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-lock-kill");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        let before = sh_git(&repo, &["rev-parse", "refs/remotes/origin/master"]);
+        commit(&upstream, "remote.txt", "moved\n", "master moved");
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![]).with_remote("origin");
+        let other_gate = gate.fetch_lock.lock();
+        let h = gate.start(&issue(), &wt);
+        while h.step() != "fetch origin/master" {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = h.kill(500);
+        drop(other_gate);
+
+        assert!(matches!(result, KillResult::Stopped), "the stop was not clean: {result:?}");
+        assert!(
+            matches!(h.finished(), Some(Verdict::Failed { .. })),
+            "a stopped gate did not pass"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let after = sh_git(&repo, &["rev-parse", "refs/remotes/origin/master"]);
+        assert_eq!(after, before, "a stopped gate fetched once the lock freed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_fetch_of_the_base_fails_the_gate_rather_than_passing_on_the_stale_ref() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-fails");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        std::fs::remove_dir_all(&upstream).unwrap();
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])])
+            .with_remote("origin");
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        match verdict {
+            Verdict::Failed { step, output, on_base } => {
+                assert_eq!(step, "fetch origin/master");
+                assert!(output.contains("cannot fetch the base `master`"), "{output}");
+                assert!(!on_base, "nothing was rebased");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!wt.join("gate-ran").exists(), "the commands do not run on a stale base");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Skipping the rebase must not skip its refusal of a dirty tree: delivery pushes `HEAD`,
     /// so an uncommitted edit that passed the gate would be dropped from the handoff unseen.
     #[test]
@@ -654,6 +1095,9 @@ mod tests {
             state: Arc::new((Mutex::new(Inner::default()), Condvar::new())),
             repo: repo.clone(),
             base: None,
+            remote: None,
+            fetch_auth: None,
+            fetch_lock: Arc::new(parking_lot::Mutex::new(())),
             commands: Vec::new(),
             workspace: wt.clone(),
             identifier: "MT-1".into(),
@@ -732,6 +1176,9 @@ mod tests {
             state: Arc::new((Mutex::new(Inner::default()), Condvar::new())),
             repo: repo.clone(),
             base: None,
+            remote: None,
+            fetch_auth: None,
+            fetch_lock: Arc::new(parking_lot::Mutex::new(())),
             commands: Vec::new(),
             workspace: wt.clone(),
             identifier: "MT-1".into(),
@@ -952,6 +1399,9 @@ mod tests {
             state: state.clone(),
             repo: PathBuf::from("/nonexistent"),
             base: None,
+            remote: None,
+            fetch_auth: None,
+            fetch_lock: Arc::new(parking_lot::Mutex::new(())),
             commands: vec![],
             workspace: PathBuf::from("/nonexistent"),
             identifier: "MT-1".into(),
