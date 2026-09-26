@@ -1555,18 +1555,24 @@ impl Scheduler {
         // Opened before the worker exists, for the same reason the claim and the session name
         // are: the token has to be inside the config file the child reads at startup, so it
         // cannot be something the child reports back afterwards.
-        let broker_session = self.broker.as_ref().and_then(|b| match b.open(issue, &run_id) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                // Degrade, never fail: the acceptance criterion for an unavailable broker is
-                // an agent without tools, not a run that did not happen.
-                tracing::warn!(
-                    issue_id = %issue.id, error = %e,
-                    "broker session could not be opened; dispatching without tracker tools"
-                );
-                None
-            }
-        });
+        // A worker that declines tools (Grok, #120) is not given a broker session to ignore:
+        // opening one would mint a credential file nothing reads. Claude still gets one.
+        let broker_session = if pool_worker.uses_tools() {
+            self.broker.as_ref().and_then(|b| match b.open(issue, &run_id) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    // Degrade, never fail: the acceptance criterion for an unavailable broker is
+                    // an agent without tools, not a run that did not happen.
+                    tracing::warn!(
+                        issue_id = %issue.id, error = %e,
+                        "broker session could not be opened; dispatching without tracker tools"
+                    );
+                    None
+                }
+            })
+        } else {
+            None
+        };
 
         // Taken, not read: whatever delivery queued for this issue reaches exactly this run.
         // A feedback row that failed to parse is dropped with a warning rather than blocking

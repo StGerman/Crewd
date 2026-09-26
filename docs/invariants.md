@@ -44,7 +44,7 @@ reading — check that the named test is still meaningful, not just still green.
 
 | Invariant | Mechanism | Guard test |
 |---|---|---|
-| A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |
+| A killed run cannot record a fabricated cost | totals are read only from the terminal usage event (`result` for Claude, `end` for Grok); a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total`, `a_grok_run_that_dies_before_its_end_event_reports_no_token_total`, `a_grok_run_reports_the_end_events_usage_rather_than_a_sum_of_usage_lines` |
 | A run names the model that did its work, not today's setting | the scheduler records `Worker::model()` — the value the worker builds `--model`/`--effort` from — on the run row at `start_run`, and never updates it | `a_run_records_the_model_it_was_dispatched_with_rather_than_the_current_default` |
 | A model the CLI refuses is not silently replaced by the default | `model_not_found` on the stream is `ErrorClass::ModelNotFound`, permanent; an unknown `effort`, which the CLI would ignore with a warning, fails config load | `a_model_the_cli_refuses_quarantines_the_issue_instead_of_retrying_it`, `a_model_setting_the_cli_would_silently_ignore_is_refused_at_load` |
 
