@@ -623,8 +623,8 @@ mod tests {
     fn prompts_carrying_the_body(body: &str) -> [String; 2] {
         let issue = issue(body);
         [
-            build_prompt(&issue, None, None, &[]),
-            build_continuation_prompt(&issue, None, None, &[], true),
+            build_prompt(&issue, None, &[], &[]),
+            build_continuation_prompt(&issue, None, &[], &[], true),
         ]
     }
 
