@@ -715,6 +715,7 @@ impl Scheduler {
             last_progress: Progress::default(),
             last_progress_at: now,
             verdicts: Vec::new(),
+            handed_back: None,
             _broker: None,
         };
         self.gating.insert(issue_id.to_string(), Gating { run, handle, started: now });

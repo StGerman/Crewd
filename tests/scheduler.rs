@@ -3095,7 +3095,7 @@ fn a_conflicting_pull_request_with_no_gate_is_handed_back_to_the_agent() {
     assert_eq!(d.stage, crew::store::DeliveryStage::Redispatched);
     assert_eq!(d.ci_pending, None);
     assert!(
-        matches!(&h.worker.feedback_for("iss-1")[1], Some(Feedback::Gate { output }) if output.contains("cannot merge")),
+        matches!(&h.worker.feedback_for("iss-1")[1][..], [Feedback::Gate { output }] if output.contains("cannot merge")),
         "{:?}",
         h.worker.feedback_for("iss-1")
     );
