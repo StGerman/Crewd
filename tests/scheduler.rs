@@ -1096,7 +1096,9 @@ fn a_rate_limit_on_one_worker_does_not_pause_dispatch_to_the_other() {
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap(); // claude is limited, in the same tick iss-2 becomes eligible
 
-    assert_eq!(grok.sessions_for("iss-2").len(), 1, "grok must still be dispatched to");
+    // Grok takes the paused worker's issue first (#165); what matters here is that it is
+    // dispatched to at all.
+    assert_eq!(grok.sessions_for("iss-1").len(), 1, "grok must still be dispatched to");
     let pauses = h.sched.snapshot().unwrap().rate_limit_pauses;
     assert_eq!(pauses.len(), 1, "{pauses:?}");
     assert_eq!(pauses[0].worker, "claude");
@@ -1104,8 +1106,7 @@ fn a_rate_limit_on_one_worker_does_not_pause_dispatch_to_the_other() {
 }
 
 /// A session id means nothing to another provider, so a continuation goes back to the worker
-/// that holds its session — waiting for it while it is full or paused, never jumping to the
-/// other worker that has room.
+/// that holds its session, even while another worker has room.
 #[test]
 fn a_continuation_stays_on_the_worker_that_holds_its_session() {
     let mut h =
@@ -1127,27 +1128,159 @@ fn a_continuation_stays_on_the_worker_that_holds_its_session() {
     h.sched.tick().unwrap();
     assert_eq!(grok.sessions_for("iss-2").len(), 1, "claude's slot is reserved; grok takes it");
 
-    // The continuation comes due: back to claude, resuming its own session.
-    h.worker.script("iss-1", rate_limited(&h.clock, 1_000, 60));
+    // The continuation comes due while grok is free again: back to claude, resuming its session.
+    h.worker.script("iss-1", Script::succeeds_in(1_000));
     h.clock.advance_ms(5_000);
     h.sched.tick().unwrap();
     let seen = h.worker.sessions_for("iss-1");
     assert_eq!(seen, vec![first.clone(), Session::Resume(first.id().to_string())]);
+    assert!(grok.sessions_for("iss-1").is_empty(), "the session must not jump provider");
+}
 
-    // Claude is limited mid-run. Grok is idle, and must still not take the session.
+/// A full worker frees a slot within a run, so the issue holding its session waits for it: only
+/// a paused worker hands an issue off (#165), and a busy one would cost the session for nothing.
+#[test]
+fn a_continuation_on_a_worker_that_is_full_but_not_paused_still_waits_for_it() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let grok = two_workers(&mut h);
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed { class: ErrorClass::AgentCrash, msg: "crashed".into() }),
+    );
+    h.worker.script("iss-2", Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    let first = h.worker.sessions_for("iss-1")[0].clone();
+
+    // iss-1 fails into a backoff that reserves nothing, and iss-2 takes claude's slot.
+    h.tracker.set_dispatchable("iss-2", true);
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
-    h.sched.tick().unwrap();
-    assert!(grok.sessions_for("iss-1").is_empty(), "the session must not jump provider");
-    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and waits while claude is paused");
+    assert_eq!(h.worker.sessions_for("iss-2").len(), 1);
 
     h.worker.script("iss-1", Script::succeeds_in(1_000));
+    h.clock.advance_ms(20_000);
+    h.sched.tick().unwrap();
+    assert!(grok.sessions_for("iss-1").is_empty(), "claude is full, not paused: it waits");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+
+    h.clock.advance_ms(40_000);
+    h.sched.tick().unwrap();
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen, vec![first.clone(), Session::Resume(first.id().to_string())]);
+    assert!(grok.sessions_for("iss-1").is_empty());
+}
+
+/// A worker whose account is rate-limited may be hours from its window, while the other has a
+/// free slot and the worktree already holds the commits. The issue moves, and the new worker is
+/// told who stopped, why, and what it last said — as text, never the raw stream.
+#[test]
+fn a_paused_workers_issue_continues_on_the_other_with_a_brief_of_where_the_run_stopped() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.sched.set_transcripts(Some(
+        Transcripts::new(&h.root.join(".transcripts"), 1 << 20, 50).unwrap(),
+    ));
+    h.worker.script("iss-1", rate_limited(&h.clock, 1_000, 3_600));
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let seen = grok.sessions_for("iss-1");
+    assert_eq!(seen.len(), 1, "grok takes the issue while claude is paused");
+    assert!(matches!(seen[0], Session::New(_)), "claude's session id means nothing to grok");
+    let Some(Feedback::Handoff { from, why, last_text, then }) =
+        grok.feedback_for("iss-1")[0].clone()
+    else {
+        panic!("the handoff carries a brief: {:?}", grok.feedback_for("iss-1"));
+    };
+    assert_eq!(from, "claude");
+    assert!(why.contains("rate limit (five_hour)"), "{why}");
+    assert_eq!(
+        last_text.as_deref(),
+        Some("fake turn 3"),
+        "the last assistant text, not the stream"
+    );
+    assert_eq!(then, None);
+    let row = h.sched.snapshot().unwrap().rows.into_iter().find(|r| r.issue_id == "iss-1").unwrap();
+    assert_eq!(row.worker.as_deref(), Some("grok"), "the pin moves to the worker that ran");
+}
+
+/// A workspace whose head a test moves, standing in for a worker's commits.
+struct MovableHead(DirWorkspace, std::sync::Mutex<String>);
+
+impl Workspace for MovableHead {
+    fn prepare(&self, issue_id: &str, identifier: &str) -> Result<Prepared, WorkspaceError> {
+        let p = self.0.prepare(issue_id, identifier)?;
+        Ok(Prepared { head: Some(self.1.lock().unwrap().clone()), ..p })
+    }
+    fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
+        self.0.remove(issue_id, identifier)
+    }
+    fn path_for(&self, issue_id: &str, identifier: &str) -> PathBuf {
+        self.0.path_for(issue_id, identifier)
+    }
+    fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String> {
+        self.0.branch_for(issue_id, identifier)
+    }
+}
+
+/// A handoff parks the first worker's session rather than overwriting it, so a window that
+/// resets before the tree moves resumes the same conversation. Once the other worker has
+/// committed, the parked session describes a tree that is gone, and is not resumed.
+#[test]
+fn each_worker_keeps_its_own_session_and_it_is_resumed_only_while_the_worktree_is_unchanged() {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("crew-sched-head-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let ws = Arc::new(MovableHead(DirWorkspace::new(&root).unwrap(), "h1".to_string().into()));
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root,
+        Store::open_in_memory().unwrap(),
+        ws.clone(),
+        |_| {},
+    );
+    let grok = two_workers(&mut h);
+
+    // Claude is limited for a minute, and grok, taking over, for two.
+    h.worker.script("iss-1", rate_limited(&h.clock, 1_000, 60));
+    grok.script("iss-1", rate_limited(&h.clock, 2_000, 120));
+    h.sched.tick().unwrap();
+    let claude_first = h.worker.sessions_for("iss-1")[0].clone();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let grok_first = grok.sessions_for("iss-1")[0].clone();
+    assert!(matches!(grok_first, Session::New(_)));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    // Claude's window resets first. Grok committed nothing, so claude resumes its own session.
+    h.worker.script("iss-1", rate_limited(&h.clock, 1_000, 600));
     h.clock.advance_ms(60_000);
     h.sched.tick().unwrap();
     let seen = h.worker.sessions_for("iss-1");
-    assert_eq!(seen.len(), 3, "claude takes it back once the window resets");
-    assert_eq!(seen[2], Session::Resume(first.id().to_string()));
-    assert!(grok.sessions_for("iss-1").is_empty());
+    assert_eq!(seen, vec![claude_first.clone(), Session::Resume(claude_first.id().to_string())]);
+
+    // This time claude commits before its limit, so grok's parked session is stale.
+    *ws.1.lock().unwrap() = "h2".into();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    grok.script("iss-1", Script::succeeds_in(60_000));
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    let seen = grok.sessions_for("iss-1");
+    assert_eq!(seen.len(), 2, "grok takes it back once its window resets: {seen:?}");
+    assert!(
+        matches!(&seen[1], Session::New(id) if id != grok_first.id() && id != claude_first.id()),
+        "the tree moved since grok's handoff, so its session is not resumed: {seen:?}"
+    );
 }
 
 /// A session recorded before runs named their worker (v13) has no owner. With several workers,

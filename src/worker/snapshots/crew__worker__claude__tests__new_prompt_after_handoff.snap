@@ -1,0 +1,21 @@
+---
+source: src/worker/claude.rs
+expression: "build_prompt(&issue(), None, Some(&fb), &[])"
+---
+You are working on issue MT-1: t
+
+Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
+
+If you have made real progress but need another turn to finish, end your final message with a line reading exactly:
+CREW_OUTCOME: continue: <one-sentence reason>
+
+If you are stuck and need a human to unblock you, end your final message with:
+CREW_OUTCOME: blocked: <one-sentence reason>
+
+The previous run on this issue was on another agent, `claude`, which stopped: its account hit a rate limit (five_hour), and its window has not reset. You are taking over from it. Whatever it committed is in this worktree; read `git log` and the diff against the base for what it did.
+
+Its last message:
+Migration written; the store tests are next.
+
+From the orchestrator, on why this attempt was dispatched:
+continuation: more to do

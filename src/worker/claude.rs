@@ -927,6 +927,41 @@ mod tests {
         );
     }
 
+    /// #165: the worker taking over is told who stopped, why and what it last said, and the
+    /// feedback the attempt was sent back with still follows.
+    #[test]
+    fn a_handoff_names_the_worker_that_stopped_and_keeps_the_feedback_it_wraps() {
+        let fb = Feedback::Handoff {
+            from: "claude".into(),
+            why: "its account hit a rate limit (five_hour), and its window has not reset".into(),
+            last_text: Some("Migration written; the store tests are next.".into()),
+            then: Some(Box::new(Feedback::Gate { output: "continuation: more to do".into() })),
+        };
+        insta::assert_snapshot!(
+            "new_prompt_after_handoff",
+            build_prompt(&issue(), None, Some(&fb), &[])
+        );
+        insta::assert_snapshot!(
+            "continuation_prompt_after_handoff",
+            build_continuation_prompt(&issue(), None, Some(&fb), &[], false)
+        );
+    }
+
+    /// The brief carries the last message's text, not the tool traffic that followed it.
+    #[test]
+    fn the_last_assistant_text_is_read_past_later_tool_events() {
+        let t = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"},{"type":"tool_use","name":"Bash"},{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}"#,
+            r#"{"type":"crew_run_end"}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_text(&t).as_deref(), Some("a\nb"));
+        assert_eq!(last_assistant_text("not json"), None);
+    }
+
     #[test]
     fn review_comments_reach_the_prompt_with_their_ids_and_the_verdict_convention() {
         let fb = Feedback::Review {

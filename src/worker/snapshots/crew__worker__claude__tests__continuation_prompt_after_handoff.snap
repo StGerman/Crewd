@@ -1,0 +1,19 @@
+---
+source: src/worker/claude.rs
+expression: "build_continuation_prompt(&issue(), None, Some(&fb), &[], false)"
+---
+Continue working on MT-1. Since your previous session on this issue, another agent held it; who, and why it stopped, is below. The working directory is the same worktree, with whatever you committed still in it. Pick up where you left off.
+
+The same rules apply: commit as you go, and when the work is fully complete, simply stop. If you need another turn, end your final message with a line reading exactly:
+CREW_OUTCOME: continue: <one-sentence reason>
+
+If you are stuck and need a human to unblock you, end with:
+CREW_OUTCOME: blocked: <one-sentence reason>
+
+The previous run on this issue was on another agent, `claude`, which stopped: its account hit a rate limit (five_hour), and its window has not reset. You are taking over from it. Whatever it committed is in this worktree; read `git log` and the diff against the base for what it did.
+
+Its last message:
+Migration written; the store tests are next.
+
+From the orchestrator, on why this attempt was dispatched:
+continuation: more to do

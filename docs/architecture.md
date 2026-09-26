@@ -176,8 +176,14 @@ limit is that provider's account, so with several workers ([src/sched/workers.rs
 checked once per tick between `sweep_parked` and the two dispatch steps — until the CLI's own
 `resetsAt`, published on `Snapshot::rate_limit_pauses` so `status` reads "claude waiting on a
 five-hour limit until 09:00Z" instead of showing an idle daemon with no explanation. An issue the
-pause released keeps its session, and so stays pinned to the paused worker rather than moving to
-one that never held that conversation. A `resetsAt` the
+pause released moves to another worker with a free slot rather than waiting out the window
+(#165): the worktree already holds the commits, and a session id means nothing to the new
+provider, so it starts or resumes its *own* session and is handed a brief — who stopped, why, and
+that run's last message as the stopped worker reads its own transcript, truncated to its last
+4 KiB. The paused worker's session is parked in `worker_session` with the worktree's head rather
+than overwritten, and resumed when that worker next takes the issue only if the head has not
+moved: once the other worker has committed, the old conversation describes a tree that is gone.
+A worker that is merely full keeps its issue, since a slot frees within a run. A `resetsAt` the
 scheduler cannot trust — missing, or already behind the clock — degrades to the ordinary
 `Failed` path rather than risking a pause nothing ever lifts, the same failure mode a clock skew
 would otherwise turn into a silent, permanent stop.

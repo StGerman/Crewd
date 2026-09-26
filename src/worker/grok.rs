@@ -556,6 +556,26 @@ mod tests {
     use crate::model::Issue;
     use crate::worker::{Session, Spawn, ToolEndpoint};
 
+    /// Text arrives in chunks, and a `usage` line closes a response: the brief is the chunks
+    /// of the last response, joined.
+    #[test]
+    fn the_last_text_is_the_final_responses_chunks_joined() {
+        let t = [
+            r#"{"type":"text","data":"old "}"#,
+            r#"{"type":"text","data":"message"}"#,
+            r#"{"type":"usage"}"#,
+            r#"{"type":"thought","data":"hmm"}"#,
+            r#"{"type":"text","data":"I'll "}"#,
+            r#"{"type":"text","data":"stop here"}"#,
+            r#"{"type":"usage"}"#,
+            r#"{"type":"end"}"#,
+        ]
+        .join("\n");
+        let w = GrokWorker::new("grok", vec![], 0);
+        assert_eq!(w.last_text(&t).as_deref(), Some("I'll stop here"));
+        assert_eq!(w.last_text(""), None);
+    }
+
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_grok").join(name)
     }
