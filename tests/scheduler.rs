@@ -1194,10 +1194,9 @@ fn a_paused_workers_issue_continues_on_the_other_with_a_brief_of_where_the_run_s
     let seen = grok.sessions_for("iss-1");
     assert_eq!(seen.len(), 1, "grok takes the issue while claude is paused");
     assert!(matches!(seen[0], Session::New(_)), "claude's session id means nothing to grok");
-    let Some(Feedback::Handoff { from, why, last_text, then }) =
-        grok.feedback_for("iss-1")[0].clone()
-    else {
-        panic!("the handoff carries a brief: {:?}", grok.feedback_for("iss-1"));
+    let fed = grok.feedback_for("iss-1");
+    let [Feedback::Handoff { from, why, last_text }] = fed[0].as_slice() else {
+        panic!("the handoff carries a brief, and nothing else was queued: {fed:?}");
     };
     assert_eq!(from, "claude");
     assert!(why.contains("rate limit (five_hour)"), "{why}");
@@ -1206,7 +1205,6 @@ fn a_paused_workers_issue_continues_on_the_other_with_a_brief_of_where_the_run_s
         Some("fake turn 3"),
         "the last assistant text, not the stream"
     );
-    assert_eq!(then, None);
     let row = h.sched.snapshot().unwrap().rows.into_iter().find(|r| r.issue_id == "iss-1").unwrap();
     assert_eq!(row.worker.as_deref(), Some("grok"), "the pin moves to the worker that ran");
 }

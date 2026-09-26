@@ -930,20 +930,20 @@ mod tests {
     /// #165: the worker taking over is told who stopped, why and what it last said, and the
     /// feedback the attempt was sent back with still follows.
     #[test]
-    fn a_handoff_names_the_worker_that_stopped_and_keeps_the_feedback_it_wraps() {
-        let fb = Feedback::Handoff {
-            from: "claude".into(),
-            why: "its account hit a rate limit (five_hour), and its window has not reset".into(),
-            last_text: Some("Migration written; the store tests are next.".into()),
-            then: Some(Box::new(Feedback::Gate { output: "continuation: more to do".into() })),
-        };
-        insta::assert_snapshot!(
-            "new_prompt_after_handoff",
-            build_prompt(&issue(), None, Some(&fb), &[])
-        );
+    fn a_handoff_names_the_worker_that_stopped_and_keeps_the_feedback_after_it() {
+        let fb = [
+            Feedback::Handoff {
+                from: "claude".into(),
+                why: "its account hit a rate limit (five_hour), and its window has not reset"
+                    .into(),
+                last_text: Some("Migration written; the store tests are next.".into()),
+            },
+            Feedback::Gate { output: "continuation: more to do".into() },
+        ];
+        insta::assert_snapshot!("new_prompt_after_handoff", build_prompt(&issue(), None, &fb, &[]));
         insta::assert_snapshot!(
             "continuation_prompt_after_handoff",
-            build_continuation_prompt(&issue(), None, Some(&fb), &[], false)
+            build_continuation_prompt(&issue(), None, &fb, &[], false)
         );
     }
 
