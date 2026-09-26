@@ -102,7 +102,7 @@ pub struct FakeWorker {
     /// What delivery told each spawn about the previous run's output. The scheduler decides
     /// this, and whether a red CI or a review actually reached the next run is exactly what
     /// its tests need to see.
-    feedback: Mutex<HashMap<String, Vec<Option<Feedback>>>>,
+    feedback: Mutex<HashMap<String, Vec<Vec<Feedback>>>>,
     /// The work-in-progress snapshot each spawn was told about, for the same reason.
     wips: Mutex<HashMap<String, Vec<Vec<WipSnapshot>>>>,
     body_changed: Mutex<HashMap<String, Vec<bool>>>,
@@ -150,7 +150,7 @@ impl FakeWorker {
     }
 
     /// The delivery feedback each spawn for this issue was handed, oldest first.
-    pub fn feedback_for(&self, issue_id: &str) -> Vec<Option<Feedback>> {
+    pub fn feedback_for(&self, issue_id: &str) -> Vec<Vec<Feedback>> {
         self.feedback.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
 
@@ -170,7 +170,7 @@ impl Worker for FakeWorker {
         let Spawn { issue, session, tools, transcript, feedback, wip, body_changed, .. } = req;
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
-        self.feedback.lock().unwrap().entry(issue.id.clone()).or_default().push(feedback.cloned());
+        self.feedback.lock().unwrap().entry(issue.id.clone()).or_default().push(feedback.to_vec());
         self.wips.lock().unwrap().entry(issue.id.clone()).or_default().push(wip.to_vec());
         self.body_changed.lock().unwrap().entry(issue.id.clone()).or_default().push(body_changed);
 

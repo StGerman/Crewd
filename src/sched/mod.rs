@@ -126,6 +126,9 @@ struct Running {
     /// the run reports `Done`, with each acceptance checked against the branch *then* — before
     /// a gate can rebase it and rewrite the commits they name. Empty until that moment.
     verdicts: Vec<ReviewVerdict>,
+    /// The delivery hand-back this run was dispatched to answer, kept so a gate that sends the
+    /// run back can queue it again rather than delivery charging a second round for it (#160).
+    handed_back: Option<Feedback>,
     /// This run's authority to write to the tracker, held for exactly as long as the run is in
     /// the `running` map. Never read — dropping it is the point. Every path that ends a run
     /// removes the entry, so every path revokes the token and deletes the config file without
@@ -757,6 +760,26 @@ impl Scheduler {
         for (issue_id, verdict) in ready {
             let g = self.gating.remove(&issue_id).expect("just listed");
             let outcome = self.gate_outcome(&issue_id, &g.run, verdict)?;
+            // A hand-back the gate interrupted was never judged by delivery, so it rides along
+            // with the next run instead of coming back as a second round (#160). The brief is
+            // queued ahead of it because a retry reason is only the fallback when nothing is.
+            if outcome != Outcome::Done
+                && let Some(fb) = &g.run.handed_back
+            {
+                if let Outcome::Continue { why } = &outcome {
+                    let brief = Feedback::Gate { output: why.clone() };
+                    self.store.set_pending_feedback(
+                        self.clock.as_ref(),
+                        &issue_id,
+                        &serde_json::to_string(&brief)?,
+                    )?;
+                }
+                self.store.requeue_delivery_feedback(
+                    self.clock.as_ref(),
+                    &issue_id,
+                    &serde_json::to_string(fb)?,
+                )?;
+            }
             // The run row closes with the verdict the gate produced, not the one the agent
             // claimed: an operator reading `continue` on a run whose agent said done is reading
             // the fact that matters.
@@ -1559,9 +1582,11 @@ impl Scheduler {
         // what is left when there is no row, or the row could not be read — for a gate-sent
         // continuation, the output of the suite that disagreed with the agent's `Done`.
         //
-        // A queued conflict is taken first and wins over both: it is what stopped the most
-        // recent run, and no CI result or review on the branch can be acted on until the branch
-        // rebases again.
+        // What the issue itself queued — a conflict, or a gate brief that interrupted a
+        // hand-back — goes first: it is what stopped the most recent run, and no CI result or
+        // review on the branch can be acted on until that is dealt with. A hand-back queued
+        // with it follows in the same prompt rather than being dropped, which cost a review
+        // round on a conflict (#160).
         let parse = |j: String, source: &str| match serde_json::from_str::<Feedback>(&j) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -1569,22 +1594,25 @@ impl Scheduler {
                 None
             }
         };
-        let conflict = self
+        let queued = self
             .store
             .take_pending_feedback(self.clock.as_ref(), &issue.id)?
-            .and_then(|j| parse(j, "conflict"));
+            .and_then(|j| parse(j, "issue"));
         let delivery = self
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
             .and_then(|j| parse(j, "delivery"));
-        let feedback: Option<Feedback> = conflict
-            .or(delivery)
-            .or_else(|| brief.map(|b| Feedback::Gate { output: b.to_string() }));
+        let mut feedback: Vec<Feedback> = queued.into_iter().chain(delivery.clone()).collect();
+        if feedback.is_empty()
+            && let Some(b) = brief
+        {
+            feedback.push(Feedback::Gate { output: b.to_string() });
+        }
 
         let handle = pool_worker.spawn(Spawn {
             tools: broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
-            feedback: feedback.as_ref(),
+            feedback: &feedback,
             wip: &prepared.wip,
             body_changed,
             ..Spawn::new(issue, &prepared.path, attempt, &session)
@@ -1607,7 +1635,11 @@ impl Scheduler {
             tools = broker_session.is_some(),
             model = model.model.as_deref().unwrap_or("-"),
             effort = model.effort.map(|e| e.as_str()).unwrap_or("-"),
-            feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
+            feedback = if feedback.is_empty() {
+                "-".to_string()
+            } else {
+                feedback.iter().map(|f| f.label()).collect::<Vec<_>>().join("+")
+            },
             wip = prepared.wip.len(),
             body_changed,
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
@@ -1628,6 +1660,7 @@ impl Scheduler {
                 last_progress: Progress::default(),
                 last_progress_at: now,
                 verdicts: Vec::new(),
+                handed_back: delivery,
                 _broker: broker_session,
             },
         );
