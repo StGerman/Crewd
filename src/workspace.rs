@@ -284,7 +284,7 @@ fn classify_push(remote: &str, branch: &str, text: &str) -> ForgeError {
 
 /// What git prints when the remote refused the credential it sent: `Authentication failed` is
 /// git's own wording for a 401 over HTTPS, and `Invalid username or token` is GitHub's.
-fn is_auth_refusal(stderr: &str) -> bool {
+pub(crate) fn is_auth_refusal(stderr: &str) -> bool {
     stderr.contains("Authentication failed") || stderr.contains("Invalid username or token")
 }
 
