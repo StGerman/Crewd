@@ -1,0 +1,13 @@
+---
+source: src/tui/detail.rs
+expression: "lines.join(\"\\n\")"
+---
+┌ detail ──────────────────────────────────────────────────┐
+│MT-1  some work                                           │
+│state       In Progress  ·  running  ·  grok              │
+│turns       4 (attempt 1)                                 │
+│tokens      not yet reported                              │
+│workspace   /tmp/ws/MT-1                                  │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

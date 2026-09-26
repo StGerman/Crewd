@@ -204,6 +204,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE issue_state ADD COLUMN session_body TEXT;
     ALTER TABLE issue_state ADD COLUMN pending_feedback TEXT;
     "#,
+    // v13
+    r#"
+    -- The worker a run was dispatched to (#119). A session belongs to one provider, so the run
+    -- that holds it is what pins a continuation: a Claude session id means nothing to another
+    -- worker. NULL for a run recorded before workers were named, which pins nothing.
+    ALTER TABLE run ADD COLUMN worker TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -298,6 +305,7 @@ mod tests {
         "6a9665ba56edbe4ceccb6d168c317ca59b6b7f100e03790a66323dda541c5caf", // v10
         "3a74fa83ec2e66ebeb9a2231b6086493884f40fdabed03608e3608f2a9cd0a5d", // v11
         "1b15b60789f8f4d2dedd3427f09829947ef902234e31abcc5b9de075e8a7502e", // v12
+        "d102caf59988230bdea97ad90b36339238e95b23246d5132fe9ab356a66f449f", // v13
     ];
 
     #[test]

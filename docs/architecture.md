@@ -167,10 +167,14 @@ since the process exits with no explicit marker — and `harvest_finished` check
 `apply_outcome` even sees the outcome: a run interrupted this way charges no attempt and no
 quarantine streak, and releases the claim with `Store::release_for_rate_limit` rather than
 `release`, which is what lets the issue resume at the attempt and session it was already on
-rather than looking like a fresh start. What pauses is dispatch itself — `Scheduler::rate_limited`
-checked once per tick, between `sweep_parked` and the two dispatch steps — until the CLI's own
-`resetsAt`, published on `Snapshot::rate_limit_pause` so `status` reads "waiting on a five-hour
-limit until 09:00Z" instead of showing an idle daemon with no explanation. A `resetsAt` the
+rather than looking like a fresh start. What pauses is dispatch to the run's own worker — the
+limit is that provider's account, so with several workers ([src/sched/workers.rs](../src/sched/workers.rs),
+#119) the others keep dispatching and dispatch as a whole stops only when every worker is paused,
+checked once per tick between `sweep_parked` and the two dispatch steps — until the CLI's own
+`resetsAt`, published on `Snapshot::rate_limit_pauses` so `status` reads "claude waiting on a
+five-hour limit until 09:00Z" instead of showing an idle daemon with no explanation. An issue the
+pause released keeps its session, and so stays pinned to the paused worker rather than moving to
+one that never held that conversation. A `resetsAt` the
 scheduler cannot trust — missing, or already behind the clock — degrades to the ordinary
 `Failed` path rather than risking a pause nothing ever lifts, the same failure mode a clock skew
 would otherwise turn into a silent, permanent stop.

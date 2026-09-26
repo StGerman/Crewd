@@ -6,6 +6,7 @@ MT-7  iss-7
 issue 7
 
   phase      running
+  worker     fake
   state      in progress
   attempt    first
   turns      1
@@ -16,4 +17,4 @@ issue 7
   last event turn_completed
 
   runs (newest first)
-    iss-7-1770000000000  started 2026-02-02 02:40:00Z  ended still open  turns 0     outcome -          tokens -  model cli default
+    iss-7-1770000000000  started 2026-02-02 02:40:00Z  ended still open  turns 0     outcome -          tokens -  worker fake  model cli default

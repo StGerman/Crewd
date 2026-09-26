@@ -1,0 +1,13 @@
+---
+source: libcrew/src/render.rs
+expression: "snapshot(&snap, \"127.0.0.1:8787\")"
+---
+crewd @ 127.0.0.1:8787  —  2 running / 2 limit
+claude waiting on a five-hour limit until 2026-09-21 09:00:00Z
+tick 9, last at 2026-09-12 09:31:02Z (0s ago)
+tokens 0 in / 0 out
+
+PHASE    IDENTIFIER  WORKER  ATT  TURNS  AGE    TOKENS  STATE        TITLE
+running  MT-1        claude  1    4      1m05s  -       in progress  do the thing
+running  MT-2        grok    1    2      12s    -       in progress  do the thing
+queued   MT-3        -       -    0      -      -       in progress  do the thing

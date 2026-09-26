@@ -65,6 +65,7 @@ pub struct RunStart<'a> {
     pub session_id: &'a str,
     pub transcript: Option<&'a Path>,
     pub model: &'a ModelChoice,
+    pub worker: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -701,8 +702,9 @@ impl Store {
     pub fn start_run(&self, clock: &dyn Clock, run: &RunStart) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO run (run_id, issue_id, started_at, session_id, transcript, model, effort)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO run (run_id, issue_id, started_at, session_id, transcript, model, effort,
+                              worker)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 run.run_id,
                 run.issue_id,
@@ -711,6 +713,7 @@ impl Store {
                 run.transcript.map(|p| p.display().to_string()),
                 run.model.model,
                 run.model.effort.map(|e| e.as_str()),
+                run.worker,
             ],
         )?;
         Ok(())
@@ -721,7 +724,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id, turns, in_tok,
-                    out_tok, transcript, model, effort
+                    out_tok, transcript, model, effort, worker
              FROM run WHERE run_id = ?1",
             params![run_id],
             run_record,
@@ -734,7 +737,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id, turns, in_tok,
-                    out_tok, transcript, model, effort
+                    out_tok, transcript, model, effort, worker
              FROM run WHERE issue_id = ?1 ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map(params![issue_id], run_record)?;
@@ -812,30 +815,47 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id,
-                    turns, in_tok, out_tok, transcript, model, effort
+                    turns, in_tok, out_tok, transcript, model, effort, worker
              FROM (SELECT *, ROW_NUMBER() OVER (
                        PARTITION BY issue_id ORDER BY started_at DESC, run_id DESC) AS rn
                    FROM run)
              WHERE rn <= ?1
              ORDER BY issue_id, started_at DESC, run_id DESC",
         )?;
-        let rows = stmt.query_map(params![per_issue as i64], |r| {
-            Ok(RunRecord {
-                run_id: r.get(0)?,
-                issue_id: r.get(1)?,
-                started_at: r.get(2)?,
-                ended_at: r.get(3)?,
-                outcome: r.get(4)?,
-                session_id: r.get(5)?,
-                turns: r.get::<_, i64>(6)? as u32,
-                in_tok: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                out_tok: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                transcript: r.get(9)?,
-                model: r.get(10)?,
-                effort: r.get(11)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![per_issue as i64], run_record)?;
         rows.collect()
+    }
+
+    /// The worker holding each issue's current session: the one that ran the latest run under
+    /// that session id (#119). An issue with no session, or whose session's runs predate v13,
+    /// is absent — pinned to nothing.
+    pub fn session_workers(&self) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.issue_id,
+                    (SELECT r.worker FROM run r
+                     WHERE r.issue_id = s.issue_id AND r.session_id = s.session_id
+                       AND r.worker IS NOT NULL
+                     ORDER BY r.started_at DESC, r.run_id DESC LIMIT 1) AS w
+             FROM issue_state s WHERE s.session_id IS NOT NULL AND w IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
+    /// [`Store::session_workers`] for one issue, as one indexed lookup: dispatch asks this per
+    /// candidate, and rebuilding the whole map each time made a tick quadratic.
+    pub fn session_worker(&self, issue_id: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT r.worker FROM issue_state s JOIN run r
+               ON r.issue_id = s.issue_id AND r.session_id = s.session_id
+             WHERE s.issue_id = ?1 AND r.worker IS NOT NULL
+             ORDER BY r.started_at DESC, r.run_id DESC LIMIT 1",
+            params![issue_id],
+            |r| r.get(0),
+        )
+        .optional()
     }
 
     /// Sums over the runs that reported a total, and counts the finished ones that did not. The
@@ -885,6 +905,7 @@ fn run_record(r: &rusqlite::Row) -> rusqlite::Result<RunRecord> {
         transcript: r.get(9)?,
         model: r.get(10)?,
         effort: r.get(11)?,
+        worker: r.get(12)?,
     })
 }
 
@@ -909,8 +930,40 @@ mod tests {
         transcript: Option<&Path>,
     ) {
         let model = ModelChoice::default();
-        s.start_run(c, &RunStart { run_id, issue_id, session_id, transcript, model: &model })
-            .unwrap();
+        s.start_run(
+            c,
+            &RunStart { run_id, issue_id, session_id, transcript, model: &model, worker: "fake" },
+        )
+        .unwrap();
+    }
+
+    /// The pin is whichever worker ran the issue's *current* session: one a run under an earlier
+    /// session names does not count, and each lookup agrees with the whole map.
+    #[test]
+    fn a_session_is_pinned_to_the_worker_of_its_own_runs_only() {
+        let (s, c) = setup();
+        let model = ModelChoice::default();
+        let run = |run_id: &str, session_id: &str, worker: &str| {
+            let r = RunStart {
+                run_id,
+                issue_id: "id-1",
+                session_id,
+                transcript: None,
+                model: &model,
+                worker,
+            };
+            s.start_run(&c, &r).unwrap();
+        };
+        assert_eq!(s.session_worker("id-1").unwrap(), None, "no session, no pin");
+
+        run("r1", "old", "claude");
+        s.set_session(&c, "id-1", Some("new")).unwrap();
+        assert_eq!(s.session_worker("id-1").unwrap(), None, "the old session's run pins nothing");
+
+        c.advance_ms(1);
+        run("r2", "new", "grok");
+        assert_eq!(s.session_worker("id-1").unwrap().as_deref(), Some("grok"));
+        assert_eq!(s.session_workers().unwrap().get("id-1").map(String::as_str), Some("grok"));
     }
 
     #[test]

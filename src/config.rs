@@ -102,6 +102,11 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub worker: WorkerConfig,
+    /// Several workers side by side, in dispatch order (#119). Empty means the one `[worker]`
+    /// above with `agent.max_concurrent` slots, which is what keeps `crew.toml` unchanged; see
+    /// [`Config::workers`].
+    #[serde(default)]
+    pub workers: Vec<WorkerConfig>,
     #[serde(default)]
     pub broker: BrokerConfig,
     #[serde(default)]
@@ -311,7 +316,7 @@ impl Default for BrokerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerConfig {
     /// `fake` (default) or `claude`. Deliberately independent of `tracker.kind` — a real
     /// tracker with a fake worker is a safe way to watch real dispatch decisions without
@@ -343,11 +348,30 @@ pub struct WorkerConfig {
     /// Passed as `--effort`. Unset passes no flag.
     #[serde(default)]
     pub effort: Option<Effort>,
+    /// `[[workers]]` only: what the run rows, the rate-limit pause and every observer call this
+    /// worker. Defaults to the kind, so it needs setting only when two workers share one.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `[[workers]]` only, and required there: this worker's own slots. The single `[worker]`
+    /// takes `agent.max_concurrent` instead.
+    #[serde(default)]
+    pub max_concurrent: Option<usize>,
 }
 
 impl WorkerConfig {
     pub fn model_choice(&self) -> ModelChoice {
         ModelChoice { model: self.model.clone(), effort: self.effort }
+    }
+
+    /// A continuation is pinned to this name (#119), so it is the one identity a worker has.
+    pub fn name(&self) -> String {
+        match self.name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => match self.kind.trim().to_ascii_lowercase().as_str() {
+                "" => "fake".to_string(),
+                k => k.to_string(),
+            },
+        }
     }
 }
 
@@ -574,7 +598,7 @@ impl Config {
 
     /// Checks that must hold before the scheduling loop starts, and again before each dispatch.
     pub fn preflight(&self) -> Result<(), ConfigError> {
-        self.worker.kind()?;
+        self.check_workers()?;
         if self.tracker.kind()? == TrackerKind::Github
             && (self.tracker.owner.trim().is_empty() || self.tracker.repo.trim().is_empty())
         {
@@ -592,18 +616,11 @@ impl Config {
         if self.tracker.terminal_states.is_empty() {
             return Err(ConfigError::Invalid("tracker.terminal_states must be non-empty".into()));
         }
-        if self.agent.max_concurrent == 0 {
+        if self.workers.is_empty() && self.agent.max_concurrent == 0 {
             return Err(ConfigError::Invalid("agent.max_concurrent must be > 0".into()));
         }
         if self.agent.max_turns_per_session == 0 || self.agent.max_turns_per_issue == 0 {
             return Err(ConfigError::Invalid("turn budgets must be > 0".into()));
-        }
-        // A blank name would reach the child as `--model ""`, which the CLI refuses on every
-        // attempt — one quarantine per issue for a typo that belongs here.
-        if self.worker.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
-            return Err(ConfigError::Invalid(
-                "worker.model must not be blank; leave it unset for the CLI default".into(),
-            ));
         }
         if self.polling.interval_ms == 0 {
             return Err(ConfigError::Invalid("polling.interval_ms must be > 0".into()));
@@ -722,7 +739,60 @@ impl Config {
             .max_concurrent_by_state
             .get(state_key)
             .copied()
-            .unwrap_or(self.agent.max_concurrent)
+            .unwrap_or_else(|| self.capacity())
+    }
+
+    /// Every worker in dispatch order, each with its name and `max_concurrent` resolved. A config
+    /// with no `[[workers]]` is the one-element list of `[worker]` at `agent.max_concurrent`.
+    pub fn workers(&self) -> Vec<WorkerConfig> {
+        if self.workers.is_empty() {
+            let mut w = self.worker.clone();
+            w.max_concurrent = Some(self.agent.max_concurrent);
+            w.name = Some(w.name());
+            return vec![w];
+        }
+        self.workers.iter().map(|w| WorkerConfig { name: Some(w.name()), ..w.clone() }).collect()
+    }
+
+    /// Global capacity: the sum of every worker's slots.
+    pub fn capacity(&self) -> usize {
+        self.workers().iter().filter_map(|w| w.max_concurrent).sum()
+    }
+
+    fn check_workers(&self) -> Result<(), ConfigError> {
+        // Two sources for one list would leave the operator guessing which one ran. Any field
+        // counts, not only `kind`: `[worker] model = ...` beside `[[workers]]` would otherwise be
+        // dropped without a word.
+        if !self.workers.is_empty() && self.worker != WorkerConfig::default() {
+            return Err(ConfigError::Invalid(
+                "set either [worker] or [[workers]], not both".into(),
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for w in self.workers() {
+            w.kind()?;
+            let name = w.name();
+            // A pause and a pinned session are both keyed by name, so a shared one would pause
+            // the wrong worker and resume a session on a provider that never held it.
+            if !names.insert(name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "two workers are named {name:?}; give each [[workers]] entry its own name"
+                )));
+            }
+            if !self.workers.is_empty() && w.max_concurrent.unwrap_or(0) == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "worker {name:?} needs max_concurrent > 0"
+                )));
+            }
+            // A blank model would reach the child as `--model ""`, which the CLI refuses on every
+            // attempt — one quarantine per issue for a typo that belongs here.
+            if w.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+                return Err(ConfigError::Invalid(
+                    "worker.model must not be blank; leave it unset for the CLI default".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -745,6 +815,7 @@ mod tests {
             workspace: Default::default(),
             agent: Default::default(),
             worker: Default::default(),
+            workers: Default::default(),
             broker: Default::default(),
             api: Default::default(),
             transcripts: Default::default(),
@@ -887,6 +958,60 @@ mod tests {
         let mut blank = unset;
         blank.worker.model = Some("  ".into());
         assert!(blank.preflight().is_err(), "a blank name would reach the child as --model ''");
+    }
+
+    /// #119: a config with no `[[workers]]` is the one-element list of `[worker]` at
+    /// `agent.max_concurrent`, which is what lets every scheduler test and `crew.toml` run
+    /// unchanged.
+    #[test]
+    fn a_single_worker_config_behaves_exactly_as_before() {
+        let mut c = base();
+        c.agent.max_concurrent = 3;
+        let ws = c.workers();
+        assert_eq!(ws.len(), 1);
+        assert_eq!((ws[0].name(), ws[0].max_concurrent), ("fake".to_string(), Some(3)));
+        assert_eq!(c.capacity(), 3);
+        assert_eq!(c.state_limit("anything"), 3);
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn workers_are_listed_in_dispatch_order_and_capacity_is_their_sum() {
+        let text = "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n\
+                    terminal_states = [\"closed\"]\n\
+                    [[workers]]\nkind = \"claude\"\nmax_concurrent = 1\neffort = \"high\"\n\
+                    [[workers]]\nkind = \"fake\"\nname = \"grok\"\nmax_concurrent = 2\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert!(c.preflight().is_ok());
+        let names: Vec<_> = c.workers().iter().map(|w| w.name()).collect();
+        assert_eq!(names, ["claude", "grok"]);
+        assert_eq!(c.capacity(), 3);
+    }
+
+    /// A pause and a pinned session are keyed by worker name, so two sources for the list, a
+    /// shared name or a worker with no slots are each refused at load.
+    #[test]
+    fn an_ambiguous_worker_list_is_refused() {
+        let pool = |name: &str, max: usize| WorkerConfig {
+            kind: "fake".into(),
+            name: Some(name.into()),
+            max_concurrent: Some(max),
+            ..Default::default()
+        };
+        let mut both = base();
+        both.worker.kind = "claude".into();
+        both.workers = vec![pool("a", 1)];
+        assert!(both.preflight().is_err(), "[worker] and [[workers]] together");
+        both.worker = WorkerConfig { model: Some("opus".into()), ..Default::default() };
+        assert!(both.preflight().is_err(), "a [worker] with only a model is still a [worker]");
+
+        let mut shared = base();
+        shared.workers = vec![pool("a", 1), pool("a", 1)];
+        assert!(shared.preflight().is_err(), "two workers named alike");
+
+        let mut empty = base();
+        empty.workers = vec![pool("a", 0)];
+        assert!(empty.preflight().is_err(), "a worker with no slots");
     }
 
     #[test]

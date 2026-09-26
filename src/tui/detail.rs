@@ -36,7 +36,15 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
             Span::raw("  "),
             Span::raw(r.title.clone()),
         ]),
-        field("state", format!("{}  ·  {}", r.tracker_state, r.phase.label())),
+        // The worker rides on this line rather than its own: the pane is a fixed nine rows, and
+        // a line of its own would push the workspace and transcript out of view (#119).
+        field(
+            "state",
+            match &r.worker {
+                Some(w) => format!("{}  ·  {}  ·  {w}", r.tracker_state, r.phase.label()),
+                None => format!("{}  ·  {}", r.tracker_state, r.phase.label()),
+            },
+        ),
         field(
             "turns",
             match r.attempt {
@@ -104,4 +112,41 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
     }
 
     f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    /// #119: with two workers the dashboard has to say which one is on the selected issue.
+    #[test]
+    fn the_detail_pane_names_the_worker_on_the_issue() {
+        let row = Row {
+            issue_id: "iss-1".into(),
+            identifier: "MT-1".into(),
+            title: "some work".into(),
+            tracker_state: "In Progress".into(),
+            phase: Phase::Running,
+            attempt: 1,
+            turns: 4,
+            worker: Some("grok".into()),
+            workspace: Some("/tmp/ws/MT-1".into()),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(60, 9)).unwrap();
+        term.draw(|f| render(f, f.area(), Some(&row))).unwrap();
+        let buf = term.backend().buffer();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .into()
+            })
+            .collect();
+        insta::assert_snapshot!(lines.join("\n"));
+    }
 }

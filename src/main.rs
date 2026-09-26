@@ -24,7 +24,7 @@ use crew::api::{Api, Command};
 use crew::broker::fake::FakeWrites;
 use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use crew::clock::{Clock, SystemClock};
-use crew::config::{Config, TrackerKind, WorkerKind};
+use crew::config::{Config, TrackerKind, WorkerConfig, WorkerKind};
 use crew::credentials::{Credentials, GithubApp, GithubAppFile, StaticToken};
 use crew::forge::fake::FakeForge;
 use crew::forge::github::GithubForge;
@@ -32,7 +32,7 @@ use crew::forge::{Forge, Publisher};
 use crew::gate::{Gate, GitGate};
 use crew::init;
 use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
-use crew::sched::{Scheduler, Snapshot};
+use crew::sched::{Scheduler, Snapshot, WorkerPool};
 use crew::store::Store;
 use crew::tracker::Tracker;
 use crew::tracker::fake::FakeTracker;
@@ -167,36 +167,17 @@ async fn main() -> anyhow::Result<()> {
 
     // `Config::load` ran preflight, which parses both; matching on the enums rather than a
     // string comparison is what keeps a new kind from falling through to the fake (#69).
-    let worker_kind = cfg.worker.kind()?;
     let tracker_kind = cfg.tracker.kind()?;
-
-    // Deliberately independent of the tracker: see WorkerConfig's doc for why a real tracker
-    // does not imply a real worker.
-    let worker: Arc<dyn Worker> = match worker_kind {
-        WorkerKind::Claude => {
-            let bin = cfg.worker.bin.clone().unwrap_or_else(|| "claude".to_string());
-            // An operator-supplied list replaces the default outright rather than extending it,
-            // so what reaches the child is exactly what the config says.
-            let env_allowlist =
-                cfg.worker.env_allowlist.clone().unwrap_or_else(|| {
-                    DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
-                });
-            Arc::new(
-                ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
-                    .with_model(cfg.worker.model_choice()),
-            )
-        }
-        WorkerKind::Fake => {
-            let fake = Arc::new(FakeWorker::new(clock.clone()));
-            // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
-            // silently ignored, since none of those ids would ever be dispatched) against a
-            // real tracker's real ids.
-            if tracker_kind == TrackerKind::Fake {
-                seed_demo_scripts(&fake);
-            }
-            fake
-        }
-    };
+    let mut pools = Vec::new();
+    for w in cfg.workers() {
+        let kind = w.kind()?;
+        pools.push(WorkerPool {
+            name: w.name(),
+            worker: build_worker(&w, kind, &cfg, &clock, tracker_kind),
+            max_concurrent: w.max_concurrent.unwrap_or(cfg.agent.max_concurrent),
+        });
+    }
+    let real_worker = cfg.workers().iter().any(|w| w.kind().ok() == Some(WorkerKind::Claude));
 
     // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
     // broker over the same credential, which never leaves this process either way.
@@ -277,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if worker_kind == WorkerKind::Claude && tracker_kind == TrackerKind::Github {
+    if real_worker && tracker_kind == TrackerKind::Github {
         tracing::warn!(
             "real tracker + real worker: this run will dispatch actual coding agents against \
              real issues and let them commit to real worktrees"
@@ -289,7 +270,8 @@ async fn main() -> anyhow::Result<()> {
         db = %db_path.display(),
         workspaces = %ws_root.display(),
         tracker = %cfg.tracker.kind,
-        limit = cfg.agent.max_concurrent,
+        limit = cfg.capacity(),
+        workers = ?pools.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
         "starting"
     );
 
@@ -334,8 +316,9 @@ async fn main() -> anyhow::Result<()> {
         (forge, publisher)
     });
 
-    let mut sched =
-        Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
+    let first = pools[0].worker.clone();
+    let mut sched = Scheduler::new(cfg, clock.clone(), store, tracker, first, workspace, projector);
+    sched.set_workers(pools);
     sched.set_broker(broker);
     sched.set_transcripts(transcripts);
     sched.set_gate(gate);
@@ -531,6 +514,42 @@ fn start_broker(
 
 /// Give the demo tracker a spread of behaviours so the dashboard shows every state worth
 /// recognising: clean completions, work that continues, a hard failure, and a wedged agent.
+/// One configured worker. Deliberately independent of the tracker: see `WorkerConfig`'s doc for
+/// why a real tracker does not imply a real worker.
+fn build_worker(
+    w: &WorkerConfig,
+    kind: WorkerKind,
+    cfg: &Config,
+    clock: &Arc<dyn Clock>,
+    tracker_kind: TrackerKind,
+) -> Arc<dyn Worker> {
+    match kind {
+        WorkerKind::Claude => {
+            let bin = w.bin.clone().unwrap_or_else(|| "claude".to_string());
+            // An operator-supplied list replaces the default outright rather than extending it,
+            // so what reaches the child is exactly what the config says.
+            let env_allowlist = w
+                .env_allowlist
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
+            Arc::new(
+                ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
+                    .with_model(w.model_choice()),
+            )
+        }
+        WorkerKind::Fake => {
+            let fake = Arc::new(FakeWorker::new(clock.clone()));
+            // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
+            // silently ignored, since none of those ids would ever be dispatched) against a
+            // real tracker's real ids.
+            if tracker_kind == TrackerKind::Fake {
+                seed_demo_scripts(&fake);
+            }
+            fake
+        }
+    }
+}
+
 fn seed_demo_scripts(w: &FakeWorker) {
     use crew::model::{ErrorClass, Outcome};
 

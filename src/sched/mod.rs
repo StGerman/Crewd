@@ -20,8 +20,10 @@
 pub mod delivery;
 pub mod retry;
 mod review_summary;
+pub mod workers;
 
 pub use delivery::DeliveryView;
+pub use workers::WorkerPool;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -43,9 +45,16 @@ use crate::transcript::Transcripts;
 use crate::worker::{Progress, RunHandle, Session, Spawn, Worker};
 use crate::workspace::Workspace;
 
-/// Continuations holding a concurrency slot through their delay: issue id to the state key the
-/// slot counts against (#86).
-type Reservations = HashMap<String, String>;
+/// Continuations holding a concurrency slot through their delay (#86), by issue id.
+type Reservations = HashMap<String, Reservation>;
+
+/// What one reserved slot counts against: its state's limit, and the worker its continuation is
+/// pinned to (#119).
+#[derive(Clone)]
+struct Reservation {
+    state: String,
+    worker: String,
+}
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
 const KILL_GRACE_MS: u64 = 10_000;
@@ -111,6 +120,8 @@ struct Running {
     last_progress_at: Mono,
     /// Tracker state when this run began, to tell real progress from spinning.
     state_at_start: String,
+    /// The pool that spawned it, whose slot it holds and whose pause its rate limit sets.
+    worker: String,
     /// The run's review verdicts as delivery will apply them: read off the handle the moment
     /// the run reports `Done`, with each acceptance checked against the branch *then* — before
     /// a gate can rebase it and rewrite the commits they name. Empty until that moment.
@@ -139,7 +150,8 @@ pub struct Scheduler {
     clock: Arc<dyn Clock>,
     store: Store,
     tracker: Arc<dyn Tracker>,
-    worker: Arc<dyn Worker>,
+    /// In dispatch order; never empty. See [`workers`].
+    workers: Vec<WorkerPool>,
     workspace: Arc<dyn Workspace>,
     projector: Arc<dyn Projector>,
     /// `None` when the broker could not start, or the operator turned it off. Dispatch carries
@@ -179,12 +191,12 @@ pub struct Scheduler {
     /// a restart reclaims what closed while the process was down without waiting a full
     /// interval. See [`Scheduler::sweep_parked`].
     last_parked_sweep: Option<Mono>,
-    /// Set when the agent CLI itself reported a rejected, account-wide rate limit; cleared once
-    /// `resets_at` has passed. Not persisted — a restart mid-pause simply re-learns it from the
+    /// Keyed by worker name: set when that worker's agent CLI reported a rejected, account-wide
+    /// rate limit, and cleared once `resets_at` has passed (#119). Not persisted — a restart mid-pause simply re-learns it from the
     /// next dispatch that hits the same limit, which costs one wasted dispatch and nothing more:
     /// that run still charges no attempt, the same as the one that set the pause in the first
     /// place (#37).
-    rate_limit_pause: Option<RateLimitPause>,
+    rate_limit_pauses: HashMap<String, RateLimitPause>,
     ticks: u64,
     last_error: Option<String>,
 }
@@ -200,12 +212,20 @@ impl Scheduler {
         workspace: Arc<dyn Workspace>,
         projector: Arc<dyn Projector>,
     ) -> Self {
+        // The one-element list a config without `[[workers]]` describes; `set_workers` replaces
+        // it for one that has them.
+        let first = cfg.workers().remove(0);
+        let pool = WorkerPool {
+            name: first.name(),
+            worker,
+            max_concurrent: first.max_concurrent.unwrap_or(cfg.agent.max_concurrent),
+        };
         Self {
             cfg,
             clock,
             store,
             tracker,
-            worker,
+            workers: vec![pool],
             workspace,
             projector,
             broker: None,
@@ -221,7 +241,7 @@ impl Scheduler {
             no_progress: HashMap::new(),
             recovered: false,
             last_parked_sweep: None,
-            rate_limit_pause: None,
+            rate_limit_pauses: HashMap::new(),
             ticks: 0,
             last_error: None,
         }
@@ -300,10 +320,9 @@ impl Scheduler {
 
         // Checked after the housekeeping above and before the two dispatch steps it guards:
         // reclaiming a closed parked issue's workspace has nothing to do with the account being
-        // throttled, but starting a new agent does. Clears itself the moment `resets_at` has
-        // passed, so a tick that finds the window already reset needs no separate step
-        // remembering to un-pause (#37).
-        if self.rate_limited() {
+        // throttled, but starting a new agent does (#37). Only when every worker is paused;
+        // otherwise `pick_worker` skips the paused ones and the rest keep dispatching (#119).
+        if self.all_rate_limited() {
             self.publish()?;
             return Ok(());
         }
@@ -312,17 +331,6 @@ impl Scheduler {
         self.dispatch_new()?;
         self.publish()?;
         Ok(())
-    }
-
-    /// True while dispatch is paused for an account-wide rate limit that has not yet lifted.
-    fn rate_limited(&mut self) -> bool {
-        let Some(p) = &self.rate_limit_pause else { return false };
-        if self.clock.wall().0 >= p.resets_at {
-            tracing::info!(kind = %p.kind, "rate limit window reset; resuming dispatch");
-            self.rate_limit_pause = None;
-            return false;
-        }
-        true
     }
 
     // ---- startup recovery ----------------------------------------------------
@@ -513,9 +521,8 @@ impl Scheduler {
     /// An account-wide rate limit interrupted this run rather than the run failing on its own
     /// account, so the claim is released exactly as it was found
     /// (`Store::release_for_rate_limit`, not `release`) — the issue resumes at the attempt and
-    /// session it was already on once the pause lifts. `resets_at_ms` widens rather than
-    /// replaces an existing pause, in case two runs interrupted by the same account-wide limit
-    /// report it with a few seconds' drift between them (#37).
+    /// session it was already on once the pause lifts. Only the run's own worker pauses: the
+    /// limit is that provider's account, not every worker's (#119).
     fn pause_for_rate_limit(
         &mut self,
         issue_id: &str,
@@ -528,13 +535,11 @@ impl Scheduler {
         self.store.add_turns(issue_id, p.turns)?;
         self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
 
-        let resets_at =
-            self.rate_limit_pause.as_ref().map_or(resets_at_ms, |p| p.resets_at.max(resets_at_ms));
         tracing::warn!(
-            issue_id, identifier = %r.issue.identifier, kind, resets_at,
-            "account-wide rate limit; pausing dispatch until it resets"
+            issue_id, identifier = %r.issue.identifier, worker = %r.worker, kind, resets_at_ms,
+            "account-wide rate limit; pausing this worker's dispatch until it resets"
         );
-        self.rate_limit_pause = Some(RateLimitPause { kind, resets_at });
+        self.pause_worker(&r.worker, kind, resets_at_ms);
         Ok(())
     }
 
@@ -1146,46 +1151,40 @@ impl Scheduler {
                 .all(|want| issue.labels.iter().any(|l| l == want))
     }
 
-    /// Capacity counts gating runs and reserved continuations as well as running ones.
-    ///
-    /// A gate is work on this machine — a rebase and then whatever `gate.commands` names, which
-    /// for this repository is a `cargo test`. Counting only `running` frees the slot the moment
-    /// the agent exits, so a fast worker in front of a slow gate lets `dispatch_new` start
-    /// another agent while the last one's suite is still compiling. Nothing bounds that: the
-    /// gates accumulate, and `max_concurrent` stops describing how many builds the host is
-    /// running. The claim is held across the gate for the same reason, so counting it here is
-    /// what makes the two agree.
-    ///
-    /// A continuation waiting out its delay counts too, or `dispatch_new` hands its slot to
-    /// whatever became eligible in the same tick and the continuing issue loses its place in
-    /// the milestone order at every session boundary (#86).
-    fn global_slots(&self, reserved: &Reservations) -> usize {
-        let used = self.running.len() + self.gating.len() + reserved.len();
-        self.cfg.agent.max_concurrent.saturating_sub(used)
-    }
-
     fn state_slots(&self, state_key: &str, reserved: &Reservations) -> usize {
         let used = self
             .running
             .values()
             .chain(self.gating.values().map(|g| &g.run))
             .map(|r| r.issue.state_key())
-            .chain(reserved.values().cloned())
+            .chain(reserved.values().map(|r| r.state.clone()))
             .filter(|k| k == state_key)
             .count();
-        self.cfg.state_limit(state_key).saturating_sub(used)
+        // Unset falls back to the workers' capacity rather than `Config::state_limit`'s, which
+        // cannot see pools `set_workers` attached.
+        let limit = self.cfg.agent.max_concurrent_by_state.get(state_key).copied();
+        limit.unwrap_or_else(|| self.capacity()).saturating_sub(used)
     }
 
     /// Continuations holding a slot, read from the retry rows themselves so a reservation
     /// cannot outlive the row it belongs to: `release`, `clear_retry` and quarantine all end
-    /// it by deleting that row.
+    /// it by deleting that row. Each counts against the worker holding its session.
     fn reservations(&self) -> anyhow::Result<Reservations> {
+        let pins = self.store.session_workers()?;
         Ok(self
             .store
             .all_retries()?
             .into_iter()
-            .filter_map(|r| r.reserved_state.map(|k| (r.issue_id, k)))
+            .filter_map(|r| {
+                let state = r.reserved_state?;
+                let worker = self.reserving_worker(pins.get(&r.issue_id).map(String::as_str));
+                Some((r.issue_id, Reservation { state, worker }))
+            })
             .collect())
+    }
+
+    fn reserving_worker(&self, pin: Option<&str>) -> String {
+        self.resolve_pin(pin).unwrap_or_else(|| self.default_worker())
     }
 
     /// Dispatch every retry that is due, and re-read every continuation still holding a slot.
@@ -1270,7 +1269,9 @@ impl Scheduler {
                         entry.reason.as_deref().unwrap_or_default(),
                         Some(&key),
                     )?;
-                    reserved.insert(issue.id.clone(), key);
+                    let pin = self.store.session_worker(&issue.id)?;
+                    let worker = self.reserving_worker(pin.as_deref());
+                    reserved.insert(issue.id.clone(), Reservation { state: key, worker });
                 }
                 continue;
             }
@@ -1291,21 +1292,25 @@ impl Scheduler {
             } else {
                 reserved.clone()
             };
-            if self.global_slots(&counted) == 0 || self.state_slots(&key, &counted) == 0 {
+            // A continuation goes back to the worker holding its session, and waits for it when
+            // that worker is full or paused rather than jumping provider (#119).
+            let pin = self.store.session_worker(&issue.id)?;
+            let worker = self.pick_worker(pin.as_deref(), &counted);
+            let Some(worker) = worker.filter(|_| self.state_slots(&key, &counted) > 0) else {
                 // Leave the entry in place; it is already due and will be retried next tick.
                 tracing::debug!(issue_id = %issue.id, "no slots for retry; deferring");
                 if let Some(k) = own {
                     reserved.insert(issue.id.clone(), k);
                 }
                 continue;
-            }
+            };
 
             let issue = issue.clone();
             self.store.clear_retry(&issue.id)?;
             // The retry reason is the one thing the orchestrator knows about this attempt that
             // the agent cannot see from inside the worktree — for a gate-sent continuation, the
             // output of the suite that disagreed with its `Done`.
-            self.launch(&issue, entry.attempt, entry.reason.as_deref())?;
+            self.launch(&issue, entry.attempt, entry.reason.as_deref(), &worker)?;
         }
         Ok(())
     }
@@ -1339,7 +1344,8 @@ impl Scheduler {
 
         let reserved = self.reservations()?;
         for issue in sorted {
-            if self.global_slots(&reserved) == 0 {
+            // No worker with room for anyone: nothing further down the queue can go either.
+            if self.pick_worker(None, &reserved).is_none() {
                 break;
             }
             self.seen.insert(issue.id.clone(), issue.clone());
@@ -1388,7 +1394,13 @@ impl Scheduler {
             // would tell the worker and the transcript this is a first attempt while the store
             // still says it is the Nth, which is exactly the disagreement the pause exists to
             // avoid.
-            self.launch(&issue, st.attempt, None)?;
+            //
+            // An issue holding a session — one a rate limit or a human's unblock sent back
+            // through here — is pinned to its worker like a continuation, and skipped while
+            // that worker has no room (#119).
+            let pin = self.store.session_worker(&issue.id)?;
+            let Some(worker) = self.pick_worker(pin.as_deref(), &reserved) else { continue };
+            self.launch(&issue, st.attempt, None, &worker)?;
         }
         Ok(())
     }
@@ -1398,7 +1410,16 @@ impl Scheduler {
     /// The claim commits before the worker exists. The spec spawns first and records the claim
     /// afterwards, leaving a window in which a fast-exiting worker reports against state that
     /// has not been written yet.
-    fn launch(&mut self, issue: &Issue, attempt: u32, brief: Option<&str>) -> anyhow::Result<()> {
+    fn launch(
+        &mut self,
+        issue: &Issue,
+        attempt: u32,
+        brief: Option<&str>,
+        worker: &str,
+    ) -> anyhow::Result<()> {
+        let pool = self.pool(worker).expect("pick_worker only names a configured worker");
+        let (pool_worker, pool_name) = (pool.worker.clone(), pool.name.clone());
+
         self.store.ensure(
             self.clock.as_ref(),
             &issue.id,
@@ -1459,9 +1480,21 @@ impl Scheduler {
         // The conversation is named here, before the process exists, for the same reason the
         // claim is written first: a run that dies early must still leave behind a name its
         // continuation can resume, and the child cannot be the one to record it.
-        let session = match self.store.get(&issue.id)?.and_then(|s| s.session_id) {
-            Some(id) => Session::Resume(id),
-            None => {
+        //
+        // A session held by another worker is not resumed: its id means nothing to this
+        // provider (#119). `pick_worker` never sends a pinned issue elsewhere, so this is the
+        // case of a worker removed from the config since the session began. A session no run
+        // names a worker for predates v13: with one worker it can only be that worker's, and
+        // with several, overflow may have sent it to another provider, so it starts fresh.
+        let pin = self.store.session_worker(&issue.id)?;
+        let stored = self.store.get(&issue.id)?.and_then(|s| s.session_id);
+        let owned = match pin.as_deref() {
+            Some(p) => p == pool_name,
+            None => self.workers.len() == 1,
+        };
+        let session = match stored {
+            Some(id) if owned => Session::Resume(id),
+            _ => {
                 let id = session_id(&issue.id, self.clock.wall().0);
                 self.store.set_session(self.clock.as_ref(), &issue.id, Some(&id))?;
                 Session::New(id)
@@ -1482,7 +1515,7 @@ impl Scheduler {
         let transcript_path = transcript.as_ref().map(|t| t.path().to_path_buf());
         // Asked of the worker, not read from `cfg`: the worker is what builds the argv, so this
         // is the one source that cannot disagree with what the child was given.
-        let model = self.worker.model();
+        let model = pool_worker.model();
         self.store.start_run(
             self.clock.as_ref(),
             &RunStart {
@@ -1491,6 +1524,7 @@ impl Scheduler {
                 session_id: session.id(),
                 transcript: transcript_path.as_deref(),
                 model: &model,
+                worker: &pool_name,
             },
         )?;
 
@@ -1540,7 +1574,7 @@ impl Scheduler {
             .or(delivery)
             .or_else(|| brief.map(|b| Feedback::Gate { output: b.to_string() }));
 
-        let handle = self.worker.spawn(Spawn {
+        let handle = pool_worker.spawn(Spawn {
             tools: broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
             feedback: feedback.as_ref(),
@@ -1562,6 +1596,7 @@ impl Scheduler {
             branch = prepared.branch.as_deref().unwrap_or("-"),
             session = session.id(),
             resumed = session.is_resume(),
+            worker = %pool_name,
             tools = broker_session.is_some(),
             model = model.model.as_deref().unwrap_or("-"),
             effort = model.effort.map(|e| e.as_str()).unwrap_or("-"),
@@ -1577,6 +1612,7 @@ impl Scheduler {
             Running {
                 run_id,
                 state_at_start: issue.state.clone(),
+                worker: pool_name,
                 issue: issue.clone(),
                 handle,
                 started: now,
@@ -1634,6 +1670,9 @@ impl Scheduler {
             }
 
             let runs = history.remove(&st.issue_id).unwrap_or_default();
+            let worker = run
+                .map(|r| r.worker.clone())
+                .or_else(|| runs.first().and_then(|r| r.worker.clone()));
 
             rows.push(Row {
                 issue_id: st.issue_id.clone(),
@@ -1663,6 +1702,7 @@ impl Scheduler {
                     .and_then(|r| r.transcript.as_ref().map(|p| p.display().to_string()))
                     .or_else(|| transcripts.get(&st.issue_id).cloned()),
                 delivery: deliveries.remove(&st.issue_id),
+                worker,
             });
         }
 
@@ -1682,7 +1722,7 @@ impl Scheduler {
             generated_at: now_wall,
             running: self.running.len() + self.gating.len(),
             reserved: retries.values().filter(|r| r.reserved_state.is_some()).count(),
-            limit: self.cfg.agent.max_concurrent,
+            limit: self.capacity(),
             retrying: retries.len(),
             quarantined: states.iter().filter(|s| s.is_quarantined()).count(),
             tokens: totals.counted,
@@ -1690,7 +1730,7 @@ impl Scheduler {
             ticks: self.ticks,
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
-            rate_limit_pause: self.rate_limit_pause.clone(),
+            rate_limit_pauses: self.published_pauses(),
             rows,
         })
     }

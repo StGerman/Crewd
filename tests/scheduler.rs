@@ -14,9 +14,9 @@ use crew::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceC
 use crew::gate::Verdict as GateVerdict;
 use crew::gate::fake::{FakeGate, GateScript};
 use crew::gate::{Gate, GateHandle, GitGate};
-use crew::model::{ErrorClass, Issue, Outcome, Phase};
+use crew::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
 use crew::project::{NoopProjector, Projector, TasksProjector};
-use crew::sched::Scheduler;
+use crew::sched::{Scheduler, WorkerPool};
 use crew::store::Store;
 use crew::tracker::TrackerError;
 use crew::tracker::fake::FakeTracker;
@@ -102,6 +102,7 @@ fn harness_full(
         workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
         agent: AgentConfig::default(),
         worker: Default::default(),
+        workers: Default::default(),
         broker: Default::default(),
         api: Default::default(),
         transcripts: Default::default(),
@@ -920,7 +921,14 @@ fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupt
         "no per-issue retry timer owns this — dispatch itself is what pauses"
     );
 
-    let pause = h.sched.snapshot().unwrap().rate_limit_pause.expect("the pause must be published");
+    let pause = h
+        .sched
+        .snapshot()
+        .unwrap()
+        .rate_limit_pauses
+        .first()
+        .cloned()
+        .expect("the pause must be published");
     assert_eq!(pause.kind, "five_hour");
 
     // Before the reset: dispatch stays paused, account-wide.
@@ -932,7 +940,7 @@ fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupt
     h.clock.advance_ms(60_000);
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 2, "dispatch resumes once the window resets");
-    assert!(h.sched.snapshot().unwrap().rate_limit_pause.is_none());
+    assert!(h.sched.snapshot().unwrap().rate_limit_pauses.is_empty());
 
     for (id, first) in [("iss-1", &first_sessions[0]), ("iss-2", &first_sessions[1])] {
         let seen = h.worker.sessions_for(id);
@@ -982,7 +990,10 @@ fn a_rate_limit_pause_does_not_disturb_runs_already_in_flight() {
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 0);
     assert_eq!(h.sched.store().get("iss-2").unwrap().unwrap().phase, Phase::Released);
-    assert!(h.sched.snapshot().unwrap().rate_limit_pause.is_some(), "the pause itself outlives it");
+    assert!(
+        !h.sched.snapshot().unwrap().rate_limit_pauses.is_empty(),
+        "the pause itself outlives it"
+    );
 }
 
 /// A `resets_at` the scheduler cannot trust — missing, or already behind the clock — must not
@@ -1007,13 +1018,177 @@ fn a_rate_limit_with_no_usable_resets_at_degrades_to_ordinary_backoff() {
         h.sched.tick().unwrap();
 
         assert!(
-            h.sched.snapshot().unwrap().rate_limit_pause.is_none(),
+            h.sched.snapshot().unwrap().rate_limit_pauses.is_empty(),
             "resets_at {resets_at:?} must not pause anything"
         );
         let st = h.sched.store().get("iss-1").unwrap().unwrap();
         assert_eq!(st.attempt, 1, "resets_at {resets_at:?} falls back to charging the attempt");
         assert!(!h.sched.store().all_retries().unwrap().is_empty(), "an ordinary retry is queued");
     }
+}
+
+// ---- several workers (#119) --------------------------------------------------
+
+/// A second worker beside the harness's own, one slot each, in dispatch order: the harness's
+/// worker as `claude`, then the returned one as `grok`.
+fn two_workers(h: &mut Harness) -> Arc<FakeWorker> {
+    let grok = Arc::new(FakeWorker::new(h.clock.clone()));
+    h.sched.set_workers(vec![
+        WorkerPool { name: "claude".into(), worker: h.worker.clone(), max_concurrent: 1 },
+        WorkerPool { name: "grok".into(), worker: grok.clone(), max_concurrent: 1 },
+    ]);
+    grok
+}
+
+fn rate_limited(clock: &FakeClock, in_ms: u64, for_secs: i64) -> Script {
+    Script::succeeds_in(in_ms)
+        .with_outcome(Outcome::Failed {
+            class: ErrorClass::AgentCrash,
+            msg: "session limit".into(),
+        })
+        .with_rate_limit(RateLimitSignal {
+            kind: "five_hour".into(),
+            resets_at: Some(clock.wall().0 / 1_000 + for_secs),
+        })
+}
+
+/// Overflow routing: one queue, and the next issue goes to the first worker in order with a
+/// free slot — Claude first, then Grok, then Claude again once its slot frees.
+#[test]
+fn an_issue_goes_to_the_first_worker_with_a_free_slot() {
+    let issues = (1..=3).map(|n| issue(n, "In Progress", Some(n as i32))).collect();
+    let mut h = harness(issues, |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.script("iss-1", Script::succeeds_in(1_000));
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "the first issue goes to claude");
+    assert_eq!(grok.sessions_for("iss-2").len(), 1, "claude is full, so the next goes to grok");
+    assert!(h.worker.sessions_for("iss-3").is_empty() && grok.sessions_for("iss-3").is_empty());
+    let snap = h.sched.snapshot().unwrap();
+    assert_eq!((snap.running, snap.limit), (2, 2), "global capacity is the sum");
+    let worker_of = |id: &str| snap.rows.iter().find(|r| r.issue_id == id).unwrap().worker.clone();
+    assert_eq!(worker_of("iss-1").as_deref(), Some("claude"));
+    assert_eq!(worker_of("iss-2").as_deref(), Some("grok"));
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // iss-1 finishes, freeing claude's slot
+    assert_eq!(h.worker.sessions_for("iss-3").len(), 1, "back to claude once its slot frees");
+    assert!(grok.sessions_for("iss-3").is_empty());
+}
+
+/// A Claude five-hour limit is Claude's account, not Grok's: the other worker keeps
+/// dispatching, and only the limited worker's pause is published.
+#[test]
+fn a_rate_limit_on_one_worker_does_not_pause_dispatch_to_the_other() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let grok = two_workers(&mut h);
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script("iss-1", rate_limited(&h.clock, 1_000, 60));
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // claude is limited, in the same tick iss-2 becomes eligible
+
+    assert_eq!(grok.sessions_for("iss-2").len(), 1, "grok must still be dispatched to");
+    let pauses = h.sched.snapshot().unwrap().rate_limit_pauses;
+    assert_eq!(pauses.len(), 1, "{pauses:?}");
+    assert_eq!(pauses[0].worker, "claude");
+    assert_eq!(pauses[0].kind, "five_hour");
+}
+
+/// A session id means nothing to another provider, so a continuation goes back to the worker
+/// that holds its session — waiting for it while it is full or paused, never jumping to the
+/// other worker that has room.
+#[test]
+fn a_continuation_stays_on_the_worker_that_holds_its_session() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let grok = two_workers(&mut h);
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+    grok.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    let first = h.worker.sessions_for("iss-1")[0].clone();
+
+    // The continuation holds claude's slot through its delay, so the new issue overflows.
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(grok.sessions_for("iss-2").len(), 1, "claude's slot is reserved; grok takes it");
+
+    // The continuation comes due: back to claude, resuming its own session.
+    h.worker.script("iss-1", rate_limited(&h.clock, 1_000, 60));
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen, vec![first.clone(), Session::Resume(first.id().to_string())]);
+
+    // Claude is limited mid-run. Grok is idle, and must still not take the session.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+    assert!(grok.sessions_for("iss-1").is_empty(), "the session must not jump provider");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and waits while claude is paused");
+
+    h.worker.script("iss-1", Script::succeeds_in(1_000));
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen.len(), 3, "claude takes it back once the window resets");
+    assert_eq!(seen[2], Session::Resume(first.id().to_string()));
+    assert!(grok.sessions_for("iss-1").is_empty());
+}
+
+/// A session recorded before runs named their worker (v13) has no owner. With several workers,
+/// overflow may hand the issue to a provider that never held it, so it starts fresh rather than
+/// resuming an id that means nothing there.
+#[test]
+fn an_ownerless_session_is_not_resumed_when_there_are_several_workers() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    let st = h.sched.store();
+    st.ensure(h.clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1")).unwrap();
+    st.set_session(h.clock.as_ref(), "iss-1", Some("legacy-session")).unwrap();
+
+    h.sched.tick().unwrap();
+
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen.len(), 1);
+    assert!(matches!(&seen[0], Session::New(id) if id != "legacy-session"), "{seen:?}");
+    assert!(grok.sessions_for("iss-1").is_empty());
+}
+
+/// A gate is a build on this host, and it holds the slot of the worker whose run produced it:
+/// a finished Claude run in its gate leaves Claude full, so the next issue goes to Grok.
+#[test]
+fn a_gating_run_holds_the_slot_of_the_worker_that_produced_it() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let grok = two_workers(&mut h);
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate));
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.set_default(Script::succeeds_in(1_000));
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "claude's run is in its gate");
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "the gate still holds claude's slot");
+    assert_eq!(grok.sessions_for("iss-2").len(), 1);
 }
 
 // ---- handoff gate -----------------------------------------------------------
