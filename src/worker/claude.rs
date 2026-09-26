@@ -549,9 +549,22 @@ fn run_reader(
     state.1.notify_all();
 }
 
-fn drain_capped(r: impl Read) -> String {
+/// Reads until the pipe closes. Bytes past the cap are discarded, not left unread: stopping
+/// while the handle is still open fills the pipe and the child blocks in its next write.
+fn drain_capped(mut r: impl Read) -> String {
     let mut buf = Vec::new();
-    let _ = r.take(MAX_CAPTURED_BYTES as u64).read_to_end(&mut buf);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = MAX_CAPTURED_BYTES.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    }
     String::from_utf8_lossy(&buf).trim().to_string()
 }
 
@@ -661,6 +674,15 @@ mod tests {
             "input is the result's input + cache creation + cache read; output is its own"
         );
 
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_run_whose_stderr_fills_the_pipe_still_reaches_its_result_event() {
+        let ws = tmp_workspace("stderr");
+        let w = ClaudeWorker::new(fixture("chatty_stderr.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
         std::fs::remove_dir_all(&ws).ok();
     }
 

@@ -45,6 +45,9 @@ use crate::transcript::TranscriptWriter;
 use libcrew::TokenUsage;
 
 const MAX_CAPTURED_BYTES: usize = 4096;
+/// Joined `text` kept for the outcome marker and the review lines. The marker is at the end
+/// of the final message, so the tail is what the parser needs.
+const MAX_TEXT_BYTES: usize = 8192;
 
 pub struct GrokWorker {
     bin: PathBuf,
@@ -365,7 +368,7 @@ fn run_reader(
         match value.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 if let Some(data) = value.get("data").and_then(|d| d.as_str()) {
-                    text.push_str(data);
+                    append_capped(&mut text, data, MAX_TEXT_BYTES);
                     let mut g = state.0.lock();
                     g.progress.last_event = Some(truncate(&text, 120));
                 }
@@ -477,17 +480,35 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+fn append_capped(buf: &mut String, data: &str, max_bytes: usize) {
+    buf.push_str(data);
+    if buf.len() <= max_bytes {
+        return;
+    }
+    let mut cut = buf.len() - max_bytes;
+    while !buf.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buf.drain(..cut);
+}
+
+/// Reads until the pipe closes. Bytes past the cap are discarded, not left unread: stopping
+/// while the handle is still open fills the pipe and the child blocks in its next write.
 fn drain_capped(mut r: impl Read) -> String {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    while buf.len() < MAX_CAPTURED_BYTES {
-        let n = match r.read(&mut chunk) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
             Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&chunk[..n.min(MAX_CAPTURED_BYTES - buf.len())]);
+            Ok(n) => {
+                let room = MAX_CAPTURED_BYTES.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 #[cfg(test)]
@@ -704,5 +725,24 @@ mod tests {
         assert!(create_private_file(&path).is_err(), "create_new must refuse the symlink");
         assert_eq!(std::fs::read(&stolen).unwrap(), b"original");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_marker_past_the_text_cap_is_still_read() {
+        let ws = tmp_workspace("cap");
+        let w = GrokWorker::new(fixture("past_the_cap.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
+        assert_eq!(wait_for_finish(&h), Outcome::Continue { why: "past the cap".into() });
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_run_whose_stderr_fills_the_pipe_still_reaches_its_end_event() {
+        let ws = tmp_workspace("stderr");
+        let w = GrokWorker::new(fixture("chatty_stderr.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        assert_eq!(h.progress().tokens.map(|t| (t.input, t.output)), Some((1, 1)));
+        std::fs::remove_dir_all(&ws).ok();
     }
 }

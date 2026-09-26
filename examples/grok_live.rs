@@ -63,6 +63,7 @@ fn main() -> anyhow::Result<()> {
     println!("grok version: {version}");
 
     let probe = temp_repo()?;
+    let mut prompts = PromptFiles::default();
     println!("throwaway repo: {}", probe.display());
 
     let home = std::env::var("HOME").unwrap_or_default();
@@ -70,7 +71,7 @@ fn main() -> anyhow::Result<()> {
 
     // Already observed: a resume of an id the CLI does not hold fails cleanly, with no stream
     // and no hang. Asserted because a hang here would pin a scheduler slot forever.
-    let unknown_prompt = write_prompt("Say hi.")?;
+    let unknown_prompt = write_prompt(&mut prompts, "Say hi.")?;
     let unknown_args = vec![
         "--cwd".into(),
         probe.display().to_string(),
@@ -95,7 +96,7 @@ fn main() -> anyhow::Result<()> {
     );
     anyhow::ensure!(unknown.stdout.is_empty(), "unknown resume produced a stream");
 
-    let bad_model_prompt = write_prompt("Say hi.")?;
+    let bad_model_prompt = write_prompt(&mut prompts, "Say hi.")?;
     let bad_model_id = crew::model::session_id("grok-live-bad-model", std::process::id() as i64);
     let bad_model_args = vec![
         "--cwd".into(),
@@ -119,6 +120,7 @@ fn main() -> anyhow::Result<()> {
 
     let fresh_id = crew::model::session_id("grok-live-fresh", std::process::id() as i64 + 1);
     let fresh_prompt = write_prompt(
+        &mut prompts,
         "The project instructions name a probe passphrase. Create notes.txt whose single line \
          is that passphrase. Commit it with the message \"probe\". Do nothing else. End your \
          final message with exactly this line:\nCREW_OUTCOME: continue: probe-fresh\n",
@@ -135,6 +137,7 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(fresh.code == Some(0), "fresh session exit {:?}\n{}", fresh.code, fresh.stderr);
 
     let resume_prompt = write_prompt(
+        &mut prompts,
         "Append a second line `resumed` to notes.txt and commit it with the message \"probe \
          resume\". End your final message with exactly this line:\nCREW_OUTCOME: blocked: \
          probe-resume\n",
@@ -161,6 +164,7 @@ fn main() -> anyhow::Result<()> {
     // emits a terminal event. The turn budget in #120 depends on that answer.
     let sig_id = crew::model::session_id("grok-live-sigterm", std::process::id() as i64 + 2);
     let sig_prompt = write_prompt(
+        &mut prompts,
         "Read CLAUDE.md with your file tool, then write count.txt containing the number 1. \
          Take one tool call at a time.",
     )?;
@@ -395,11 +399,34 @@ fn write_fixture(name: &str, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_prompt(text: &str) -> anyhow::Result<String> {
+/// Prompt files for the probe. Dropped when `main` returns, including on failure, so a
+/// passphrase written for the agent does not stay in the shared temp directory.
+#[derive(Default)]
+struct PromptFiles(Vec<PathBuf>);
+
+impl Drop for PromptFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+            if let Some(dir) = path.parent() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+    }
+}
+
+fn write_prompt(kept: &mut PromptFiles, text: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("crewd-grok-live-{}-{n}.txt", std::process::id()));
-    fs::write(&path, text)?;
+    let dir = std::env::temp_dir().join(format!("crewd-grok-live-{}-{n}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join("prompt");
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+    file.write_all(text.as_bytes())?;
+    kept.0.push(path.clone());
     Ok(path.display().to_string())
 }
 
