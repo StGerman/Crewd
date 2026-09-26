@@ -674,8 +674,11 @@ impl Scheduler {
             return Ok(());
         };
         let reserved = self.reservations().map_err(StepError::Other)?;
-        if self.global_slots(&reserved) == 0 || self.state_slots(&issue.state_key(), &reserved) == 0
-        {
+        // A gate holds a slot on the worker whose session it gates, as a reservation does (#119).
+        let pin = self.store.session_worker(issue_id)?;
+        let worker = self.reserving_worker(pin.as_deref());
+        let worker_slots = self.pool(&worker).map_or(0, |p| self.worker_slots(p, &reserved));
+        if worker_slots == 0 || self.state_slots(&issue.state_key(), &reserved) == 0 {
             tracing::debug!(issue_id, "{what}; no slot to gate in, re-gating next poll");
             return Ok(());
         }
@@ -706,6 +709,7 @@ impl Scheduler {
             transcript: None,
             last_progress: Progress::default(),
             last_progress_at: now,
+            worker,
             verdicts: Vec::new(),
             _broker: None,
         };
