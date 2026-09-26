@@ -427,7 +427,8 @@ fn write_prompt(kept: &mut PromptFiles, text: &str) -> anyhow::Result<String> {
 
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("crewd-grok-live-{}-{n}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("crewd-grok-live-prompt-{}-{n}", std::process::id()));
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let path = dir.join("prompt");
     let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
@@ -440,7 +441,7 @@ fn temp_repo() -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("crewd-grok-live-{}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("crewd-grok-live-repo-{}-{n}", std::process::id()));
     // `create` fails if the name exists. Nothing is deleted first: a predictable path that
     // this process did not create is not this process's to remove.
     fs::DirBuilder::new().mode(0o700).create(&dir)?;

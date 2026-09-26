@@ -342,9 +342,11 @@ fn run_reader(
     let mut saw_valid_line = false;
     let mut text = String::new();
     let mut model_error: Option<String> = None;
-    // Held until the child is reaped, like the budget's `Continue`: a published outcome is the
-    // scheduler's signal that the run is over and its workspace free (review on #166).
-    let mut model_not_found: Option<Outcome> = None;
+    // The verdict of an `end` or an unknown model, held until the child is reaped, like the
+    // budget's `Continue`: a published outcome is the scheduler's signal that the run is over
+    // and its workspace free, and `grok` can still be running after its last line (review on
+    // #166).
+    let mut terminal: Option<Outcome> = None;
     // Set at the budget, applied only after `wait`. Publishing `Continue` earlier lets the
     // scheduler reuse the worktree while this process is still in it.
     let mut budget_hit = false;
@@ -398,7 +400,7 @@ fn run_reader(
             Some("error") => {
                 let msg = value.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
                 if msg.contains("unknown model id") {
-                    model_not_found = Some(Outcome::Failed {
+                    terminal = Some(Outcome::Failed {
                         class: ErrorClass::ModelNotFound,
                         msg: truncate(&msg, 500),
                     });
@@ -407,13 +409,14 @@ fn run_reader(
                 }
             }
             Some("end") => {
-                if model_not_found.is_some() {
+                if terminal.is_some() {
                     break;
                 }
                 let mut g = state.0.lock();
                 g.progress.tokens = end_usage(&value);
                 g.verdicts = extract_verdicts(&text);
-                g.outcome = Some(outcome_from_text(&text, model_error.as_deref()));
+                drop(g);
+                terminal = Some(outcome_from_text(&text, model_error.as_deref()));
                 break;
             }
             _ => {}
@@ -441,9 +444,9 @@ fn run_reader(
     let mut g = state.0.lock();
     if budget_hit {
         g.outcome = Some(Outcome::Continue { why: "session turn budget reached".into() });
-    } else if let Some(outcome) = model_not_found {
+    } else if let Some(outcome) = terminal {
         g.outcome = Some(outcome);
-    } else if g.outcome.is_none() {
+    } else {
         let msg = if !saw_any_line {
             "process produced no output before exiting".to_string()
         } else if !saw_valid_line {
@@ -659,6 +662,19 @@ mod tests {
             Outcome::Failed { class: ErrorClass::ModelNotFound, .. } => {}
             other => panic!("expected ModelNotFound, got {other:?}"),
         }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// Review on #166: an `end` is not the process's exit. Published on the line, the verdict let
+    /// the scheduler reclaim a workspace a live `grok` was still flushing into.
+    #[test]
+    fn a_finished_run_is_reported_only_once_the_child_has_exited() {
+        let ws = tmp_workspace("end-lingers");
+        let w = GrokWorker::new(fixture("end_then_lingers.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        assert!(ws.join("exited").exists(), "the verdict came while the child was still running");
+        assert_eq!(h.progress().tokens.map(|t| (t.input, t.output)), Some((14, 4)));
         std::fs::remove_dir_all(&ws).ok();
     }
 
