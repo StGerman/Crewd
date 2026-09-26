@@ -4265,6 +4265,74 @@ fn a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes
     assert_eq!(forge.open_prs().len(), 1);
 }
 
+/// #160, as on PR #133: a review round's run said `Done`, its gate hit a conflict the agent may
+/// resolve, and the brief went out alone — so the next run fixed only the conflict and delivery
+/// handed the same comments back as a second round. The brief and the comments go in one prompt,
+/// and the round is charged once.
+#[test]
+fn a_review_hand_back_preempted_by_a_conflict_brief_is_carried_in_the_same_prompt_and_charged_once()
+{
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        resolvable,
+    );
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    gate.set_default(GateScript::passes_in(1_000));
+
+    // First run, gated and delivered; a reviewer comments on the pull request.
+    run_once(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+
+    // Round one is dispatched with the comment; its gate then conflicts on a resolvable path.
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["CLAUDE.md".into()],
+        base_sha: BASE.into(),
+    }));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
+    assert_eq!(handed_ids(&h, "iss-1", 1), vec![c.clone()]);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "the round's run said done and is being gated");
+
+    // The next run answers the comment and resolves the conflict, both from one prompt.
+    gate.set_default(GateScript::passes_in(1_000));
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c.clone(),
+        verdict: Verdict::Accepted,
+        detail: "abc1234".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    let fb = h.worker.feedback_for("iss-1");
+    assert_eq!(fb.len(), 3, "the conflict was sent back to an agent: {fb:?}");
+    let [Feedback::Gate { output }, Feedback::Review { comments, .. }] = &fb[2][..] else {
+        panic!("the brief first, then the comments it interrupted: {:?}", fb[2]);
+    };
+    assert!(output.contains("CLAUDE.md"), "the brief names the conflict: {output}");
+    assert_eq!(comments.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![c.clone()]);
+
+    // It finishes, the gate passes, delivery settles the comment: no second round is charged.
+    for _ in 0..4 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.rounds_pr, 1, "one round of review, whatever interrupted it: {d:?}");
+    assert_eq!(d.rounds_issue, 1);
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready, "{d:?}");
+    assert!(h.sched.store().verdicts_for("iss-1").unwrap().contains_key(&c));
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 3, "and no fourth run");
+}
+
 /// #108. A gate conflict is a human's problem, and once the human has resolved it the issue has
 /// to be handed back without closing and reopening its ticket. The unblock lifts the park and
 /// nothing else, so the next tick dispatches through the ordinary path — and `prepare` attaches

@@ -1161,6 +1161,33 @@ mod tests {
         );
     }
 
+    /// #160: a conflict brief that interrupted a review hand-back once went out alone, and the
+    /// comments came back as a second round.
+    #[test]
+    fn a_conflict_brief_and_the_review_it_interrupted_share_one_prompt() {
+        let fb = [
+            Feedback::Gate {
+                output: "the handoff gate's rebase onto master conflicted in CLAUDE.md.".into(),
+            },
+            Feedback::Review {
+                pr_url: "https://github.com/o/r/pull/9".into(),
+                comments: vec![crate::forge::ReviewComment {
+                    id: "4059939692".into(),
+                    author: "Copilot".into(),
+                    path: Some("src/config.rs".into()),
+                    line: Some(79),
+                    body: "This field is missing `#[serde(default)]`".into(),
+                    url: None,
+                }],
+                unanswered_before: vec![],
+            },
+        ];
+        insta::assert_snapshot!(
+            "continuation_prompt_conflict_then_review",
+            build_continuation_prompt(&issue(), None, &fb, &[], false)
+        );
+    }
+
     #[test]
     fn review_comments_reach_the_prompt_with_their_ids_and_the_verdict_convention() {
         let fb = Feedback::Review {
