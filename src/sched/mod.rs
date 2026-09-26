@@ -35,14 +35,12 @@ use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
 use crate::forge::{Forge, Publisher};
 use crate::gate::{self, Gate, GateHandle, Verdict};
-use crate::model::{
-    ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, session_id, worktree_key,
-};
+use crate::model::{ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RetryEntry, RunRecord, RunStart, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::transcript::Transcripts;
-use crate::worker::{Progress, RunHandle, Session, Spawn, Worker};
+use crate::worker::{Progress, RunHandle, Spawn, Worker};
 use crate::workspace::Workspace;
 
 /// Continuations holding a concurrency slot through their delay (#86), by issue id.
@@ -1316,8 +1314,8 @@ impl Scheduler {
             } else {
                 reserved.clone()
             };
-            // A continuation goes back to the worker holding its session, and waits for it when
-            // that worker is full or paused rather than jumping provider (#119).
+            // A continuation goes back to the worker holding its session, and waits for it while
+            // that worker is full (#119); a paused one hands it to whichever has room (#165).
             let pin = self.store.session_worker(&issue.id)?;
             let worker = self.pick_worker(pin.as_deref(), &counted);
             let Some(worker) = worker.filter(|_| self.state_slots(&key, &counted) > 0) else {
@@ -1421,7 +1419,7 @@ impl Scheduler {
             //
             // An issue holding a session — one a rate limit or a human's unblock sent back
             // through here — is pinned to its worker like a continuation, and skipped while
-            // that worker has no room (#119).
+            // that worker is full (#119).
             let pin = self.store.session_worker(&issue.id)?;
             let Some(worker) = self.pick_worker(pin.as_deref(), &reserved) else { continue };
             self.launch(&issue, st.attempt, None, &worker)?;
@@ -1503,34 +1501,20 @@ impl Scheduler {
 
         // The conversation is named here, before the process exists, for the same reason the
         // claim is written first: a run that dies early must still leave behind a name its
-        // continuation can resume, and the child cannot be the one to record it.
-        //
-        // A session held by another worker is not resumed: its id means nothing to this
-        // provider (#119). `pick_worker` never sends a pinned issue elsewhere, so this is the
-        // case of a worker removed from the config since the session began. A session no run
-        // names a worker for predates v13: with one worker it can only be that worker's, and
-        // with several, overflow may have sent it to another provider, so it starts fresh.
-        let pin = self.store.session_worker(&issue.id)?;
-        let stored = self.store.get(&issue.id)?.and_then(|s| s.session_id);
-        let owned = match pin.as_deref() {
-            Some(p) => p == pool_name,
-            None => self.workers.len() == 1,
-        };
-        let session = match stored {
-            Some(id) if owned => Session::Resume(id),
-            _ => {
-                let id = session_id(&issue.id, self.clock.wall().0);
-                self.store.set_session(self.clock.as_ref(), &issue.id, Some(&id))?;
-                Session::New(id)
-            }
-        };
+        // continuation can resume, and the child cannot be the one to record it. After
+        // `prepare`, because whether a handed-off session is still resumable depends on the
+        // worktree's head.
+        let (session, handed_from) =
+            self.choose_session(&issue.id, &pool_name, prepared.head.as_deref())?;
         // A resumed session holds the body it was started with, and nothing newer: a decision
         // written into the description since then is otherwise never read (#109). An unknown
         // previous hash counts as changed — re-sending a body costs a few tokens, missing one
-        // costs the attempt.
+        // costs the attempt. The recorded hash is the issue's, not each session's, so a session
+        // resumed after another worker held the issue is sent the body again.
         let body_hash = blake3::hash(issue.body.as_deref().unwrap_or("").as_bytes()).to_hex();
         let seen = self.store.swap_session_body(self.clock.as_ref(), &issue.id, &body_hash)?;
-        let body_changed = session.is_resume() && seen.as_deref() != Some(body_hash.as_str());
+        let body_changed = session.is_resume()
+            && (handed_from.is_some() || seen.as_deref() != Some(body_hash.as_str()));
         // Opened before the process exists, like the claim and the session name, and for a
         // reason specific to this one: a run that dies in its first second is exactly the run
         // someone will want the bytes from, so the file and the record of where it went both
@@ -1607,6 +1591,11 @@ impl Scheduler {
             && let Some(b) = brief
         {
             feedback.push(Feedback::Gate { output: b.to_string() });
+        }
+        // A handoff goes first: it is who this run is taking over from, and every other item
+        // reads as that worker's unfinished business (#165).
+        if let Some(from) = handed_from.as_deref() {
+            feedback.insert(0, self.handoff_brief(&issue.id, from)?);
         }
 
         let handle = pool_worker.spawn(Spawn {

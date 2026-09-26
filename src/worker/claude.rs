@@ -401,6 +401,25 @@ impl Worker for ClaudeWorker {
     fn model(&self) -> ModelChoice {
         self.model.clone()
     }
+
+    fn last_text(&self, transcript: &str) -> Option<String> {
+        last_assistant_text(transcript)
+    }
+}
+
+/// Every text block of the last `assistant` event in a `stream-json` transcript that has any.
+/// Read from the end, because the transcript of a long run is mostly tool traffic before it.
+pub(crate) fn last_assistant_text(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        if v.get("type")?.as_str()? != "assistant" {
+            return None;
+        }
+        let blocks = v.pointer("/message/content")?.as_array()?;
+        let text: Vec<&str> =
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect();
+        (!text.is_empty()).then(|| text.join("\n"))
+    })
 }
 
 /// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the

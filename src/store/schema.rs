@@ -211,6 +211,20 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- worker. NULL for a run recorded before workers were named, which pins nothing.
     ALTER TABLE run ADD COLUMN worker TEXT;
     "#,
+    // v14
+    r#"
+    -- A session another worker took the issue over from (#165). `issue_state.session_id` holds
+    -- only the pinned worker's, so without this a handoff overwrote the one id the first worker
+    -- could resume. `head` is the worktree's commit at the handoff: the session describes that
+    -- tree, and is resumed only while the worktree still sits on it.
+    CREATE TABLE IF NOT EXISTS worker_session (
+      issue_id   TEXT NOT NULL REFERENCES issue_state(issue_id),
+      worker     TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      head       TEXT,
+      PRIMARY KEY (issue_id, worker)
+    );
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -306,6 +320,7 @@ mod tests {
         "3a74fa83ec2e66ebeb9a2231b6086493884f40fdabed03608e3608f2a9cd0a5d", // v11
         "1b15b60789f8f4d2dedd3427f09829947ef902234e31abcc5b9de075e8a7502e", // v12
         "d102caf59988230bdea97ad90b36339238e95b23246d5132fe9ab356a66f449f", // v13
+        "520562198a072368e0c51621f67c99d360a8e0f4201dc3f0d9b94330499bbf2e", // v14
     ];
 
     #[test]

@@ -145,6 +145,27 @@ impl Worker for GrokWorker {
         self.model.clone()
     }
 
+    /// The `text` chunks of the last response, joined. A `usage` line closes a response, so
+    /// text after one starts the next message rather than extending the last.
+    fn last_text(&self, transcript: &str) -> Option<String> {
+        let mut text = String::new();
+        let mut closed = false;
+        for line in transcript.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if std::mem::take(&mut closed) {
+                        text.clear();
+                    }
+                    text.push_str(v.get("data").and_then(|d| d.as_str()).unwrap_or_default());
+                }
+                Some("usage") => closed = true,
+                _ => {}
+            }
+        }
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
         let Spawn {
             issue,

@@ -859,6 +859,47 @@ impl Store {
         .optional()
     }
 
+    /// Keep `worker`'s session for this issue while another worker takes it over (#165),
+    /// replacing any it parked before. `head` is the worktree's commit at the handoff.
+    pub fn park_session(
+        &self,
+        issue_id: &str,
+        worker: &str,
+        session_id: &str,
+        head: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO worker_session (issue_id, worker, session_id, head)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![issue_id, worker, session_id, head],
+        )?;
+        Ok(())
+    }
+
+    /// Remove and return `worker`'s parked session and the head it was parked at. Taken rather
+    /// than read: a worker dispatched again either resumes it, making it the pinned session, or
+    /// finds the tree moved and starts a new one, and neither leaves a use for the old row.
+    pub fn take_parked_session(
+        &self,
+        issue_id: &str,
+        worker: &str,
+    ) -> rusqlite::Result<Option<(String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT session_id, head FROM worker_session WHERE issue_id = ?1 AND worker = ?2",
+                params![issue_id, worker],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        conn.execute(
+            "DELETE FROM worker_session WHERE issue_id = ?1 AND worker = ?2",
+            params![issue_id, worker],
+        )?;
+        Ok(row)
+    }
+
     /// Sums over the runs that reported a total, and counts the finished ones that did not. The
     /// count travels with the sum because the sum is only meaningful alongside it: "12k tokens
     /// across 3 runs, 2 more uncounted" is a cost figure; "12k tokens" alone is a lower bound
@@ -965,6 +1006,21 @@ mod tests {
         run("r2", "new", "grok");
         assert_eq!(s.session_worker("id-1").unwrap().as_deref(), Some("grok"));
         assert_eq!(s.session_workers().unwrap().get("id-1").map(String::as_str), Some("grok"));
+    }
+
+    /// Each worker's parked session is its own: parking one does not touch the other's, and a
+    /// take hands it over exactly once.
+    #[test]
+    fn a_parked_session_belongs_to_one_worker_and_is_taken_once() {
+        let (s, _c) = setup();
+        s.park_session("id-1", "claude", "c-1", Some("abc")).unwrap();
+        s.park_session("id-1", "grok", "g-1", None).unwrap();
+        s.park_session("id-1", "claude", "c-2", Some("def")).unwrap();
+
+        let claude = s.take_parked_session("id-1", "claude").unwrap();
+        assert_eq!(claude, Some(("c-2".to_string(), Some("def".to_string()))));
+        assert_eq!(s.take_parked_session("id-1", "claude").unwrap(), None, "taken once");
+        assert_eq!(s.take_parked_session("id-1", "grok").unwrap(), Some(("g-1".into(), None)));
     }
 
     #[test]

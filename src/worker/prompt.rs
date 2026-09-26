@@ -124,6 +124,10 @@ pub(crate) fn build_continuation_prompt(
             "Your previous session on this issue reported its work finished, but the \
              orchestrator could not hand the branch off; what stopped it is below."
         }
+        Some(Feedback::Handoff { .. }) => {
+            "Since your previous session on this issue, another agent held it; who, and why \
+             it stopped, is below."
+        }
         _ => {
             "Your previous session on this issue ended before the work was finished — either \
              you asked for another turn, or the orchestrator's per-session turn budget stopped \
@@ -221,6 +225,17 @@ pub(crate) fn feedback_help(feedback: &[Feedback]) -> String {
                  still conflicts with {base}.\n",
                     paths.join(", ")
                 ));
+            }
+            Feedback::Handoff { from, why, last_text } => {
+                s.push_str(&format!(
+                    "\nThe previous run on this issue was on another agent, `{from}`, which \
+                     stopped: {why}. You are taking over from it. Whatever it committed is in \
+                     this worktree; read `git log` and the diff against the base for what it \
+                     did.\n"
+                ));
+                if let Some(t) = last_text.as_deref().filter(|t| !t.trim().is_empty()) {
+                    s.push_str(&format!("\nIts last message:\n{}\n", t.trim_end()));
+                }
             }
             Feedback::Ci { pr_url, failures } => {
                 s.push_str(&format!(
