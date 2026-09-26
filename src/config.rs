@@ -381,6 +381,7 @@ impl WorkerConfig {
 pub enum WorkerKind {
     Fake,
     Claude,
+    Grok,
 }
 
 impl WorkerConfig {
@@ -390,8 +391,9 @@ impl WorkerConfig {
         match self.kind.trim().to_ascii_lowercase().as_str() {
             "" | "fake" => Ok(WorkerKind::Fake),
             "claude" => Ok(WorkerKind::Claude),
+            "grok" => Ok(WorkerKind::Grok),
             _ => Err(ConfigError::Invalid(format!(
-                "unsupported worker.kind {:?}; expected one of \"fake\", \"claude\"",
+                "unsupported worker.kind {:?}; expected one of \"fake\", \"claude\", \"grok\"",
                 self.kind
             ))),
         }
@@ -1069,6 +1071,8 @@ mod tests {
             ("Fake", WorkerKind::Fake),
             ("claude", WorkerKind::Claude),
             (" CLAUDE", WorkerKind::Claude),
+            ("grok", WorkerKind::Grok),
+            (" Grok", WorkerKind::Grok),
         ] {
             c.worker.kind = kind.into();
             assert_eq!(c.worker.kind().unwrap(), want);

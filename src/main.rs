@@ -42,6 +42,7 @@ use crew::tui::{Ui, UiAction};
 use crew::worker::Worker;
 use crew::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
 use crew::worker::fake::{FakeWorker, Script};
+use crew::worker::grok::GrokWorker;
 use crew::workspace::GitWorktreeWorkspace;
 use tokio::sync::{mpsc, watch};
 
@@ -177,7 +178,10 @@ async fn main() -> anyhow::Result<()> {
             max_concurrent: w.max_concurrent.unwrap_or(cfg.agent.max_concurrent),
         });
     }
-    let real_worker = cfg.workers().iter().any(|w| w.kind().ok() == Some(WorkerKind::Claude));
+    let real_worker = cfg
+        .workers()
+        .iter()
+        .any(|w| matches!(w.kind().ok(), Some(WorkerKind::Claude | WorkerKind::Grok)));
 
     // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
     // broker over the same credential, which never leaves this process either way.
@@ -534,6 +538,19 @@ fn build_worker(
                 .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
             Arc::new(
                 ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
+                    .with_model(w.model_choice()),
+            )
+        }
+        WorkerKind::Grok => {
+            let bin = w.bin.clone().unwrap_or_else(|| "grok".to_string());
+            // The same list Claude gets. Nothing is added: Grok's login lives in the keychain
+            // the way Claude's does, and a tracker credential is still not a worker's to hold.
+            let env_allowlist = w
+                .env_allowlist
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
+            Arc::new(
+                GrokWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
                     .with_model(w.model_choice()),
             )
         }

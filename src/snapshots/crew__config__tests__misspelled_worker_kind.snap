@@ -2,4 +2,4 @@
 source: src/config.rs
 expression: c.preflight().unwrap_err()
 ---
-invalid config: unsupported worker.kind "cluade"; expected one of "fake", "claude"
+invalid config: unsupported worker.kind "cluade"; expected one of "fake", "claude", "grok"

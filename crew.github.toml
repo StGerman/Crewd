@@ -35,13 +35,20 @@ interval_ms = 30000
 root = ".crew/workspaces"
 repo = "."
 
-# Live dispatch: real `claude -p` processes, with `--permission-mode bypassPermissions`, against
-# real git worktrees. Flipping this is the separate, deliberate decision `WorkerConfig`'s doc
-# describes — a real tracker on its own only watches; this is what turns watching into working.
-[worker]
+# Live dispatch. Claude first, then Grok: overflow fills the free slot (#119, #120). Each entry
+# is its own account and its own slot. `agent.max_concurrent` is not the fleet size once this
+# list is set.
+[[workers]]
 kind = "claude"
+max_concurrent = 1
 # Pinned so dogfood runs are reproducible and every run row names what did the work (#36).
 model = "claude-opus-5-5"
+effort = "medium"
+
+[[workers]]
+kind = "grok"
+max_concurrent = 1
+model = "grok-4.7"
 effort = "medium"
 
 [agent]
@@ -55,13 +62,11 @@ effort = "medium"
 # Memory is not what binds here today, though. Five concurrent agents drove the account's
 # five-hour token window to 1.05 utilization in minutes. Since #37 a rejection pauses dispatch
 # until `resetsAt` instead of quarantining each interrupted issue, so hitting the window no
-# longer costs quarantines, but this number is still a burn-rate dial: raising it does not buy
-# throughput once the window is the limit, it only reaches the pause sooner. One also means
-# issues run strictly in the order dispatch picks them, with no two branches built off the
-# same base at once.
+# longer costs quarantines, but this number is still a burn-rate dial when `[[workers]]` is
+# absent. With that list set, each entry's `max_concurrent` is the slot, and this key is unused.
 max_concurrent = 1
-# Budgets sized for a real agent rather than for the fake worker. A turn is one `assistant`
-# event, so a slice of work runs to dozens of them; at 20 the session was cut every 20 tool
+# Budgets sized for a real agent rather than for the fake worker. A turn is one model round
+# (`assistant` for Claude, `usage` for Grok), so a slice of work runs to dozens of them; at 20 the session was cut every 20 tool
 # calls, and at 40 cumulative the issue quarantined before the work could land.
 max_turns_per_session = 40
 # Raised from 200 after #27 hit that ceiling with its implementation landed and only its TUI

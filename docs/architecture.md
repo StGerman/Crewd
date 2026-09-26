@@ -125,7 +125,9 @@ this scope; a literal per-issue quarantine here would be quarantining tickets a 
 nothing to do with.
 
 `Worker` gets its real implementation in [src/worker/claude.rs](../src/worker/claude.rs):
-`ClaudeWorker`, over `claude -p --output-format stream-json`. Two things there were confirmed
+`ClaudeWorker`, over `claude -p --output-format stream-json`. [src/worker/grok.rs](../src/worker/grok.rs)
+is the same contract over `grok --output-format streaming-json` (#120), checked against `grok 1.0.41`:
+a turn is a `usage` event, totals come only from `end`, and a Grok run is spawned with no broker tools. Two things there were confirmed
 against a real install rather than assumed, because guessing wrong would have meant a worker
 that silently never worked: there is no `--max-turns` flag, so the per-session turn budget is
 self-enforced — the reader thread counts `assistant` events and sends `SIGTERM` once the count

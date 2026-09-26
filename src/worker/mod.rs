@@ -6,6 +6,8 @@
 
 pub mod claude;
 pub mod fake;
+pub mod grok;
+pub(crate) mod prompt;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -246,5 +248,11 @@ pub trait Worker: Send + Sync {
     /// model to choose.
     fn model(&self) -> ModelChoice {
         ModelChoice::default()
+    }
+
+    /// Whether `launch` should open a broker session for this worker. Grok is not handed
+    /// tracker tools (#120); the default keeps Claude's path unchanged.
+    fn uses_tools(&self) -> bool {
+        true
     }
 }
