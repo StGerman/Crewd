@@ -6,5 +6,5 @@ crewd @ [ADDR]  —  1 running / 10 limit
 tick 1, last at 2026-02-02 02:40:00Z (0s ago)
 tokens 0 in / 0 out
 
-PHASE    IDENTIFIER  ATT  TURNS  AGE  TOKENS  STATE        TITLE
-running  MT-7        -    1      -    -       in progress  issue 7
+PHASE    IDENTIFIER  WORKER  ATT  TURNS  AGE  TOKENS  STATE        TITLE
+running  MT-7        fake    -    1      -    -       in progress  issue 7

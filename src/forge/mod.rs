@@ -75,6 +75,11 @@ pub struct PullRequest {
     /// Logins with a review request outstanding. A reviewer who has already posted a review is
     /// no longer in this list — check [`Forge::reviews`] too before concluding nobody attached.
     pub requested_reviewers: Vec<String>,
+    /// Whether the pull request can merge into its base: `Some(false)` for a conflict, `None`
+    /// while the provider is still computing it — which GitHub does after every push, and which
+    /// is not a conflict. A list endpoint never carries it, so only [`Forge::pull_request`] does.
+    #[serde(default)]
+    pub mergeable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

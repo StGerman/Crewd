@@ -167,10 +167,14 @@ since the process exits with no explicit marker — and `harvest_finished` check
 `apply_outcome` even sees the outcome: a run interrupted this way charges no attempt and no
 quarantine streak, and releases the claim with `Store::release_for_rate_limit` rather than
 `release`, which is what lets the issue resume at the attempt and session it was already on
-rather than looking like a fresh start. What pauses is dispatch itself — `Scheduler::rate_limited`
-checked once per tick, between `sweep_parked` and the two dispatch steps — until the CLI's own
-`resetsAt`, published on `Snapshot::rate_limit_pause` so `status` reads "waiting on a five-hour
-limit until 09:00Z" instead of showing an idle daemon with no explanation. A `resetsAt` the
+rather than looking like a fresh start. What pauses is dispatch to the run's own worker — the
+limit is that provider's account, so with several workers ([src/sched/workers.rs](../src/sched/workers.rs),
+#119) the others keep dispatching and dispatch as a whole stops only when every worker is paused,
+checked once per tick between `sweep_parked` and the two dispatch steps — until the CLI's own
+`resetsAt`, published on `Snapshot::rate_limit_pauses` so `status` reads "claude waiting on a
+five-hour limit until 09:00Z" instead of showing an idle daemon with no explanation. An issue the
+pause released keeps its session, and so stays pinned to the paused worker rather than moving to
+one that never held that conversation. A `resetsAt` the
 scheduler cannot trust — missing, or already behind the clock — degrades to the ordinary
 `Failed` path rather than risking a pause nothing ever lifts, the same failure mode a clock skew
 would otherwise turn into a silent, permanent stop.
@@ -411,6 +415,9 @@ summary has no thread. A red CI or
 an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
 due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 `Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".
+A pull request the provider reports unable to merge is not waited on at all, since GitHub runs no
+CI on it: delivery charges a round and re-gates the branch as if its `Done` were new, so the
+gate's rebase and its conflict rule decide what follows (#159).
 The handoff gate's failing output travels the same way, as `Feedback::Gate`: `launch` builds one
 `Feedback` from delivery's structured row when there is one and from the retry reason otherwise,
 so `Worker::spawn` has a single parameter for the question and `feedback_help` in the worker is

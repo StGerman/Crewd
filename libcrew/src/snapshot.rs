@@ -45,6 +45,10 @@ pub struct Row {
     /// Where the branch is on its way to a mergeable pull request, once a run has reported
     /// done with delivery on. `None` before that, and always for a deployment without a forge.
     pub delivery: Option<DeliveryView>,
+    /// The worker running this issue, or else the one that ran its latest run (#119). `None`
+    /// for an issue never dispatched, or last dispatched by a daemon that did not record it.
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 /// Immutable view published to observers. The TUI renders this and never touches the store,
@@ -76,16 +80,53 @@ pub struct Snapshot {
     pub ticks: u64,
     pub last_tick_at: Option<i64>,
     pub last_error: Option<String>,
-    /// Set while dispatch is paused for an account-wide rate limit the agent CLI itself
-    /// reported (#37). `None` when dispatch is not paused for this reason — which is not the
-    /// same as "nothing is wrong"; see `last_error` for an ordinary failure.
-    pub rate_limit_pause: Option<RateLimitPause>,
+    /// One entry per worker whose dispatch is paused for an account-wide rate limit its agent
+    /// CLI reported (#37), in dispatch order; a pause on one worker leaves the others
+    /// dispatching (#119). Empty when nothing is paused for this reason — which is not the same
+    /// as "nothing is wrong"; see `last_error` for an ordinary failure.
+    ///
+    /// On the wire it travels beside the singleton `rate_limit_pause` it replaced, so a client
+    /// and a daemon on either side of #119 still see a pause while the API marker says `1`.
+    #[serde(flatten, with = "pauses_wire")]
+    pub rate_limit_pauses: Vec<RateLimitPause>,
+}
+
+/// The pause list plus the pre-#119 singleton. Without the singleton an older client reads no
+/// `rate_limit_pause` and shows an idle daemon as healthy; without reading it back, a newer
+/// client does the same against an older daemon.
+mod pauses_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::RateLimitPause;
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        rate_limit_pauses: Option<Vec<RateLimitPause>>,
+        #[serde(default)]
+        rate_limit_pause: Option<RateLimitPause>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(v: &[RateLimitPause], s: S) -> Result<S::Ok, S::Error> {
+        Wire { rate_limit_pauses: Some(v.to_vec()), rate_limit_pause: v.first().cloned() }
+            .serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<RateLimitPause>, D::Error> {
+        let w = Wire::deserialize(d)?;
+        Ok(w.rate_limit_pauses.unwrap_or_else(|| w.rate_limit_pause.into_iter().collect()))
+    }
 }
 
 /// An account-wide dispatch pause, published so an operator sees *why* nothing is running
 /// rather than an idle daemon with no explanation (#37).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitPause {
+    /// The worker whose account is limited, and the only one that stops dispatching (#119).
+    #[serde(default)]
+    pub worker: String,
     /// Whatever the CLI named the exhausted window — `"five_hour"`, `"seven_day"`, or a name
     /// this crate has never seen.
     pub kind: String,
@@ -137,6 +178,10 @@ pub struct RunRecord {
     /// `Effort`, stops offering it.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The worker that ran it (#119), and so the one holding its session. `None` for a run
+    /// recorded before workers were named.
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 impl RunRecord {
@@ -202,5 +247,35 @@ impl Phase {
             Phase::Quarantined => "quarantine",
             Phase::Released => "released",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pause(worker: &str) -> RateLimitPause {
+        RateLimitPause { worker: worker.into(), kind: "five_hour".into(), resets_at: 1 }
+    }
+
+    /// Copilot on #156: the list replaced a singleton while the API marker stayed `1`, so either
+    /// side of the change must still see the other's pause.
+    #[test]
+    fn a_pause_survives_a_client_and_daemon_on_either_side_of_the_list() {
+        let snap = Snapshot { rate_limit_pauses: vec![pause("claude")], ..Default::default() };
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["rate_limit_pause"]["kind"], "five_hour", "an older client reads this");
+        let back: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.rate_limit_pauses, vec![pause("claude")]);
+
+        let mut old = serde_json::to_value(Snapshot::default()).unwrap();
+        let map = old.as_object_mut().unwrap();
+        map.remove("rate_limit_pauses");
+        map.insert(
+            "rate_limit_pause".into(),
+            serde_json::json!({"kind": "five_hour", "resets_at": 1}),
+        );
+        let read: Snapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(read.rate_limit_pauses, vec![pause("")], "an older daemon's pause is read");
     }
 }

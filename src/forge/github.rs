@@ -76,6 +76,10 @@ struct GhPullRequest {
     merged_at: Option<String>,
     #[serde(default)]
     requested_reviewers: Vec<GhUser>,
+    #[serde(default)]
+    mergeable: Option<bool>,
+    #[serde(default)]
+    mergeable_state: Option<String>,
 }
 
 /// `merged`/`merged_at` win over `state`: GitHub reports a merged pull request's `state` as
@@ -96,6 +100,13 @@ fn to_pull_request(gh: GhPullRequest) -> PullRequest {
         base: gh.base.r#ref,
         state,
         requested_reviewers: gh.requested_reviewers.into_iter().map(|u| u.login).collect(),
+        // `dirty` is GitHub's word for a merge conflict, and can arrive with `mergeable` still
+        // unset; any other state leaves the boolean to speak.
+        mergeable: if gh.mergeable_state.as_deref() == Some("dirty") {
+            Some(false)
+        } else {
+            gh.mergeable
+        },
     }
 }
 
@@ -1005,6 +1016,23 @@ mod tests {
 
         let got = f.pull_request(9).unwrap();
         assert_eq!(got.state, PrState::Closed);
+    }
+
+    /// #159: `dirty` is a conflict whatever `mergeable` says, and a `null` is still computing.
+    #[test]
+    fn mergeability_parses_dirty_as_a_conflict_and_null_as_unknown() {
+        let read = |mergeable: Value, state: Value| {
+            let http = FakeHttp::new();
+            let mut pr = gh_pr(9, "sha2", "master", "open");
+            pr["mergeable"] = mergeable;
+            pr["mergeable_state"] = state;
+            http.push(ok(pr));
+            forge(http).pull_request(9).unwrap().mergeable
+        };
+        assert_eq!(read(json!(false), json!("dirty")), Some(false));
+        assert_eq!(read(Value::Null, json!("dirty")), Some(false));
+        assert_eq!(read(Value::Null, json!("unknown")), None);
+        assert_eq!(read(json!(true), json!("blocked")), Some(true));
     }
 
     #[test]

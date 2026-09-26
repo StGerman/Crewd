@@ -40,10 +40,12 @@ pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
 
     // Named so an idle daemon reads as "waiting on a limit" rather than as broken — the whole
     // point of publishing this at all (#37). Its own line, ahead of the tick line: an operator
-    // deciding whether to restart the daemon needs this before anything else here.
-    if let Some(p) = &snap.rate_limit_pause {
+    // deciding whether to restart the daemon needs this before anything else here. One line per
+    // worker, because a pause on one leaves the others dispatching (#119).
+    for p in &snap.rate_limit_pauses {
         out.push_str(&format!(
-            "waiting on a {} limit until {}\n",
+            "{} waiting on a {} limit until {}\n",
+            if p.worker.is_empty() { "dispatch" } else { p.worker.as_str() },
             p.kind.replace('_', "-"),
             timestamp(p.resets_at)
         ));
@@ -102,13 +104,15 @@ pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
 fn table(rows: &[Row]) -> String {
     const TITLE_MAX: usize = 44;
 
-    let header = ["PHASE", "IDENTIFIER", "ATT", "TURNS", "AGE", "TOKENS", "STATE", "TITLE"];
+    let header =
+        ["PHASE", "IDENTIFIER", "WORKER", "ATT", "TURNS", "AGE", "TOKENS", "STATE", "TITLE"];
     let mut cells: Vec<Vec<String>> = vec![header.iter().map(|h| h.to_string()).collect()];
 
     for r in rows {
         cells.push(vec![
             r.phase.label().to_string(),
             r.identifier.clone(),
+            r.worker.clone().unwrap_or_else(|| NONE.into()),
             if r.attempt == 0 { NONE.into() } else { r.attempt.to_string() },
             r.turns.to_string(),
             age_of(r),
@@ -172,6 +176,7 @@ pub fn issue(r: &Row) -> String {
     };
 
     field("phase", r.phase.label().to_string());
+    field("worker", r.worker.clone().unwrap_or_else(|| NONE.into()));
     field("state", or_none(&r.tracker_state));
     field(
         "attempt",
@@ -267,13 +272,14 @@ fn run_line(run: &RunRecord) -> String {
         _ => NONE.to_string(),
     };
     format!(
-        "{}  started {}  ended {}  turns {:<4}  outcome {:<9}  tokens {}  model {}",
+        "{}  started {}  ended {}  turns {:<4}  outcome {:<9}  tokens {}  worker {}  model {}",
         run.run_id,
         timestamp(run.started_at),
         ended,
         run.turns,
         run.outcome.as_deref().unwrap_or(NONE),
         cost,
+        run.worker.as_deref().unwrap_or(NONE),
         run.model_label()
     )
 }
@@ -385,7 +391,7 @@ mod tests {
             uncounted_runs: 2,
             rows: vec![row("MT-601", Phase::Running)],
             last_error: None,
-            rate_limit_pause: None,
+            rate_limit_pauses: vec![],
         };
 
         let out = snapshot(&snap, "127.0.0.1:8787");
@@ -419,14 +425,15 @@ mod tests {
     #[test]
     fn a_rate_limit_pause_says_why_nothing_is_dispatching_and_when_that_ends() {
         let snap = Snapshot {
-            rate_limit_pause: Some(RateLimitPause {
+            rate_limit_pauses: vec![RateLimitPause {
+                worker: "claude".into(),
                 kind: "five_hour".into(),
                 resets_at: 1_789_981_200_000,
-            }),
+            }],
             ..Default::default()
         };
         let out = snapshot(&snap, "x");
-        assert!(out.contains("waiting on a five-hour limit until"), "{out}");
+        assert!(out.contains("claude waiting on a five-hour limit until"), "{out}");
         assert!(out.contains(&timestamp(1_789_981_200_000)), "{out}");
     }
 
@@ -536,6 +543,7 @@ mod tests {
                     transcript: None,
                     model: None,
                     effort: None,
+                    worker: None,
                 },
                 RunRecord {
                     run_id: "run-1".into(),
@@ -550,6 +558,7 @@ mod tests {
                     transcript: None,
                     model: None,
                     effort: None,
+                    worker: None,
                 },
             ],
             ..row("MT-7", Phase::Released)
@@ -595,6 +604,7 @@ mod tests {
                     transcript: None,
                     model: None,
                     effort: None,
+                    worker: None,
                 },
                 RunRecord {
                     run_id: "run-8".into(),
@@ -609,6 +619,7 @@ mod tests {
                     transcript: None,
                     model: None,
                     effort: None,
+                    worker: None,
                 },
             ],
             ..row("MT-1", Phase::Running)
@@ -631,5 +642,37 @@ mod tests {
         let out = snapshot(&Snapshot { rows: vec![r], ..Default::default() }, "x");
         assert!(out.contains("MT-3 retries in 45s"), "{out}");
         assert!(out.contains("last error: agent_crash"), "{out}");
+    }
+
+    /// #119: with two workers the table has to say who is working on what, and a pause has to
+    /// name the worker it stops — the other one is still dispatching.
+    #[test]
+    fn the_table_names_each_rows_worker_and_each_pause_names_its_worker() {
+        let mut claude = row("MT-1", Phase::Running);
+        claude.worker = Some("claude".into());
+        claude.attempt = 1;
+        claude.turns = 4;
+        claude.age_ms = 65_000;
+        let mut grok = row("MT-2", Phase::Running);
+        grok.worker = Some("grok".into());
+        grok.attempt = 1;
+        grok.turns = 2;
+        grok.age_ms = 12_000;
+        let never = row("MT-3", Phase::Queued);
+        let snap = Snapshot {
+            generated_at: 1_789_205_462_000,
+            last_tick_at: Some(1_789_205_462_000),
+            ticks: 9,
+            running: 2,
+            limit: 2,
+            rows: vec![claude, grok, never],
+            rate_limit_pauses: vec![RateLimitPause {
+                worker: "claude".into(),
+                kind: "five_hour".into(),
+                resets_at: 1_789_981_200_000,
+            }],
+            ..Default::default()
+        };
+        insta::assert_snapshot!(snapshot(&snap, "127.0.0.1:8787"));
     }
 }

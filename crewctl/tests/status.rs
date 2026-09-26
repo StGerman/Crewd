@@ -56,6 +56,7 @@ fn scheduler(root: &Path, db: &Path) -> Scheduler {
         broker: Default::default(),
         agent: AgentConfig::default(),
         worker: Default::default(),
+        workers: Default::default(),
         api: Default::default(),
         transcripts: Default::default(),
         gate: Default::default(),
