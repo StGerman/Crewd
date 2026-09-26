@@ -6,6 +6,8 @@
 
 pub mod claude;
 pub mod fake;
+pub mod grok;
+pub(crate) mod prompt;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -161,8 +163,9 @@ pub trait RunHandle: Send + Sync {
         Vec::new()
     }
     /// Set once the run's stream reported a rejected, account-wide rate limit. Defaulted to
-    /// `None` rather than required alongside `finished()`: only [`crate::worker::claude`] ever
-    /// sees this on the wire, and every other implementation is correct reporting nothing.
+    /// `None` rather than required alongside `finished()`: only [`crate::worker::claude`] has
+    /// shown this event. The grok 1.0.41 probe did not emit one, so [`crate::worker::grok`]
+    /// is correct reporting nothing until a rejection is recorded.
     fn rate_limit(&self) -> Option<RateLimitSignal> {
         None
     }
@@ -246,5 +249,11 @@ pub trait Worker: Send + Sync {
     /// model to choose.
     fn model(&self) -> ModelChoice {
         ModelChoice::default()
+    }
+
+    /// Whether `launch` should open a broker session for this worker. Grok is not handed
+    /// tracker tools (#120); the default keeps Claude's path unchanged.
+    fn uses_tools(&self) -> bool {
+        true
     }
 }
