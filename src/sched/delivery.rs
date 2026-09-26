@@ -674,8 +674,15 @@ impl Scheduler {
             return Ok(());
         };
         let reserved = self.reservations().map_err(StepError::Other)?;
-        if self.global_slots(&reserved) == 0 || self.state_slots(&issue.state_key(), &reserved) == 0
-        {
+        // The gate is a build on this host, counted against the worker that produced the branch
+        // (#119), including while that worker's account is paused: a pause stops new agent
+        // sessions, and this re-gate does not start one. A worker removed from the config since
+        // the session began falls back to the first pool, the same place an unpinned reservation
+        // is counted.
+        let pin = self.store.session_worker(issue_id)?;
+        let worker_name = self.resolve_pin(pin.as_deref()).unwrap_or_else(|| self.default_worker());
+        let free = self.pool(&worker_name).map(|p| self.worker_slots(p, &reserved)).unwrap_or(0);
+        if free == 0 || self.state_slots(&issue.state_key(), &reserved) == 0 {
             tracing::debug!(issue_id, "{what}; no slot to gate in, re-gating next poll");
             return Ok(());
         }
@@ -699,6 +706,7 @@ impl Scheduler {
         let run = Running {
             run_id: format!("{issue_id}-regate-{}", self.clock.wall().0),
             state_at_start: issue.state.clone(),
+            worker: worker_name,
             issue,
             handle: Arc::new(Regated),
             started: now,
