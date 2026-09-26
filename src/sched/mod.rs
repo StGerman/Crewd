@@ -20,6 +20,7 @@
 pub mod delivery;
 pub mod retry;
 mod review_summary;
+mod sync;
 pub mod workers;
 
 pub use delivery::DeliveryView;
@@ -1475,6 +1476,25 @@ impl Scheduler {
         // attempt, so a stale value from a since-renamed identifier does not survive a retry.
         self.store.set_branch(self.clock.as_ref(), &issue.id, prepared.branch.as_deref())?;
 
+        // Taken before the sync, which needs to know whether a human handed this run a queued
+        // conflict; see `sync_before_run`.
+        let parse = |j: String, source: &str| match serde_json::from_str::<Feedback>(&j) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(issue_id = %issue.id, error = %e, source, "unreadable feedback dropped");
+                None
+            }
+        };
+        let conflict = self
+            .store
+            .take_pending_feedback(self.clock.as_ref(), &issue.id)?
+            .and_then(|j| parse(j, "conflict"));
+        // Before the session or the run row exist, so a sync that blocks leaves neither behind.
+        let synced = match self.sync_before_run(issue, &prepared, conflict.is_some())? {
+            sync::BeforeRun::Proceed(brief) => brief,
+            sync::BeforeRun::Blocked => return Ok(()),
+        };
+
         let run_id = format!("{}-{}", issue.id, self.clock.wall().0);
 
         // The conversation is named here, before the process exists, for the same reason the
@@ -1558,25 +1578,15 @@ impl Scheduler {
         // what is left when there is no row, or the row could not be read — for a gate-sent
         // continuation, the output of the suite that disagreed with the agent's `Done`.
         //
-        // A queued conflict is taken first and wins over both: it is what stopped the most
-        // recent run, and no CI result or review on the branch can be acted on until the branch
-        // rebases again.
-        let parse = |j: String, source: &str| match serde_json::from_str::<Feedback>(&j) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                tracing::warn!(issue_id = %issue.id, error = %e, source, "unreadable feedback dropped");
-                None
-            }
-        };
-        let conflict = self
-            .store
-            .take_pending_feedback(self.clock.as_ref(), &issue.id)?
-            .and_then(|j| parse(j, "conflict"));
+        // A queued conflict wins over both: it is what stopped the most recent run, and no CI
+        // result or review on the branch can be acted on until the branch rebases again. A
+        // conflict the sync just met wins over that, being the newer word on the same branch.
         let delivery = self
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
             .and_then(|j| parse(j, "delivery"));
-        let feedback: Option<Feedback> = conflict
+        let feedback: Option<Feedback> = synced
+            .or(conflict)
             .or(delivery)
             .or_else(|| brief.map(|b| Feedback::Gate { output: b.to_string() }));
 

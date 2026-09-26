@@ -203,12 +203,52 @@ pub struct Published {
     pub commits: Vec<String>,
 }
 
+/// What [`Publisher::sync`] found on the remote's copy of a branch, and what it did about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Synced {
+    /// The remote has no such branch: nothing has been pushed to it yet.
+    Absent,
+    /// The worktree already holds every commit the remote's branch does.
+    Current { remote_head: String },
+    /// The worktree took the remote's commits: fast-forwarded when it had none of its own,
+    /// merged when it had (`merged`). Never rebased, which would rewrite the agent's commits and
+    /// drop a merge someone else pushed, so the pull request's head would change under review.
+    Advanced { remote_head: String, merged: bool },
+    /// Both sides moved and merging the remote's branch in conflicted in `paths`. The merge was
+    /// aborted, so the worktree is where it was, and the push lease still names the last head it
+    /// took in: a push now is refused rather than replacing the commits it has not seen.
+    Conflict { remote_head: String, paths: Vec<String> },
+}
+
+impl Synced {
+    /// The remote branch's head as fetched, or `None` when there is no remote branch.
+    pub fn remote_head(&self) -> Option<&str> {
+        match self {
+            Synced::Absent => None,
+            Synced::Current { remote_head }
+            | Synced::Advanced { remote_head, .. }
+            | Synced::Conflict { remote_head, .. } => Some(remote_head),
+        }
+    }
+}
+
 /// The git half of delivery: push the branch and describe what is on it. On the
 /// [`Workspace`](crate::workspace::Workspace) rather than on [`Forge`] because it is a git
 /// operation in the worktree, not a provider API call, and because the plain-directory
 /// workspace has to be able to say "no branch here" rather than fake one.
 pub trait Publisher: Send + Sync {
+    /// Bring into `worktree` whatever someone else pushed to `branch` on `remote` (#163): fetch
+    /// it, fast-forward or merge it in, and record the head taken in as the lease the next
+    /// [`Publisher::publish`] pushes against. Called before every agent run and every re-gate,
+    /// so the branch those build on is the one the pull request shows.
+    fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError>;
+
     /// Push `branch` from `worktree` to `remote`, and list its commits over `base`.
+    ///
+    /// Forced, against a lease naming the last head [`Publisher::sync`] took in or this method
+    /// pushed — never a remote-tracking ref, which any `git fetch` in `workspace.repo` moves
+    /// without the worktree having seen what it fetched. A remote branch that moved since is
+    /// refused, not overwritten.
     fn publish(
         &self,
         worktree: &Path,
