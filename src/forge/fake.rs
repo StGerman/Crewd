@@ -280,8 +280,8 @@ impl FakeForge {
         Self::push_foreign(&mut g, branch, sha);
     }
 
-    /// The same push, landing between delivery's read of the pull request and the `sync` after
-    /// it: the race #163 records for #160.
+    /// The same push, landing between delivery's read of the branch's open pull request and the
+    /// `sync` after it: the race #163 records for #160.
     pub fn push_to_branch_during_sync(&self, branch: &str, sha: &str) {
         self.inner.lock().unwrap().push_at_sync = Some((branch.into(), sha.into()));
     }
@@ -360,7 +360,8 @@ impl Publisher for FakeForge {
     fn sync(&self, _worktree: &Path, branch: &str, _remote: &str) -> Result<Synced, ForgeError> {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
-        if let Some((b, sha)) = g.push_at_sync.take_if(|(b, _)| b == branch) {
+        let has_pr = g.prs.values().any(|r| r.spec.head == branch && r.pr.state == PrState::Open);
+        if has_pr && let Some((b, sha)) = g.push_at_sync.take_if(|(b, _)| b == branch) {
             Self::push_foreign(&mut g, &b, &sha);
         }
         g.syncs.push(branch.to_string());

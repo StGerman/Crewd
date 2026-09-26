@@ -2025,7 +2025,10 @@ mod tests {
             "no merge is left in progress"
         );
         assert!(ws.publish(&p.path, &branch, "origin", "main").is_err());
-        assert_eq!(git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(), theirs);
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            theirs
+        );
 
         for d in [&root, &repo, &bare, &other] {
             std::fs::remove_dir_all(d).ok();

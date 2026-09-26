@@ -4465,3 +4465,177 @@ fn a_ticket_that_closes_between_an_unblock_and_the_next_tick_is_still_swept() {
     assert!(!ws.exists(), "and the sweep still reclaimed the worktree the unblock left parked");
     assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state, None);
 }
+
+/// #163: a continuation resumed on the branch as it was left, without the merge the operator
+/// had pushed to it, and the next push replaced that merge. End to end over real git: the
+/// operator's commit must be in the worktree by the time the next run is dispatched into it.
+#[test]
+fn a_commit_pushed_to_the_branch_by_someone_else_reaches_the_worktree_before_the_next_run() {
+    let dir = tmp_dir("sync-before-run");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+    let bare = dir.join("remote.git");
+    git(&dir, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let ws = Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap());
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        ws.clone(),
+        |c| {
+            c.delivery.enabled = true;
+            c.delivery.poll_interval_ms = 1_000;
+            c.delivery.base = "main".into();
+            c.delivery.remote = "origin".into();
+        },
+    );
+    let forge = Arc::new(FakeForge::new());
+    let publisher: Arc<dyn Publisher> = ws;
+    h.sched.set_delivery(Some(forge.clone()), Some(publisher));
+    h.worker.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    let wt = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    commit_in(&wt, "a.txt", "the agent's work");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    assert!(git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).is_some());
+
+    let other = dir.join("operator");
+    git(&dir, &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    git(&other, &["config", "user.email", "op@example.com"]);
+    git(&other, &["config", "user.name", "op"]);
+    git(&other, &["checkout", "-q", &branch]);
+    commit_in(&other, "theirs.txt", "the operator's merge");
+    git(&other, &["push", "-q", "origin", &branch]);
+    let theirs = git_out(&other, &["rev-parse", "HEAD"]).unwrap();
+
+    // A review round hands the issue back to an agent.
+    let number = forge.open_prs()[0].number;
+    forge.add_comment(number, "reviewer", "a.txt", "please fix");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 2, "the next run is dispatched");
+    assert!(
+        git_out(&wt, &["merge-base", "--is-ancestor", &theirs, "HEAD"]).is_some(),
+        "the operator's commit is on the branch the run works on"
+    );
+    assert!(wt.join("theirs.txt").exists());
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A conflict with the remote branch that no `gate.agent_resolvable` pattern covers is a
+/// human's, as a gate conflict is: the run is not spawned onto a branch that would push over
+/// the operator's work, and the issue parks `Blocked` naming the paths.
+#[test]
+fn a_remote_branch_conflicting_outside_resolvable_paths_blocks_before_the_run() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    let number = forge.open_prs()[0].number;
+    forge.push_to_branch(&branch, "0perat0r");
+    forge.set_sync_conflict(Some(vec!["src/sched/mod.rs".into()]));
+    forge.add_comment(number, "reviewer", "a.txt", "please fix");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 1, "no run is spawned onto the conflict");
+    assert_eq!(st.phase, Phase::Released);
+    assert!(st.parked_state.is_some(), "parked");
+    let note = st.last_error.unwrap_or_default();
+    assert!(note.contains("src/sched/mod.rs"), "names the path: {note}");
+
+    // A human unblocks without resolving it: the agent is handed the conflict, not re-blocked.
+    assert!(h.sched.unblock("iss-1").unwrap());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let fb = h.worker.feedback_for("iss-1");
+    assert_eq!(fb.len(), 2, "the unblocked run is dispatched");
+    assert!(
+        matches!(&fb[1], Some(Feedback::Gate { output }) if output.contains("git merge 0perat0r")),
+        "{fb:?}"
+    );
+}
+
+#[test]
+fn a_remote_branch_conflicting_only_in_resolvable_paths_is_handed_to_the_agent() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        resolvable,
+    );
+    run_once(&mut h);
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    let number = forge.open_prs()[0].number;
+    forge.push_to_branch(&branch, "0perat0r");
+    forge.set_sync_conflict(Some(vec!["CLAUDE.md".into()]));
+    forge.add_comment(number, "reviewer", "a.txt", "please fix");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+
+    let fb = h.worker.feedback_for("iss-1");
+    assert_eq!(fb.len(), 2);
+    assert!(
+        matches!(&fb[1], Some(Feedback::Gate { output }) if output.contains("git merge 0perat0r") && output.contains("CLAUDE.md")),
+        "{fb:?}"
+    );
+}
+
+/// #163 on #160: the operator's merge landed a second after delivery read the pull request as
+/// unmergeable. The re-gate then rebased a worktree that never had the merge and parked a
+/// mergeable pull request as blocked. The fetched head is what the read is checked against.
+#[test]
+fn a_push_landing_after_an_unmergeable_read_is_read_again_rather_than_re_gated() {
+    let (mut h, forge, gate) = gated_delivery_harness();
+    forge.set_mergeable_default(Some(false));
+    run_once(&mut h);
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    forge.push_to_branch_during_sync(&branch, "c11c4f5");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(gate.starts_for("iss-1").len(), 1, "not re-gated");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (0, 0), "and no round charged");
+    assert_eq!(h.sched.gating_count() + h.sched.running_count(), 0);
+    assert!(forge.syncs().contains(&branch), "the branch was synced first");
+}
+
+/// The fake's lease: a publish over a head the worktree never took in is refused, and the
+/// sync before delivery's push is what takes it in.
+#[test]
+fn a_foreign_push_is_taken_in_before_delivery_pushes_again() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    let number = forge.open_prs()[0].number;
+    forge.push_to_branch(&branch, "0perat0r");
+    forge.add_comment(number, "reviewer", "a.txt", "please fix");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, crew::store::DeliveryStage::HandedOff, "{:?}", d.handoff_reason);
+    assert_eq!(forge.pr(number).unwrap().head_sha, FakeForge::head_after_publish(2));
+}

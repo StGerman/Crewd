@@ -468,6 +468,19 @@ the verdict queued on the row and the step returns the error, so the threads are
 handed back to an agent — until it lands. Recording first, as it did, hid a verdict from its
 reviewer for good over one transient error while delivery went on to `Ready`.
 
+The lease is a ref crewd owns, `refs/crew/lease/<branch>`, written by `Publisher::sync` and by
+`publish` and by nothing else (#163). The bare `--force-with-lease` took it from
+`refs/remotes/<remote>/<branch>`, which any fetch in `workspace.repo` moves onto commits the
+worktree never had, so the push replaced an operator's merge instead of refusing. `sync` runs
+before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch
+into the worktree and fast-forwards, or merges when the worktree has commits of its own. It never
+rebases, which would rewrite commits a reviewer saw and drop the operator's merge. A conflict is
+aborted and treated like a gate conflict (#111): a brief when every path is agent-resolvable,
+`Blocked` naming the paths otherwise, with the brief queued for the run an unblock dispatches.
+A re-gate also compares the fetched head with the one the unmergeable read was taken at, and
+reads the pull request again when they differ, because the push that moved it may be the one
+that resolved the conflict.
+
 ## Examples that talk to real services
 
 `broker_live` is the counterpart for the tool broker, and it exists because nothing inside
