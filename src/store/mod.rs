@@ -503,8 +503,9 @@ impl Store {
         Ok(before)
     }
 
-    /// Queue `feedback_json` for this issue's next run: why the last one ended, when neither a
-    /// retry reason nor delivery carries it — a rebase conflict that parked the issue (#109).
+    /// Queue `feedback_json` for this issue's next run, ahead of anything delivery queued: why
+    /// the last one ended, when a retry reason alone would not carry it — a rebase conflict that
+    /// parked the issue (#109), or a gate brief that must precede a requeued hand-back (#160).
     pub fn set_pending_feedback(
         &self,
         clock: &dyn Clock,
@@ -1574,6 +1575,23 @@ impl Store {
             params![issue_id],
             |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
         )
+    }
+
+    /// Queue `feedback_json` again for this issue's next run *without* charging a round: the
+    /// run it was handed to was sent back by the gate before delivery could judge its answer,
+    /// so the round it was charged is still the one in progress (#160).
+    pub fn requeue_delivery_feedback(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        feedback_json: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET pending_feedback = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, feedback_json, clock.wall().0],
+        )?;
+        Ok(())
     }
 
     /// Read the feedback queued for this issue's next run and clear it, in one step, so a run

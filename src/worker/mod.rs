@@ -204,12 +204,14 @@ pub struct Spawn<'a> {
     /// scheduler, which is what records the path.
     pub transcript: Option<TranscriptWriter>,
     /// What the orchestrator knows about why this attempt exists that the agent cannot see from
-    /// inside its worktree — the handoff gate's failing output, a red CI, review comments — and
-    /// `None` on a first dispatch. The worker renders it into the prompt; the scheduler does not,
-    /// because the prompt's wording and the verdict marker the worker parses back are one
+    /// inside its worktree — the handoff gate's failing output, a red CI, review comments — in
+    /// the order the agent should act on them, and empty on a first dispatch. More than one when
+    /// a gate verdict interrupted a delivery hand-back, which rides along after it rather than
+    /// costing a second round (#160). The worker renders it into the prompt; the scheduler does
+    /// not, because the prompt's wording and the verdict marker the worker parses back are one
     /// convention and live in one module. It reaches the agent through the prompt and nothing
     /// else, so a worker that ignores it is degraded, not wrong.
-    pub feedback: Option<&'a Feedback>,
+    pub feedback: &'a [Feedback],
     /// Uncommitted work earlier runs of this issue left behind when their worktrees were
     /// removed, oldest first. Separate from `feedback` because the two are independent — a
     /// gate-sent continuation can also have a snapshot — and, like it, reaches the agent only
@@ -230,7 +232,7 @@ impl<'a> Spawn<'a> {
             session,
             tools: None,
             transcript: None,
-            feedback: None,
+            feedback: &[],
             wip: &[],
             body_changed: false,
         }

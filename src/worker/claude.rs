@@ -684,11 +684,11 @@ fn truncate(s: &str, n: usize) -> String {
 fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
-    feedback: Option<&Feedback>,
+    feedback: &[Feedback],
     wip: &[WipSnapshot],
     body_changed: bool,
 ) -> String {
-    let why = match feedback {
+    let why = match feedback.first() {
         Some(Feedback::Conflict { .. }) => {
             "Your previous session on this issue reported its work finished, but the \
              orchestrator could not hand the branch off; what stopped it is below."
@@ -727,7 +727,7 @@ fn build_continuation_prompt(
 fn build_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
-    feedback: Option<&Feedback>,
+    feedback: &[Feedback],
     wip: &[WipSnapshot],
 ) -> String {
     let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
@@ -765,72 +765,77 @@ fn build_prompt(
 /// parse back: a fix names the commit that carries it, a refusal names its reason. Comments
 /// that came back unanswered from an earlier round are called out, so silence reads as noticed
 /// rather than accepted.
-fn feedback_help(feedback: Option<&Feedback>) -> String {
-    let Some(fb) = feedback else { return String::new() };
+///
+/// Each item is rendered in turn, so a conflict brief that interrupted a review hand-back comes
+/// first and the comments follow it in the same prompt (#160): the branch has to rebase before
+/// anything else on it can land, and splitting the two cost a review round on a conflict.
+fn feedback_help(feedback: &[Feedback]) -> String {
     let mut s = String::new();
-    match fb {
-        Feedback::Gate { output } if output.trim().is_empty() => {}
-        Feedback::Gate { output } => {
-            s.push_str(&format!(
-                "\nFrom the orchestrator, on why this attempt was dispatched:\n{}\n",
-                output.trim_end()
-            ));
-        }
-        Feedback::Conflict { base, base_sha, paths } => {
-            s.push_str(&format!(
-                "\nThe orchestrator could not rebase your branch onto {base} ({base_sha}): \
+    for fb in feedback {
+        match fb {
+            Feedback::Gate { output } if output.trim().is_empty() => {}
+            Feedback::Gate { output } => {
+                s.push_str(&format!(
+                    "\nFrom the orchestrator, on why this attempt was dispatched:\n{}\n",
+                    output.trim_end()
+                ));
+            }
+            Feedback::Conflict { base, base_sha, paths } => {
+                s.push_str(&format!(
+                    "\nThe orchestrator could not rebase your branch onto {base} ({base_sha}): \
                  conflicts in {}. The rebase was aborted, so your branch is exactly as you left \
                  it. Your job this run is to resolve that yourself — `git rebase {base_sha}`, \
                  resolve each conflict (the description may say how), `git rebase --continue` — \
                  then run the project's own gate and commit. Do not report done while the branch \
                  still conflicts with {base}.\n",
-                paths.join(", ")
-            ));
-        }
-        Feedback::Ci { pr_url, failures } => {
-            s.push_str(&format!(
+                    paths.join(", ")
+                ));
+            }
+            Feedback::Ci { pr_url, failures } => {
+                s.push_str(&format!(
                 "\nCI is red on the pull request for this work ({pr_url}). Your job this run is \
                  to make it green: reproduce the failure locally, fix it, run the project's \
                  own gate, and commit. Do not report done while the cause below is unfixed.\n"
             ));
-            for f in failures {
-                s.push_str(&format!("\n### {}", f.name));
-                if let Some(u) = &f.url {
-                    s.push_str(&format!(" ({u})"));
-                }
-                s.push('\n');
-                if !f.detail.is_empty() {
-                    s.push_str(&f.detail);
+                for f in failures {
+                    s.push_str(&format!("\n### {}", f.name));
+                    if let Some(u) = &f.url {
+                        s.push_str(&format!(" ({u})"));
+                    }
                     s.push('\n');
+                    if !f.detail.is_empty() {
+                        s.push_str(&f.detail);
+                        s.push('\n');
+                    }
                 }
             }
-        }
-        Feedback::Review { pr_url, comments, unanswered_before } => {
-            s.push_str(&format!(
-                "\nThe pull request for this work ({pr_url}) has review comments that need a \
+            Feedback::Review { pr_url, comments, unanswered_before } => {
+                s.push_str(&format!(
+                    "\nThe pull request for this work ({pr_url}) has review comments that need a \
                  verdict each. For every comment below, either fix what it raises and commit, \
                  or decide it should not change and say why. Do not merely acknowledge one. \
                  Then end your final message with one line per comment, exactly:\n\
                  CREW_REVIEW: <comment-id>: accepted: <commit sha that resolved it>\n\
                  CREW_REVIEW: <comment-id>: rejected: <one-sentence reason>\n"
-            ));
-            if !unanswered_before.is_empty() {
-                s.push_str(&format!(
-                    "\nThese were handed to a previous run and came back without a verdict; \
-                     they are still open: {}\n",
-                    unanswered_before.join(", ")
                 ));
-            }
-            for c in comments {
-                let at = match (&c.path, c.line) {
-                    (Some(p), Some(l)) => format!("{p}:{l}"),
-                    (Some(p), None) => p.clone(),
-                    _ if crate::forge::summary_review_id(&c.id).is_some() => {
-                        "(review summary)".into()
-                    }
-                    _ => "(general)".into(),
-                };
-                s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
+                if !unanswered_before.is_empty() {
+                    s.push_str(&format!(
+                        "\nThese were handed to a previous run and came back without a verdict; \
+                     they are still open: {}\n",
+                        unanswered_before.join(", ")
+                    ));
+                }
+                for c in comments {
+                    let at = match (&c.path, c.line) {
+                        (Some(p), Some(l)) => format!("{p}:{l}"),
+                        (Some(p), None) => p.clone(),
+                        _ if crate::forge::summary_review_id(&c.id).is_some() => {
+                            "(review summary)".into()
+                        }
+                        _ => "(general)".into(),
+                    };
+                    s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
+                }
             }
         }
     }
@@ -1088,8 +1093,8 @@ mod tests {
             }],
         };
         for prompt in [
-            build_prompt(&issue(), None, Some(&fb), &[]),
-            build_continuation_prompt(&issue(), None, Some(&fb), &[], false),
+            build_prompt(&issue(), None, std::slice::from_ref(&fb), &[]),
+            build_continuation_prompt(&issue(), None, std::slice::from_ref(&fb), &[], false),
         ] {
             assert!(prompt.contains("CI is red"), "{prompt}");
             assert!(prompt.contains("fmt + clippy + test"));
@@ -1099,7 +1104,7 @@ mod tests {
             );
             assert!(prompt.contains("https://github.com/o/r/pull/9"));
         }
-        assert!(!build_prompt(&issue(), None, None, &[]).contains("CI is red"));
+        assert!(!build_prompt(&issue(), None, &[], &[]).contains("CI is red"));
     }
 
     #[test]
@@ -1115,12 +1120,12 @@ mod tests {
                     .into(),
             },
         ];
-        insta::assert_snapshot!("new_prompt_with_wip", build_prompt(&issue(), None, None, &wip));
+        insta::assert_snapshot!("new_prompt_with_wip", build_prompt(&issue(), None, &[], &wip));
         insta::assert_snapshot!(
             "continuation_prompt_with_wip",
-            build_continuation_prompt(&issue(), None, None, &wip, false)
+            build_continuation_prompt(&issue(), None, &[], &wip, false)
         );
-        insta::assert_snapshot!("new_prompt_without_wip", build_prompt(&issue(), None, None, &[]));
+        insta::assert_snapshot!("new_prompt_without_wip", build_prompt(&issue(), None, &[], &[]));
     }
 
     /// #109: a Decisions section written into #105's description after its session started was
@@ -1133,11 +1138,11 @@ mod tests {
         };
         insta::assert_snapshot!(
             "continuation_prompt_body_changed",
-            build_continuation_prompt(&edited, None, None, &[], true)
+            build_continuation_prompt(&edited, None, &[], &[], true)
         );
         insta::assert_snapshot!(
             "continuation_prompt_body_unchanged",
-            build_continuation_prompt(&edited, None, None, &[], false)
+            build_continuation_prompt(&edited, None, &[], &[], false)
         );
     }
 
@@ -1152,7 +1157,7 @@ mod tests {
         };
         insta::assert_snapshot!(
             "continuation_prompt_after_conflict",
-            build_continuation_prompt(&issue(), None, Some(&fb), &[], false)
+            build_continuation_prompt(&issue(), None, std::slice::from_ref(&fb), &[], false)
         );
     }
 
@@ -1170,7 +1175,7 @@ mod tests {
             }],
             unanswered_before: vec!["4059939600".into()],
         };
-        let prompt = build_prompt(&issue(), None, Some(&fb), &[]);
+        let prompt = build_prompt(&issue(), None, std::slice::from_ref(&fb), &[]);
         assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
         assert!(prompt.contains("missing `#[serde(default)]`"));
         assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");
