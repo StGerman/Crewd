@@ -106,6 +106,8 @@ struct Inner {
     push_at_sync: Option<(String, String)>,
     /// When set, a `sync` that finds a foreign head not yet taken in reports these as conflicted.
     sync_conflict: Option<Vec<String>>,
+    /// The head each branch's last `publish` left on the remote.
+    pushed_heads: HashMap<String, String>,
     /// Every branch `sync` was called for, in order.
     syncs: Vec<String>,
 }
@@ -366,9 +368,9 @@ impl Publisher for FakeForge {
         }
         g.syncs.push(branch.to_string());
         let Some(remote_head) = g.foreign.get(branch).cloned() else {
-            return Ok(match g.published.contains(branch) {
-                true => Synced::Current { remote_head: Self::head_after_publish(g.publishes) },
-                false => Synced::Absent,
+            return Ok(match g.pushed_heads.get(branch) {
+                Some(head) => Synced::Current { remote_head: head.clone() },
+                None => Synced::Absent,
             });
         };
         if g.taken_in.get(branch) == Some(&remote_head) {
@@ -403,6 +405,7 @@ impl Publisher for FakeForge {
         g.published.insert(branch.to_string());
         g.publishes += 1;
         let head_sha = Self::head_after_publish(g.publishes);
+        g.pushed_heads.insert(branch.to_string(), head_sha.clone());
         // The pull request open for this branch moves with the push, as the real one does. A
         // push is the gate's rebased branch, so it merges again.
         for rec in g.prs.values_mut() {
@@ -575,5 +578,22 @@ impl Forge for FakeForge {
                 Ok(())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review on #174: the fake answered a sync with the last head *any* branch published, so
+    /// a second issue's push read as the first one's branch moving.
+    #[test]
+    fn a_sync_reports_the_head_its_own_branch_last_published() {
+        let f = FakeForge::new();
+        let at = Path::new("/nowhere");
+        let first = f.publish(at, "crew/a", "origin", "master").unwrap().head_sha;
+        f.publish(at, "crew/b", "origin", "master").unwrap();
+        assert_eq!(f.sync(at, "crew/a", "origin").unwrap(), Synced::Current { remote_head: first });
+        assert_eq!(f.sync(at, "crew/c", "origin").unwrap(), Synced::Absent);
     }
 }
