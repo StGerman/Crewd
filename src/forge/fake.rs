@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use super::{
     CiFailure, CiStatus, Forge, ForgeError, PrState, Published, Publisher, PullRequest,
-    PullRequestSpec, Review, ReviewComment,
+    PullRequestSpec, Review, ReviewComment, Synced,
 };
 
 /// One call the fake saw, for asserting on sequences and absences.
@@ -98,6 +98,18 @@ struct Inner {
     stacked_on: Option<String>,
     /// What a newly opened pull request reports as `mergeable`.
     mergeable: Option<bool>,
+    /// Heads someone other than `publish` pushed, per branch, until a `publish` replaces them.
+    foreign: HashMap<String, String>,
+    /// The foreign head each branch's worktree took in through `sync`: the push lease.
+    taken_in: HashMap<String, String>,
+    /// A foreign push that lands during the next `sync` of its branch, after delivery's read.
+    push_at_sync: Option<(String, String)>,
+    /// When set, a `sync` that finds a foreign head not yet taken in reports these as conflicted.
+    sync_conflict: Option<Vec<String>>,
+    /// The head each branch's last `publish` left on the remote.
+    pushed_heads: HashMap<String, String>,
+    /// Every branch `sync` was called for, in order.
+    syncs: Vec<String>,
 }
 
 pub struct FakeForge {
@@ -262,6 +274,40 @@ impl FakeForge {
         }
     }
 
+    /// Someone other than the orchestrator pushes `sha` to `branch` on the remote: the open pull
+    /// request's head moves with it and its mergeability is being recomputed. Until a `sync`
+    /// takes it in, a `publish` of the branch is refused, as the real push lease refuses it.
+    pub fn push_to_branch(&self, branch: &str, sha: &str) {
+        let mut g = self.inner.lock().unwrap();
+        Self::push_foreign(&mut g, branch, sha);
+    }
+
+    /// The same push, landing between delivery's read of the branch's open pull request and the
+    /// `sync` after it: the race #163 records for #160.
+    pub fn push_to_branch_during_sync(&self, branch: &str, sha: &str) {
+        self.inner.lock().unwrap().push_at_sync = Some((branch.into(), sha.into()));
+    }
+
+    fn push_foreign(g: &mut Inner, branch: &str, sha: &str) {
+        g.foreign.insert(branch.to_string(), sha.to_string());
+        for rec in g.prs.values_mut() {
+            if rec.spec.head == branch && rec.pr.state == PrState::Open {
+                rec.pr.head_sha = sha.to_string();
+                rec.pr.mergeable = None;
+            }
+        }
+    }
+
+    /// Makes every `sync` that meets a foreign head conflict in `paths`, or stops doing so.
+    pub fn set_sync_conflict(&self, paths: Option<Vec<String>>) {
+        self.inner.lock().unwrap().sync_conflict = paths;
+    }
+
+    /// Every branch `sync` has been asked about, in order.
+    pub fn syncs(&self) -> Vec<String> {
+        self.inner.lock().unwrap().syncs.clone()
+    }
+
     /// What every pull request opened from now on reports as `mergeable`.
     pub fn set_mergeable_default(&self, mergeable: Option<bool>) {
         self.inner.lock().unwrap().mergeable = mergeable;
@@ -313,6 +359,30 @@ impl FakeForge {
 }
 
 impl Publisher for FakeForge {
+    fn sync(&self, _worktree: &Path, branch: &str, _remote: &str) -> Result<Synced, ForgeError> {
+        let mut g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        let has_pr = g.prs.values().any(|r| r.spec.head == branch && r.pr.state == PrState::Open);
+        if has_pr && let Some((b, sha)) = g.push_at_sync.take_if(|(b, _)| b == branch) {
+            Self::push_foreign(&mut g, &b, &sha);
+        }
+        g.syncs.push(branch.to_string());
+        let Some(remote_head) = g.foreign.get(branch).cloned() else {
+            return Ok(match g.pushed_heads.get(branch) {
+                Some(head) => Synced::Current { remote_head: head.clone() },
+                None => Synced::Absent,
+            });
+        };
+        if g.taken_in.get(branch) == Some(&remote_head) {
+            return Ok(Synced::Current { remote_head });
+        }
+        if let Some(paths) = g.sync_conflict.clone() {
+            return Ok(Synced::Conflict { remote_head, paths });
+        }
+        g.taken_in.insert(branch.to_string(), remote_head.clone());
+        Ok(Synced::Advanced { remote_head, merged: true })
+    }
+
     fn publish(
         &self,
         _worktree: &Path,
@@ -322,10 +392,20 @@ impl Publisher for FakeForge {
     ) -> Result<Published, ForgeError> {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
+        if let Some(head) = g.foreign.get(branch)
+            && g.taken_in.get(branch) != Some(head)
+        {
+            return Err(ForgeError::Permanent(format!(
+                "stale info: {branch} moved to {head}, which the worktree never took in"
+            )));
+        }
+        g.foreign.remove(branch);
+        g.taken_in.remove(branch);
         g.ops.push(Op::Publish { branch: branch.into(), base: base.into() });
         g.published.insert(branch.to_string());
         g.publishes += 1;
         let head_sha = Self::head_after_publish(g.publishes);
+        g.pushed_heads.insert(branch.to_string(), head_sha.clone());
         // The pull request open for this branch moves with the push, as the real one does. A
         // push is the gate's rebased branch, so it merges again.
         for rec in g.prs.values_mut() {
@@ -498,5 +578,22 @@ impl Forge for FakeForge {
                 Ok(())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review on #174: the fake answered a sync with the last head *any* branch published, so
+    /// a second issue's push read as the first one's branch moving.
+    #[test]
+    fn a_sync_reports_the_head_its_own_branch_last_published() {
+        let f = FakeForge::new();
+        let at = Path::new("/nowhere");
+        let first = f.publish(at, "crew/a", "origin", "master").unwrap().head_sha;
+        f.publish(at, "crew/b", "origin", "master").unwrap();
+        assert_eq!(f.sync(at, "crew/a", "origin").unwrap(), Synced::Current { remote_head: first });
+        assert_eq!(f.sync(at, "crew/c", "origin").unwrap(), Synced::Absent);
     }
 }

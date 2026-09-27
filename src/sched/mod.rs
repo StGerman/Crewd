@@ -20,6 +20,7 @@
 pub mod delivery;
 pub mod retry;
 mod review_summary;
+mod sync;
 pub mod workers;
 
 pub use delivery::DeliveryView;
@@ -1499,6 +1500,25 @@ impl Scheduler {
         // attempt, so a stale value from a since-renamed identifier does not survive a retry.
         self.store.set_branch(self.clock.as_ref(), &issue.id, prepared.branch.as_deref())?;
 
+        // Taken before the sync, which needs to know whether a human handed this run a queued
+        // conflict; see `sync_before_run`.
+        let parse = |j: String, source: &str| match serde_json::from_str::<Feedback>(&j) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(issue_id = %issue.id, error = %e, source, "unreadable feedback dropped");
+                None
+            }
+        };
+        let queued = self
+            .store
+            .take_pending_feedback(self.clock.as_ref(), &issue.id)?
+            .and_then(|j| parse(j, "issue"));
+        // Before the session or the run row exist, so a sync that blocks leaves neither behind.
+        let synced = match self.sync_before_run(issue, &prepared, queued.is_some())? {
+            sync::BeforeRun::Proceed(brief) => brief,
+            sync::BeforeRun::Blocked => return Ok(()),
+        };
+
         let run_id = format!("{}-{}", issue.id, self.clock.wall().0);
 
         // The conversation is named here, before the process exists, for the same reason the
@@ -1586,23 +1606,14 @@ impl Scheduler {
         // hand-back — goes first: it is what stopped the most recent run, and no CI result or
         // review on the branch can be acted on until that is dealt with. A hand-back queued
         // with it follows in the same prompt rather than being dropped, which cost a review
-        // round on a conflict (#160).
-        let parse = |j: String, source: &str| match serde_json::from_str::<Feedback>(&j) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                tracing::warn!(issue_id = %issue.id, error = %e, source, "unreadable feedback dropped");
-                None
-            }
-        };
-        let queued = self
-            .store
-            .take_pending_feedback(self.clock.as_ref(), &issue.id)?
-            .and_then(|j| parse(j, "issue"));
+        // round on a conflict (#160). A conflict the sync just met leads, being the newest
+        // word on the same branch.
         let delivery = self
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
             .and_then(|j| parse(j, "delivery"));
-        let mut feedback: Vec<Feedback> = queued.into_iter().chain(delivery.clone()).collect();
+        let mut feedback: Vec<Feedback> =
+            synced.into_iter().chain(queued).chain(delivery.clone()).collect();
         if feedback.is_empty()
             && let Some(b) = brief
         {

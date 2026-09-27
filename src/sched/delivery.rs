@@ -49,7 +49,8 @@ use super::review_summary::{summary_findings, verdict_comment};
 use super::{Gating, Running, Scheduler};
 use crate::clock::{Mono, Wall};
 use crate::forge::{
-    CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, summary_review_id,
+    CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, Synced,
+    summary_review_id,
 };
 use crate::model::{Feedback, Outcome, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
@@ -128,7 +129,7 @@ impl Scheduler {
         self.publisher = publisher;
     }
 
-    fn delivery_on(&self) -> bool {
+    pub(super) fn delivery_on(&self) -> bool {
         self.cfg.delivery.enabled && self.forge.is_some() && self.publisher.is_some()
     }
 
@@ -340,6 +341,12 @@ impl Scheduler {
                 .filter(|o| o.issue_id != issue_id)
                 .filter_map(|o| o.branch)
                 .collect();
+            // After the gate, so anything taken in here reaches the pull request ungated; its CI
+            // is what judges it. Pushing without it would be refused by the lease whenever the
+            // agent took the commits in by hand, after a conflict the last sync reported.
+            if self.sync_for_delivery(issue_id, &d, &worktree, &branch)?.is_none() {
+                return Ok(());
+            }
             let default_base = self.cfg.delivery.base.clone();
             let remote = self.cfg.delivery.remote.clone();
             let base = publisher
@@ -686,6 +693,28 @@ impl Scheduler {
             tracing::debug!(issue_id, "{what}; no slot to gate in, re-gating next poll");
             return Ok(());
         }
+        // Before anything is charged: the unmergeable read may predate a push that already
+        // resolved it — the operator merging the base in a second after it (#163, on #160).
+        let workspace = self.workspace.path_for(issue_id, &st.identifier);
+        if let Some(branch) = &st.branch {
+            let Some(synced) = self.sync_for_delivery(issue_id, d, &workspace, branch)? else {
+                return Ok(());
+            };
+            if let Some(head) = synced.remote_head()
+                && head != pr.head_sha
+            {
+                let forge = self.forge.clone().expect("checked by delivery_on");
+                if forge.pull_request(pr.number)?.mergeable != Some(false) {
+                    tracing::info!(
+                        issue_id,
+                        pr = pr.number,
+                        head,
+                        "{what} as read, but its head has moved since; reading it again next poll"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         if self.rounds_spent(issue_id, d, &what)? {
             return Ok(());
         }
@@ -696,7 +725,6 @@ impl Scheduler {
                 "{issue_id}: released issue refused a claim"
             )));
         }
-        let workspace = self.workspace.path_for(issue_id, &st.identifier);
         let handle = gate.start(&issue, &workspace);
         let now = self.clock.mono();
         tracing::info!(
@@ -720,6 +748,28 @@ impl Scheduler {
         };
         self.gating.insert(issue_id.to_string(), Gating { run, handle, started: now });
         Ok(())
+    }
+
+    /// Sync the branch before delivery builds on it, or — when the remote's commits conflict
+    /// with the worktree's — hand the issue to an agent run, whose own sync decides between a
+    /// brief and `Blocked` by #111's rule, and answer `None`.
+    fn sync_for_delivery(
+        &mut self,
+        issue_id: &str,
+        d: &DeliveryRecord,
+        worktree: &std::path::Path,
+        branch: &str,
+    ) -> Result<Option<Synced>, StepError> {
+        let synced = self.sync_branch(worktree, branch)?.unwrap_or(Synced::Absent);
+        let Synced::Conflict { remote_head, paths } = &synced else { return Ok(Some(synced)) };
+        let remote = &self.cfg.delivery.remote;
+        let what = format!(
+            "{remote}/{branch} moved to {remote_head}, and merging it conflicts in {}",
+            paths.join(", ")
+        );
+        let output = format!("{what}. Merge {remote_head} into the branch and finish again.");
+        self.open_round(issue_id, d, Feedback::Gate { output }, None, &what)?;
+        Ok(None)
     }
 
     /// Reply on each verdict's thread, and record the verdict once the reply has landed.

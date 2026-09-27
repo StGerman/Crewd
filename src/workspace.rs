@@ -12,7 +12,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::credentials::Credentials;
-use crate::forge::{ForgeError, Published, Publisher};
+use crate::forge::{ForgeError, Published, Publisher, Synced};
 use crate::model::{looks_like_commit, worktree_key};
 
 #[derive(Debug, thiserror::Error)]
@@ -385,18 +385,19 @@ impl GitWorktreeWorkspace {
     /// The token-bearing file, when there is one, is created here and dropped by the caller
     /// once the push has returned.
     ///
-    /// With an App credential the push goes to an explicit URL, so git updates no
-    /// remote-tracking ref and would take its lease from nothing. `lease` is therefore spelled
-    /// out: what `refs/remotes/<remote>/<branch>` holds, or empty for "must not exist yet", and
-    /// `publish` moves that ref itself once the push lands.
+    /// `lease` is spelled out on both paths, empty for "must not exist yet": a bare
+    /// `--force-with-lease` takes it from `refs/remotes/<remote>/<branch>`, which a fetch in
+    /// `workspace.repo` moves onto commits the worktree never took in, and the push then
+    /// replaces them (#163). See [`GitWorktreeWorkspace::lease_ref`].
     fn push_args(
         &self,
         remote: &str,
         branch: &str,
         lease: &str,
     ) -> Result<(Vec<String>, Option<PushCredentialFile>), ForgeError> {
+        let lease_arg = format!("--force-with-lease=refs/heads/{branch}:{lease}");
         let Some(PushAuth { creds, url }) = &self.push_auth else {
-            let args = ["push", "--force-with-lease", "--set-upstream", remote, branch];
+            let args = ["push", &lease_arg, "--set-upstream", remote, branch];
             return Ok((args.map(str::to_string).to_vec(), None));
         };
         let file = PushCredentialFile::new(&creds.token()?)
@@ -404,11 +405,49 @@ impl GitWorktreeWorkspace {
         let mut args = file.git_config();
         args.extend([
             "push".to_string(),
-            format!("--force-with-lease=refs/heads/{branch}:{lease}"),
+            lease_arg,
             url.clone(),
             format!("{branch}:refs/heads/{branch}"),
         ]);
         Ok((args, Some(file)))
+    }
+
+    /// `git <cmd> <where> <refspec>` in `worktree`, where `where` is the URL and credential
+    /// `publish` pushes with when there is one, and `remote` otherwise. A read on the ambient
+    /// credential while the push uses the App's fails wherever only the App can reach the
+    /// repository, and a sync that cannot read leaves the lease refusing a push whose missing
+    /// commits the worktree never got to take in. Retried on a fresh token as a push is.
+    fn read_remote(
+        &self,
+        worktree: &Path,
+        remote: &str,
+        cmd: &[&str],
+        refspec: &str,
+    ) -> Result<Result<String, WorkspaceError>, ForgeError> {
+        self.retry_on_auth(|| {
+            let (mut args, file, target) = match &self.push_auth {
+                None => (Vec::new(), None, remote.to_string()),
+                Some(PushAuth { creds, url }) => {
+                    let file = PushCredentialFile::new(&creds.token()?).map_err(|e| {
+                        ForgeError::Transient(format!("writing the fetch credential: {e}"))
+                    })?;
+                    (file.git_config(), Some(file), url.clone())
+                }
+            };
+            args.extend(cmd.iter().map(|c| c.to_string()));
+            args.extend([target, refspec.to_string()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = Self::git(worktree, &args);
+            drop(file);
+            Ok(out)
+        })
+    }
+
+    /// The remote head the worktree last took in, by `sync` or by its own push: the only value
+    /// the push lease may hold. Outside `refs/remotes/` so no fetch moves it, and in the shared
+    /// `.git` rather than `refs/worktree/` so it outlives a worktree removed and re-prepared.
+    fn lease_ref(branch: &str) -> String {
+        format!("refs/crew/lease/{branch}")
     }
 
     pub fn root(&self) -> &Path {
@@ -723,6 +762,66 @@ impl Workspace for GitWorktreeWorkspace {
 /// has one, because that is the base the pull request will actually be opened against; a
 /// local `base` that has fallen behind would list commits the remote already has.
 impl Publisher for GitWorktreeWorkspace {
+    fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError> {
+        self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        // Asked of the remote, not read off `refs/remotes/`: that ref is what `workspace.repo`
+        // last fetched, which is neither current nor anything this worktree took in.
+        let full = format!("refs/heads/{branch}");
+        let lease_ref = Self::lease_ref(branch);
+        let listed = self
+            .read_remote(worktree, remote, &["ls-remote", "--heads"], &full)?
+            .map_err(|e| ForgeError::Transient(format!("reading {remote}/{branch}: {e}")))?;
+        if listed.is_empty() {
+            // A lease left from a branch since deleted (merged, or by hand) would make the push
+            // that recreates it expect a head the remote no longer has, and be refused forever.
+            Self::git(worktree, &["update-ref", "-d", &lease_ref])
+                .map_err(|e| ForgeError::Transient(format!("clearing the lease: {e}")))?;
+            return Ok(Synced::Absent);
+        }
+        // Into `FETCH_HEAD`, which is per worktree, rather than any shared ref a fetch in
+        // `workspace.repo` could also move.
+        self.read_remote(worktree, remote, &["fetch", "--quiet"], &full)?
+            .map_err(|e| ForgeError::Transient(format!("fetching {remote}/{branch}: {e}")))?;
+        let remote_head = Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"])
+            .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
+        let is_ancestor =
+            |a: &str, b: &str| Self::git(worktree, &["merge-base", "--is-ancestor", a, b]).is_ok();
+
+        let synced = if is_ancestor(&remote_head, "HEAD") {
+            Synced::Current { remote_head: remote_head.clone() }
+        } else {
+            let fast_forward = is_ancestor("HEAD", &remote_head);
+            let msg = format!("Merge {remote}/{branch} into the agent's branch");
+            let args: &[&str] = if fast_forward {
+                &["merge", "--ff-only", "--quiet", &remote_head]
+            } else {
+                &["merge", "--no-ff", "--no-edit", "--quiet", "-m", &msg, &remote_head]
+            };
+            if let Err(e) = Self::git(worktree, args) {
+                // Paths before the abort, which is what clears them; the abort is what leaves
+                // the worktree as the agent had it, as the gate's rebase abort does.
+                let paths: Vec<String> =
+                    Self::git(worktree, &["diff", "--name-only", "--diff-filter=U"])
+                        .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+                        .unwrap_or_default();
+                let _ = Self::git(worktree, &["merge", "--abort"]);
+                if paths.is_empty() {
+                    // Refused before it began, a dirty tree most likely: asking again will not
+                    // change the answer, and the lease still holds either way.
+                    return Err(ForgeError::Permanent(format!(
+                        "merging {remote}/{branch} ({remote_head}) into the worktree: {e}"
+                    )));
+                }
+                return Ok(Synced::Conflict { remote_head, paths });
+            }
+            Synced::Advanced { remote_head: remote_head.clone(), merged: !fast_forward }
+        };
+        // Only now: the lease may name a head only once the worktree holds it.
+        Self::git(worktree, &["update-ref", &lease_ref, &remote_head])
+            .map_err(|e| ForgeError::Transient(format!("recording the fetched head: {e}")))?;
+        Ok(synced)
+    }
+
     fn publish(
         &self,
         worktree: &Path,
@@ -736,10 +835,11 @@ impl Publisher for GitWorktreeWorkspace {
         // a plain push is rejected non-fast-forward in exactly the round the base moved and
         // delivery hands off instead of updating the pull request. Forcing is sanctioned
         // because the branch is the orchestrator's own; the lease is what keeps that apart from
-        // forcing over somebody else's — it expects the remote ref to be what this repository
-        // last saw of it, and a remote that has moved since is refused, not overwritten.
+        // forcing over somebody else's — it expects the remote ref to be the head the worktree
+        // last took in, and a remote that has moved since is refused, not overwritten.
         let tracking = format!("refs/remotes/{remote}/{branch}");
-        let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &tracking])
+        let lease_ref = Self::lease_ref(branch);
+        let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &lease_ref])
             .unwrap_or_default();
         let push = || {
             let (args, credential) = self.push_args(remote, branch, &lease)?;
@@ -751,10 +851,13 @@ impl Publisher for GitWorktreeWorkspace {
         self.retry_on_auth(push)?.map_err(|e| classify_push(remote, branch, &e.to_string()))?;
         let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
             .map_err(|e| ForgeError::Transient(e.to_string()))?;
+        Self::git(worktree, &["update-ref", &lease_ref, &head_sha])
+            .map_err(|e| ForgeError::Transient(format!("recording the pushed head: {e}")))?;
         if self.push_auth.is_some() {
-            // A push to a URL moves no remote-tracking ref; the next lease is taken from this one.
-            Self::git(worktree, &["update-ref", &tracking, &head_sha])
-                .map_err(|e| ForgeError::Transient(format!("recording the pushed head: {e}")))?;
+            // A push to a URL moves no remote-tracking ref, and without one the branch has no
+            // upstream for an operator's `git status` to compare against. Display only: the
+            // lease is `lease_ref`, never this.
+            let _ = Self::git(worktree, &["update-ref", &tracking, &head_sha]);
             let upstream = format!("{remote}/{branch}");
             let _ = Self::git(worktree, &["branch", "--set-upstream-to", &upstream, branch]);
         }
@@ -1662,6 +1765,57 @@ mod tests {
         }
     }
 
+    /// Review on #174: with an App credential the sync read through the operator's remote,
+    /// which a host with only the App's access cannot reach.
+    #[test]
+    fn an_app_credentialed_sync_reads_the_branch_where_the_push_goes() {
+        let root = tmp_root("wt-sync-app");
+        let (repo, bare) = repo_with_remote("wt-sync-app");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(
+            Arc::new(crate::credentials::StaticToken::new("tok")),
+            bare.to_str().unwrap(),
+        );
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        git_out(&repo, &["remote", "set-url", "origin", "/nonexistent/crew-test.git"]).unwrap();
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: first.head_sha }
+        );
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Review on #174: a lease outliving its remote branch refused the push recreating it.
+    #[test]
+    fn a_branch_deleted_on_the_remote_can_be_pushed_again() {
+        let root = tmp_root("wt-sync-deleted");
+        let (repo, bare) = repo_with_remote("wt-sync-deleted");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        git_out(&bare, &["branch", "-D", &branch]).unwrap();
+        commit_in(&p.path, "b.txt", "second");
+
+        assert_eq!(ws.sync(&p.path, &branch, "origin").unwrap(), Synced::Absent);
+        let again = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            again.head_sha
+        );
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     #[test]
     fn a_push_refused_for_authentication_is_retried_once_on_a_fresh_token() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1738,7 +1892,10 @@ mod tests {
         let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
         let (args, file) = ws.push_args("origin", "crew/x", "").unwrap();
         assert!(file.is_none());
-        assert_eq!(args, ["push", "--force-with-lease", "--set-upstream", "origin", "crew/x"]);
+        assert_eq!(
+            args,
+            ["push", "--force-with-lease=refs/heads/crew/x:", "--set-upstream", "origin", "crew/x"]
+        );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&bare).ok();
@@ -1820,6 +1977,150 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&bare).ok();
         std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// A clone of `bare` with `branch` checked out, standing in for the operator's session.
+    fn someone_else(bare: &Path, branch: &str, tag: &str) -> PathBuf {
+        let other = tmp_root(tag);
+        std::fs::remove_dir_all(&other).ok();
+        git_out(
+            &std::env::temp_dir(),
+            &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()],
+        )
+        .unwrap();
+        git_out(&other, &["config", "user.email", "test@example.com"]).unwrap();
+        git_out(&other, &["config", "user.name", "test"]).unwrap();
+        git_out(&other, &["checkout", "-q", branch]).unwrap();
+        other
+    }
+
+    /// #163: the bare lease came from `refs/remotes/origin/<branch>`, so once anything in
+    /// `workspace.repo` had fetched, the push replaced the operator's commit instead of refusing.
+    #[test]
+    fn the_next_push_never_replaces_a_commit_the_worktree_has_not_seen() {
+        let root = tmp_root("wt-lease-fetched");
+        let (repo, bare) = repo_with_remote("wt-lease-fetched");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-lease-fetched-other");
+        commit_in(&other, "theirs.txt", "the operator's commit");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+        git_out(&repo, &["fetch", "-q", "origin"]).unwrap();
+
+        commit_in(&p.path, "b.txt", "second change");
+        let err = ws.publish(&p.path, &branch, "origin", "main").unwrap_err();
+        assert!(matches!(err, ForgeError::Permanent(_)), "refused, not forced: {err}");
+        let remote_head = |b: &str| git_out(&bare, &["rev-parse", &format!("refs/heads/{b}")]);
+        assert_eq!(remote_head(&branch).unwrap(), theirs, "their commit is still the head");
+
+        // Taken in, the same push carries it.
+        assert!(matches!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Advanced { merged: true, .. }
+        ));
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        let pushed = remote_head(&branch).unwrap();
+        assert!(git_out(&bare, &["merge-base", "--is-ancestor", &theirs, &pushed]).is_ok());
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    #[test]
+    fn a_branch_nobody_else_moved_syncs_as_absent_then_current() {
+        let root = tmp_root("wt-sync-current");
+        let (repo, bare) = repo_with_remote("wt-sync-current");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+
+        assert_eq!(ws.sync(&p.path, &branch, "origin").unwrap(), Synced::Absent);
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        commit_in(&p.path, "b.txt", "a later, unpushed change");
+        let head = head_of(&p.path);
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: published.head_sha }
+        );
+        assert_eq!(head_of(&p.path), head, "the worktree is left alone");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Fast-forward when the worktree has nothing of its own, so the operator's commit id — what
+    /// a reviewer saw — is the branch's head, with no merge commit on top.
+    #[test]
+    fn a_worktree_with_nothing_of_its_own_fast_forwards_to_the_remote() {
+        let root = tmp_root("wt-sync-ff");
+        let (repo, bare) = repo_with_remote("wt-sync-ff");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-ff-other");
+        commit_in(&other, "theirs.txt", "the operator's commit");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Advanced { remote_head: theirs.clone(), merged: false }
+        );
+        assert_eq!(head_of(&p.path), theirs);
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A conflict leaves the worktree as the agent had it, and the lease where it was, so the
+    /// push after it still refuses.
+    #[test]
+    fn a_conflicting_remote_branch_is_aborted_named_and_never_pushed_over() {
+        let root = tmp_root("wt-sync-conflict");
+        let (repo, bare) = repo_with_remote("wt-sync-conflict");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-conflict-other");
+        commit_in(&other, "a.txt", "their version");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+        commit_in(&p.path, "a.txt", "the agent's version");
+        let mine = head_of(&p.path);
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Conflict { remote_head: theirs.clone(), paths: vec!["a.txt".into()] }
+        );
+        assert_eq!(head_of(&p.path), mine, "the branch is where the agent left it");
+        assert!(
+            git_out(&p.path, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_err(),
+            "no merge is left in progress"
+        );
+        assert!(ws.publish(&p.path, &branch, "origin", "main").is_err());
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            theirs
+        );
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     #[test]
