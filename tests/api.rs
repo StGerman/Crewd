@@ -84,6 +84,7 @@ impl Harness {
                 repo: String::new(),
                 ..Default::default()
             },
+            forge: Default::default(),
             polling: PollingConfig { interval_ms: 30_000 },
             workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
             broker: Default::default(),

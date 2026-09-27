@@ -122,16 +122,26 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
+    // `Config::load` ran preflight, which parses it; matching on the enum rather than a string
+    // comparison is what keeps a new kind from falling through to the fake (#69).
+    let tracker_kind = cfg.tracker.kind()?;
+
     let ws_root =
         cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
     let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    // One source for the tracker, the forge and the push, so they mint one installation token
-    // between them rather than one each. `None` is the `GITHUB_TOKEN` path, and there the push
-    // rides the operator's ambient git credential exactly as before.
-    let app: Option<Arc<dyn Credentials>> = match &cfg.tracker.github_app {
-        Some(path) if cfg.tracker.kind()? == TrackerKind::Github => {
+    // One source for a GitHub tracker, the forge and the push, so they mint one installation
+    // token between them rather than one each. `None` is the `GITHUB_TOKEN` path, and there the
+    // push rides the operator's ambient git credential exactly as before. It is the forge's
+    // credential, not the tracker's: a Jira tracker still delivers to GitHub (#99).
+    let app: Option<Arc<dyn Credentials>> = match cfg.forge_github_app() {
+        Some(path) if tracker_kind != TrackerKind::Fake => {
+            let key = if cfg.forge.github_app.is_some() {
+                "forge.github_app"
+            } else {
+                "tracker.github_app"
+            };
             let file = GithubAppFile::load(path)
-                .with_context(|| format!("reading tracker.github_app {}", path.display()))?;
+                .with_context(|| format!("reading {key} {}", path.display()))?;
             tracing::info!(
                 app_id = file.app_id,
                 installation_id = file.installation_id,
@@ -143,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
     };
     // The repository's canonical HTTPS URL, not the remote's: a `pushurl` or an SSH alias there
     // would send the push out on the operator's key (#64). The gate fetches its base from it too.
-    let app_url = format!("https://github.com/{}/{}.git", cfg.tracker.owner, cfg.tracker.repo);
+    let app_url = format!("https://github.com/{}/{}.git", cfg.forge_owner(), cfg.forge_repo());
     let mut workspace = GitWorktreeWorkspace::new(&ws_root, &repo)?;
     if let Some(app) = &app {
         workspace = workspace.with_push_credentials(app.clone(), app_url.clone());
@@ -166,9 +176,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // `Config::load` ran preflight, which parses both; matching on the enums rather than a
-    // string comparison is what keeps a new kind from falling through to the fake (#69).
-    let tracker_kind = cfg.tracker.kind()?;
     let mut pools = Vec::new();
     for w in cfg.workers() {
         let kind = w.kind()?;
@@ -188,13 +195,7 @@ async fn main() -> anyhow::Result<()> {
     let (tracker, writes, forge): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Arc<dyn Forge>) =
         match tracker_kind {
             TrackerKind::Github => {
-                let creds: Arc<dyn Credentials> = match &app {
-                    Some(app) => app.clone(),
-                    None => Arc::new(StaticToken::new(&std::env::var("GITHUB_TOKEN").context(
-                        "GITHUB_TOKEN must be set when tracker.kind = \"github\" and no \
-                         tracker.github_app is configured",
-                    )?)),
-                };
+                let creds = github_credentials(&app)?;
                 let rule = DispatchRule {
                     label: cfg.tracker.dispatch_label.clone(),
                     assignee: cfg.tracker.assignee.clone(),
@@ -210,16 +211,11 @@ async fn main() -> anyhow::Result<()> {
                     .with_credentials(creds.clone())
                     .with_dispatch_rule(rule),
                 );
-                // The forge is the same repository on GitHub, so the same credential; on any
-                // other provider it would be a separate adapter with its own.
+                // `[forge]` falls back to this same repository (#99), so the tracker and the
+                // forge share one credential here.
                 let forge = Arc::new(
-                    GithubForge::new(
-                        UreqHttp::default(),
-                        &cfg.tracker.owner,
-                        &cfg.tracker.repo,
-                        "",
-                    )
-                    .with_credentials(creds),
+                    GithubForge::new(UreqHttp::default(), cfg.forge_owner(), cfg.forge_repo(), "")
+                        .with_credentials(creds),
                 );
                 (gh.clone(), gh, forge)
             }
@@ -262,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if real_worker && tracker_kind == TrackerKind::Github {
+    if real_worker && tracker_kind != TrackerKind::Fake {
         tracing::warn!(
             "real tracker + real worker: this run will dispatch actual coding agents against \
              real issues and let them commit to real worktrees"
@@ -479,6 +475,20 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// The forge credential: the GitHub App already minted above, or a `GITHUB_TOKEN` static token.
+///
+/// Split out because a Jira tracker needs the same forge credential for its own delivery path,
+/// not a second way to build one.
+fn github_credentials(app: &Option<Arc<dyn Credentials>>) -> anyhow::Result<Arc<dyn Credentials>> {
+    match app {
+        Some(app) => Ok(app.clone()),
+        None => Ok(Arc::new(StaticToken::new(&std::env::var("GITHUB_TOKEN").context(
+            "GITHUB_TOKEN must be set when tracker.kind is not \"fake\" and no forge.github_app \
+             (or tracker.github_app) is configured",
+        )?))),
+    }
 }
 
 /// Bind the broker's loopback listener and start serving.

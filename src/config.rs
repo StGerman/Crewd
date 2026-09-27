@@ -95,6 +95,8 @@ pub struct Config {
     #[serde(default)]
     pub tracker: TrackerConfig,
     #[serde(default)]
+    pub forge: ForgeConfig,
+    #[serde(default)]
     pub polling: PollingConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
@@ -457,6 +459,24 @@ impl TrackerConfig {
     }
 }
 
+/// The GitHub repository pull requests and pushes go to (see [`crate::forge`]).
+///
+/// A Jira-tracked issue is not a GitHub issue, so the repository the tracker polls and the
+/// repository delivery opens a pull request against can differ. Each key falls back to the
+/// matching `[tracker]` key when unset, so a GitHub-tracker config — where the two repositories
+/// are the same one — needs no `[forge]` table at all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgeConfig {
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub repo: String,
+    /// Falls back to `tracker.github_app` when unset. See [`TrackerConfig::github_app`] for
+    /// what the file names.
+    #[serde(default)]
+    pub github_app: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollingConfig {
     #[serde(default = "d_interval")]
@@ -550,6 +570,26 @@ impl Config {
         self.gate.base.clone().or_else(|| self.delivery.enabled.then(|| self.delivery.base.clone()))
     }
 
+    /// The repository owner pull requests and pushes go to: `forge.owner` when set, else
+    /// `tracker.owner`. See [`ForgeConfig`].
+    pub fn forge_owner(&self) -> &str {
+        let forge = self.forge.owner.trim();
+        if !forge.is_empty() { forge } else { &self.tracker.owner }
+    }
+
+    /// The repository name pull requests and pushes go to: `forge.repo` when set, else
+    /// `tracker.repo`. See [`ForgeConfig`].
+    pub fn forge_repo(&self) -> &str {
+        let forge = self.forge.repo.trim();
+        if !forge.is_empty() { forge } else { &self.tracker.repo }
+    }
+
+    /// The GitHub App settings file the forge credential is minted from: `forge.github_app`
+    /// when set, else `tracker.github_app`. See [`ForgeConfig`].
+    pub fn forge_github_app(&self) -> Option<&Path> {
+        self.forge.github_app.as_deref().or(self.tracker.github_app.as_deref())
+    }
+
     /// Parse and preflight a config, then check the host has what `tracker.github_app` names.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let cfg = Self::parse(path)?;
@@ -573,15 +613,19 @@ impl Config {
     /// Once, at load, and not in `preflight`: preflight runs every tick, and a key file briefly
     /// replaced on disk must not stop dispatch while the key `main` already loaded is still the
     /// one in use. A half-configured App would otherwise surface as a 401 on the first poll,
-    /// naming none of the pieces actually missing. The fake tracker never reads the file.
+    /// naming none of the pieces actually missing. The fake tracker never reads the file; every
+    /// other tracker checks the *resolved* forge path, since delivery needs a GitHub credential
+    /// even when the tracker itself is not GitHub.
     pub fn check_github_app(&self) -> Result<(), ConfigError> {
-        let Some(path) = &self.tracker.github_app else { return Ok(()) };
-        if self.tracker.kind()? != TrackerKind::Github {
+        if self.tracker.kind()? == TrackerKind::Fake {
             return Ok(());
         }
+        let Some(path) = self.forge_github_app() else { return Ok(()) };
+        let key =
+            if self.forge.github_app.is_some() { "forge.github_app" } else { "tracker.github_app" };
         GithubAppFile::load(path)
             .and_then(|file| file.load_key().map(drop))
-            .map_err(|e| ConfigError::Invalid(format!("tracker.github_app: {e}")))
+            .map_err(|e| ConfigError::Invalid(format!("{key}: {e}")))
     }
 
     /// Lowercase every state used for comparison, so provider spelling never leaks into lookups.
@@ -617,6 +661,18 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "tracker.owner and tracker.repo are required when tracker.kind = \"github\"".into(),
+            ));
+        }
+        // Delivery needs a GitHub repository to push to and open a pull request against even
+        // when the tracker itself is not GitHub (a Jira tracker, say); each `[forge]` key falls
+        // back to the matching `[tracker]` key, so this only fires when neither names one.
+        if self.tracker.kind()? != TrackerKind::Fake
+            && (self.forge_owner().is_empty() || self.forge_repo().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "forge.owner and forge.repo are required when tracker.kind is not \"fake\"; \
+                 each falls back to tracker.owner and tracker.repo"
+                    .into(),
             ));
         }
         // The spec omits this, so a service with no active states polls forever, dispatches
@@ -824,6 +880,7 @@ mod tests {
                 repo: String::new(),
                 ..Default::default()
             },
+            forge: Default::default(),
             polling: Default::default(),
             workspace: Default::default(),
             agent: Default::default(),
@@ -1134,6 +1191,35 @@ mod tests {
         c.tracker.owner = "o".into();
         assert!(c.preflight().is_err(), "repo is still missing");
         c.tracker.repo = "r".into();
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_forge_section_falls_back_to_the_tracker_fields_when_unset() {
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        c.tracker.github_app = Some(PathBuf::from("tracker-app.toml"));
+        assert_eq!(c.forge_owner(), "o");
+        assert_eq!(c.forge_repo(), "r");
+        assert_eq!(c.forge_github_app(), Some(Path::new("tracker-app.toml")));
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn an_explicit_forge_section_overrides_the_tracker_fields() {
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        c.tracker.github_app = Some(PathBuf::from("tracker-app.toml"));
+        c.forge.owner = "fo".into();
+        c.forge.repo = "fr".into();
+        c.forge.github_app = Some(PathBuf::from("forge-app.toml"));
+        assert_eq!(c.forge_owner(), "fo");
+        assert_eq!(c.forge_repo(), "fr");
+        assert_eq!(c.forge_github_app(), Some(Path::new("forge-app.toml")));
         assert!(c.preflight().is_ok());
     }
 
