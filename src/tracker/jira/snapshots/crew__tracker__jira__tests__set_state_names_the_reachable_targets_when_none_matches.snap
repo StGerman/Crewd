@@ -1,0 +1,5 @@
+---
+source: src/tracker/jira/mod.rs
+expression: m
+---
+PROJ-1 is Open; no transition reaches "done"; reachable: In Progress

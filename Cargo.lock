@@ -366,6 +366,7 @@ dependencies = [
  "ratatui",
  "ring",
  "rusqlite",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",

@@ -1,0 +1,99 @@
+# Points a Jira Cloud project at this daemon (#99). Every value below is a placeholder — no real
+# domain, project or repository — swap each one in before running this config.
+
+[tracker]
+kind = "jira"
+# Jira's native workflow statuses, whatever this project's board actually uses.
+active_states = ["In Progress"]
+terminal_states = ["Done"]
+# The label is the whole dispatch signal (#99): carrying it is what makes an issue ready, the
+# same way `dispatch_label` works for the GitHub tracker. There is no assignee fallback for Jira.
+dispatch_label = "crewd"
+
+[tracker.jira]
+base_url = "https://your-domain.atlassian.net"
+project = "PROJ"
+# Narrows dispatch further, to issues assigned to the token's own account. Checked per issue in
+# both the poll and reconciliation, so a reassigned issue stops being dispatched even mid-run.
+assigned_to_me = true
+# A TOML file naming `email` and `api_token` (an Atlassian API token, not the account password).
+# Unset falls back to JIRA_EMAIL and JIRA_API_TOKEN in the environment. Never check the token
+# itself into a file this repository tracks.
+credentials = "~/.crewd/jira.toml"
+
+# Delivery still needs a GitHub repository to push to and open a pull request against, even
+# though the tracker itself is Jira — a Jira-tracked issue is not a GitHub issue. Unset,
+# `github_app` falls back to GITHUB_TOKEN; set, the daemon refuses to start while the file it
+# names is absent or incomplete.
+[forge]
+owner = "your-org"
+repo = "your-repo"
+# github_app = "~/.crewd/github-app.toml"
+
+# A poll costs one search request (paginated at 100) plus one `by_ids` request per running issue;
+# Jira Cloud's rate limiting is cost-based with no budget header the way GitHub's is, so this is
+# an empirical knob rather than an arithmetic one — see src/tracker/jira/mod.rs's module doc.
+[polling]
+interval_ms = 30000
+
+# A clone of the [forge] repository, and a worktree root beside it. Run the daemon from outside
+# both: never from inside a worktree (#29).
+[workspace]
+root = "../your-repo-crew"
+repo = "../your-repo"
+
+[[workers]]
+kind = "claude"
+max_concurrent = 1
+model = "claude-opus-5-5"
+effort = "medium"
+
+[agent]
+max_concurrent = 1
+max_turns_per_session = 40
+max_turns_per_issue = 400
+max_retry_backoff_ms = 60000
+stall_timeout_ms = 300000
+quarantine_after_identical = 3
+refresh_miss_grace = 2
+parked_sweep_interval_ms = 300000
+
+# Host-side tracker tools. Writes land as the token's own account: a comment, a transition, a
+# remote link to the pull request — never a raw Jira credential handed to the agent.
+[broker]
+enabled = true
+max_calls_per_run = 10
+max_calls_per_issue = 40
+
+[api]
+enabled = true
+bind = "127.0.0.1:8787"
+mcp_enabled = true
+mcp_bind = "127.0.0.1:8788"
+
+[transcripts]
+enabled = true
+max_bytes_per_run = 8388608
+keep_runs = 50
+
+# The handoff gate (src/gate/): before a `Done` run is believed, its branch is rebased and these
+# commands run in its worktree. Off here — name this repository's own commit-gate commands (its
+# linter, formatter, type checker and tests, in the order it runs them) before turning it on.
+[gate]
+enabled = false
+commands = []
+
+# Delivery (src/sched/delivery.rs): push a finished run's branch and open a pull request against
+# `base`. The pull request body writes `Issue: [PROJ-123](url)` rather than `Closes <url>` — Jira
+# has no GitHub-recognised closing keyword. Nothing here moves the Jira ticket once that pull
+# request merges (#180): a person or a Jira automation transitions it, and its worktree is
+# reclaimed once it reaches a terminal status.
+[delivery]
+enabled = true
+base = "main"
+remote = "origin"
+reviewers = []
+max_rounds_per_pr = 3
+max_rounds_per_issue = 6
+poll_interval_ms = 120000
+ci_timeout_ms = 3600000

@@ -25,7 +25,7 @@ use crew::broker::fake::FakeWrites;
 use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use crew::clock::{Clock, SystemClock};
 use crew::config::{Config, TrackerKind, WorkerConfig, WorkerKind};
-use crew::credentials::{Credentials, GithubApp, GithubAppFile, StaticToken};
+use crew::credentials::{Credentials, GithubApp, GithubAppFile, JiraCredentialsFile, StaticToken};
 use crew::forge::fake::FakeForge;
 use crew::forge::github::GithubForge;
 use crew::forge::{Forge, Publisher};
@@ -37,6 +37,7 @@ use crew::store::Store;
 use crew::tracker::Tracker;
 use crew::tracker::fake::FakeTracker;
 use crew::tracker::github::{DispatchRule, GithubTracker, UreqHttp};
+use crew::tracker::jira::JiraTracker;
 use crew::transcript::Transcripts;
 use crew::tui::{Ui, UiAction};
 use crew::worker::Worker;
@@ -118,32 +119,53 @@ async fn main() -> anyhow::Result<()> {
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
+    // One client for the whole process (#150): `SSL_CERT_FILE` is read once, here, so a bundle
+    // that cannot be read stops startup instead of failing the first poll as an opaque transport
+    // error, and the tracker, the forge and the GitHub App below share one connection pool and
+    // one root-certificate set rather than each reading the environment for their own.
+    let http = UreqHttp::from_env().context("building the HTTPS client")?;
+
     let db_path =
         std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
+    // `Config::load` ran preflight, which parses it; matching on the enum rather than a string
+    // comparison is what keeps a new kind from falling through to the fake (#69).
+    let tracker_kind = cfg.tracker.kind()?;
+
     let ws_root =
         cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
     let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    // One source for the tracker, the forge and the push, so they mint one installation token
-    // between them rather than one each. `None` is the `GITHUB_TOKEN` path, and there the push
-    // rides the operator's ambient git credential exactly as before.
-    let app: Option<Arc<dyn Credentials>> = match &cfg.tracker.github_app {
-        Some(path) if cfg.tracker.kind()? == TrackerKind::Github => {
+    // A Jira dry run with delivery off must not need a GitHub App on disk: delivery is the
+    // forge's only consumer. A GitHub tracker needs this credential for its own reads (#99).
+    let needs_forge_credential = tracker_kind == TrackerKind::Github
+        || (tracker_kind != TrackerKind::Fake && cfg.delivery.enabled);
+    // One source for a GitHub tracker, the forge and the push, so they mint one installation
+    // token between them rather than one each. `None` is the `GITHUB_TOKEN` path, and there the
+    // push rides the operator's ambient git credential exactly as before. It is the forge's
+    // credential, not the tracker's: a Jira tracker delivers to GitHub only while `[delivery]`
+    // is on (#99).
+    let app: Option<Arc<dyn Credentials>> = match cfg.forge_github_app() {
+        Some(path) if needs_forge_credential => {
+            let key = if cfg.forge.github_app.is_some() {
+                "forge.github_app"
+            } else {
+                "tracker.github_app"
+            };
             let file = GithubAppFile::load(path)
-                .with_context(|| format!("reading tracker.github_app {}", path.display()))?;
+                .with_context(|| format!("reading {key} {}", path.display()))?;
             tracing::info!(
                 app_id = file.app_id,
                 installation_id = file.installation_id,
                 "writes are authored by the GitHub App, not the operator"
             );
-            Some(Arc::new(GithubApp::new(UreqHttp::default(), &file, clock.clone())?))
+            Some(Arc::new(GithubApp::new(http.clone(), &file, clock.clone())?))
         }
         _ => None,
     };
     // The repository's canonical HTTPS URL, not the remote's: a `pushurl` or an SSH alias there
     // would send the push out on the operator's key (#64). The gate fetches its base from it too.
-    let app_url = format!("https://github.com/{}/{}.git", cfg.tracker.owner, cfg.tracker.repo);
+    let app_url = format!("https://github.com/{}/{}.git", cfg.forge_owner(), cfg.forge_repo());
     let mut workspace = GitWorktreeWorkspace::new(&ws_root, &repo)?;
     if let Some(app) = &app {
         workspace = workspace.with_push_credentials(app.clone(), app_url.clone());
@@ -166,9 +188,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // `Config::load` ran preflight, which parses both; matching on the enums rather than a
-    // string comparison is what keeps a new kind from falling through to the fake (#69).
-    let tracker_kind = cfg.tracker.kind()?;
     let mut pools = Vec::new();
     for w in cfg.workers() {
         let kind = w.kind()?;
@@ -183,57 +202,44 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .any(|w| matches!(w.kind().ok(), Some(WorkerKind::Claude | WorkerKind::Grok)));
 
-    // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
-    // broker over the same credential, which never leaves this process either way.
-    let (tracker, writes, forge): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Arc<dyn Forge>) =
-        match tracker_kind {
-            TrackerKind::Github => {
-                let creds: Arc<dyn Credentials> = match &app {
-                    Some(app) => app.clone(),
-                    None => Arc::new(StaticToken::new(&std::env::var("GITHUB_TOKEN").context(
-                        "GITHUB_TOKEN must be set when tracker.kind = \"github\" and no \
-                         tracker.github_app is configured",
-                    )?)),
-                };
-                let rule = DispatchRule {
-                    label: cfg.tracker.dispatch_label.clone(),
-                    assignee: cfg.tracker.assignee.clone(),
-                };
-                let gh = Arc::new(
-                    GithubTracker::new(
-                        UreqHttp::default(),
-                        &cfg.tracker.owner,
-                        &cfg.tracker.repo,
-                        "",
-                        &cfg.tracker.required_labels,
-                    )
-                    .with_credentials(creds.clone())
-                    .with_dispatch_rule(rule),
-                );
-                // The forge is the same repository on GitHub, so the same credential; on any
-                // other provider it would be a separate adapter with its own.
-                let forge = Arc::new(
-                    GithubForge::new(
-                        UreqHttp::default(),
-                        &cfg.tracker.owner,
-                        &cfg.tracker.repo,
-                        "",
-                    )
-                    .with_credentials(creds),
-                );
-                (gh.clone(), gh, forge)
-            }
-            TrackerKind::Fake => {
-                // The demo tracker has nothing to write to, so broker calls are recorded and
-                // dropped. That still exercises the whole path — scoping, budgets, audit —
-                // without a network. The fake forge likewise: green CI, reviewers that attach.
-                (
-                    Arc::new(FakeTracker::demo()),
-                    Arc::new(FakeWrites::new()),
-                    Arc::new(FakeForge::new()),
+    // One adapter, two traits: a real tracker reads for the scheduler and writes for the broker
+    // over the same credential, which never leaves this process either way. A non-GitHub
+    // tracker with delivery off builds no forge (#99).
+    let (tracker, writes, forge): TrackerSet = match tracker_kind {
+        TrackerKind::Github => {
+            let creds = github_credentials(&app)?;
+            let rule = DispatchRule {
+                label: cfg.tracker.dispatch_label.clone(),
+                assignee: cfg.tracker.assignee.clone(),
+            };
+            let gh = Arc::new(
+                GithubTracker::new(
+                    http.clone(),
+                    &cfg.tracker.owner,
+                    &cfg.tracker.repo,
+                    "",
+                    &cfg.tracker.required_labels,
                 )
-            }
-        };
+                .with_credentials(creds.clone())
+                .with_dispatch_rule(rule),
+            );
+            // `preflight` refuses a `[forge]` that names anything else when `tracker.kind =
+            // "github"`, so the tracker and the forge always share this one credential.
+            let forge: Arc<dyn Forge> = Arc::new(
+                GithubForge::new(http.clone(), cfg.forge_owner(), cfg.forge_repo(), "")
+                    .with_credentials(creds),
+            );
+            (gh.clone(), gh, Some(forge))
+        }
+        TrackerKind::Jira => build_jira(&cfg, &app, &http)?,
+        TrackerKind::Fake => {
+            // The demo tracker has nothing to write to, so broker calls are recorded and
+            // dropped. That still exercises the whole path — scoping, budgets, audit —
+            // without a network. The fake forge likewise: green CI, reviewers that attach.
+            let forge: Arc<dyn Forge> = Arc::new(FakeForge::new());
+            (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()), Some(forge))
+        }
+    };
 
     // Best-effort, like the projector: a root that cannot be created costs post-mortems, not
     // dispatch. Defaults beside the worktrees rather than inside one — see `TranscriptsConfig`.
@@ -262,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if real_worker && tracker_kind == TrackerKind::Github {
+    if real_worker && tracker_kind != TrackerKind::Fake {
         tracing::warn!(
             "real tracker + real worker: this run will dispatch actual coding agents against \
              real issues and let them commit to real worktrees"
@@ -318,8 +324,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     // Attached whenever the config asks, and the real git worktree is always the publisher:
-    // there is no fake half here, because the branch that gets pushed is a real one.
-    let delivery = cfg.delivery.enabled.then(|| {
+    // there is no fake half here, because the branch that gets pushed is a real one. Every
+    // tracker arm above builds a forge whenever delivery is on.
+    let delivery = forge.filter(|_| cfg.delivery.enabled).map(|forge| {
         tracing::info!(
             base = %cfg.delivery.base, remote = %cfg.delivery.remote, reviewers = ?cfg.delivery.reviewers,
             rounds_per_pr = cfg.delivery.max_rounds_per_pr, rounds_per_issue = cfg.delivery.max_rounds_per_issue,
@@ -481,6 +488,71 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The forge credential: the GitHub App already minted above, or a `GITHUB_TOKEN` static token.
+///
+/// Split out because a Jira tracker needs the same forge credential for its own delivery path,
+/// not a second way to build one.
+fn github_credentials(app: &Option<Arc<dyn Credentials>>) -> anyhow::Result<Arc<dyn Credentials>> {
+    match app {
+        Some(app) => Ok(app.clone()),
+        None => Ok(Arc::new(StaticToken::new(&std::env::var("GITHUB_TOKEN").context(
+            "GITHUB_TOKEN must be set when tracker.kind is not \"fake\" and no forge.github_app \
+             (or tracker.github_app) is configured",
+        )?))),
+    }
+}
+
+/// What every `TrackerKind` arm in `main` builds: the tracker, its broker writes, and the forge
+/// (`None` for a non-GitHub tracker with delivery off).
+type TrackerSet = (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Option<Arc<dyn Forge>>);
+
+/// The Jira tracker and, only while `[delivery]` is on, the GitHub forge it delivers through,
+/// which `[forge]` names (#99). With delivery off nothing here reads `[forge]`, so a dry run with
+/// the fake worker needs no GitHub App, token or repository. `http` is the one client `main`
+/// built from the environment (#150), shared rather than rebuilt per tracker.
+fn build_jira(
+    cfg: &Config,
+    app: &Option<Arc<dyn Credentials>>,
+    http: &UreqHttp,
+) -> anyhow::Result<TrackerSet> {
+    let jira = cfg
+        .tracker
+        .jira
+        .as_ref()
+        .context("[tracker.jira] is required when tracker.kind = \"jira\"")?;
+    let creds = match &jira.credentials {
+        Some(path) => JiraCredentialsFile::load(path)
+            .with_context(|| format!("reading tracker.jira.credentials {}", path.display()))?,
+        None => JiraCredentialsFile::from_env().context(
+            "set tracker.jira.credentials to a file naming email/api_token, or JIRA_EMAIL and \
+             JIRA_API_TOKEN in the environment",
+        )?,
+    };
+    let token: Arc<dyn Credentials> = Arc::new(StaticToken::new(&creds.basic_token()));
+    tracing::info!(
+        project = %jira.project, base_url = %jira.base_url,
+        "polling Jira Cloud; writes are authored by the token's own account"
+    );
+    // Preflight already refused a Jira tracker with no dispatch_label, so this is always set.
+    let dispatch_label = cfg.tracker.dispatch_label.clone().unwrap_or_default();
+    let jira_tracker = Arc::new(
+        JiraTracker::new(http.clone(), &jira.base_url, &jira.project, &dispatch_label)
+            .with_credentials(token)
+            .with_assigned_to_me(jira.assigned_to_me),
+    );
+    let forge = cfg
+        .delivery
+        .enabled
+        .then(|| {
+            anyhow::Ok(Arc::new(
+                GithubForge::new(http.clone(), cfg.forge_owner(), cfg.forge_repo(), "")
+                    .with_credentials(github_credentials(app)?),
+            ) as Arc<dyn Forge>)
+        })
+        .transpose()?;
+    Ok((jira_tracker.clone(), jira_tracker, forge))
+}
+
 /// Bind the broker's loopback listener and start serving.
 ///
 /// Every failure here returns `None` rather than propagating: a broker that cannot start is an
@@ -626,8 +698,10 @@ fn run_init(
         // that an abandoned run ends.
         install_polls: 200,
     };
-    let registered =
-        init::run(&UreqHttp::default(), &SystemClock::new(), &mut TerminalOperator, &opts)?;
+    // `init` runs before a config is loaded and on its own thread (#150), so it builds its own
+    // client from the environment rather than sharing the daemon's.
+    let http = UreqHttp::from_env().context("building the HTTPS client")?;
+    let registered = init::run(&http, &SystemClock::new(), &mut TerminalOperator, &opts)?;
     println!(
         "\nApp {} (id {}) is installed (installation {}).\n  key:      {}\n  settings: {}\n\n\
          Name the settings from the daemon's config:\n\n  [tracker]\n  github_app = \"{}\"",

@@ -51,6 +51,7 @@ fn scheduler(root: &Path, db: &Path) -> Scheduler {
             repo: String::new(),
             ..Default::default()
         },
+        forge: Default::default(),
         polling: PollingConfig { interval_ms: 30_000 },
         workspace: WorkspaceConfig { root: Some(root.join("workspaces")), repo: None },
         broker: Default::default(),

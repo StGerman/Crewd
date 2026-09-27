@@ -1,0 +1,6 @@
+---
+source: src/tracker/jira/adf.rs
+expression: render(&doc)
+---
+- Use Postgres
+- Ship Friday

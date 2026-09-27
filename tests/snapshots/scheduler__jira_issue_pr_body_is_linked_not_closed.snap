@@ -1,0 +1,13 @@
+---
+source: tests/scheduler.rs
+expression: spec.body
+---
+Issue: [MT-1](https://your-domain.atlassian.net/browse/PROJ-12)
+
+## Commits
+
+- do the work
+
+## Provenance
+
+Opened by crewd from 1 run of MT-1 (3 turns, 1200 tokens in / 750 out). The verdict on each review comment is recorded as a reply on its thread; merging is left to a human.

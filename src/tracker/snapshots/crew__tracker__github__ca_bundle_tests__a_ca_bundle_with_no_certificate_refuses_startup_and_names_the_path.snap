@@ -1,0 +1,5 @@
+---
+source: src/tracker/github.rs
+expression: "redact_tmp(&err.to_string(), &dir)"
+---
+SSL_CERT_FILE names <tmp>/bundle.pem, which holds no certificate

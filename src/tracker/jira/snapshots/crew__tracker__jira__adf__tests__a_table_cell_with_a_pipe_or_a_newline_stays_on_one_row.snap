@@ -1,0 +1,7 @@
+---
+source: src/tracker/jira/adf.rs
+expression: render(&doc)
+---
+| A | B |
+| --- | --- |
+| a\|b | line one  line two |

@@ -6,6 +6,9 @@
 
 pub mod fake;
 pub mod github;
+pub mod jira;
+#[cfg(test)]
+pub(crate) mod test_http;
 
 use crate::model::{ErrorClass, Issue};
 
@@ -37,6 +40,20 @@ impl TrackerError {
             TrackerError::Auth(_) => ErrorClass::AuthFailed,
         }
     }
+}
+
+/// Without this an issue labelled `Agent` never matches a configured `agent` and is never
+/// dispatched (#70): `routable` compares with plain equality against `required_labels`, which
+/// `Config::normalize` has already given this same shape.
+pub(crate) fn normalize_labels(labels: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for label in labels {
+        let name = label.trim().to_lowercase();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 pub trait Tracker: Send + Sync {

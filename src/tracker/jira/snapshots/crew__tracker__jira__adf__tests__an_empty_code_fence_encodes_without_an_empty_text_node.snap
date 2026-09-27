@@ -1,0 +1,13 @@
+---
+source: src/tracker/jira/adf.rs
+expression: "serde_json::to_string_pretty(&encode(\"```\\n\\n```\")).unwrap()"
+---
+{
+  "content": [
+    {
+      "type": "codeBlock"
+    }
+  ],
+  "type": "doc",
+  "version": 1
+}

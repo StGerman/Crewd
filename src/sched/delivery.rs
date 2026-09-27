@@ -963,8 +963,11 @@ impl Scheduler {
         };
 
         let mut body = String::new();
-        match issue.and_then(|i| i.url.as_deref()) {
-            Some(url) => body.push_str(&format!("Closes {url}\n\n")),
+        match issue.and_then(|i| i.url.as_deref().map(|url| (i, url))) {
+            Some((_, url)) if is_github_issue_url(url) => {
+                body.push_str(&format!("Closes {url}\n\n"))
+            }
+            Some((i, url)) => body.push_str(&format!("Issue: [{}]({url})\n\n", i.identifier)),
             None => body.push_str(&format!("Issue: {}\n\n", st.identifier)),
         }
         if base != self.cfg.delivery.base {
@@ -1013,5 +1016,49 @@ impl Scheduler {
             .iter()
             .map(|d| (d.issue_id.clone(), DeliveryView::from(d)))
             .collect())
+    }
+}
+
+/// Whether `url` is a GitHub issue's own permalink — the one shape GitHub's `Closes` keyword
+/// actually understands. Every other tracker's URL (a Jira ticket, a GitLab issue) is inert
+/// there, so writing `Closes` in front of it would tell a reviewer that merging closes a ticket
+/// nothing in the merge touches.
+fn is_github_issue_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://github.com/") else { return false };
+    let mut segments = rest.split('/');
+    let owner = segments.next().unwrap_or_default();
+    let repo = segments.next().unwrap_or_default();
+    let kind = segments.next().unwrap_or_default();
+    let number = segments.next().unwrap_or_default();
+    !owner.is_empty()
+        && !repo.is_empty()
+        && kind == "issues"
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
+        && segments.next().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_github_issue_url;
+
+    #[test]
+    fn a_github_issue_url_is_recognized() {
+        assert!(is_github_issue_url("https://github.com/StGerman/crewd/issues/99"));
+    }
+
+    #[test]
+    fn a_jira_url_is_not_a_github_issue_url() {
+        assert!(!is_github_issue_url("https://your-domain.atlassian.net/browse/PROJ-12"));
+    }
+
+    #[test]
+    fn a_github_pull_request_url_is_not_a_github_issue_url() {
+        assert!(!is_github_issue_url("https://github.com/StGerman/crewd/pull/99"));
+    }
+
+    #[test]
+    fn a_github_issue_url_with_a_trailing_fragment_is_not_recognized() {
+        assert!(!is_github_issue_url("https://github.com/StGerman/crewd/issues/99#issuecomment-1"));
     }
 }

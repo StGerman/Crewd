@@ -66,14 +66,35 @@ cargo run -p crewctl -- status
    dispatched, whoever it is assigned to. Unset, any assignee marks it instead.
 3. **Give it a credential.** A GitHub App (below), or `GITHUB_TOKEN` in the environment —
    never a token in the file.
-4. **Decide whether it acts.** `tracker.kind = "github"` decides what it *looks at*;
-   `worker.kind = "claude"` decides whether it *works*. Leaving the worker fake is a safe way
-   to watch real dispatch decisions before you let anything edit code.
+4. **Decide whether it acts.** `tracker.kind = "github"` decides what it *looks at* — `"jira"`
+   is the alternative, below; `worker.kind = "claude"` decides whether it *works*. Leaving the
+   worker fake is a safe way to watch real dispatch decisions before you let anything edit code.
 5. **Decide whether it publishes.** `[delivery]` pushes branches and opens pull requests under
    your credentials. Off by default.
 
 Steps 4 and 5 are separate switches on purpose. Turning this from "watch my backlog" into
 "work my backlog" should be a decision you make twice.
+
+### Using Jira
+
+`tracker.kind = "jira"` polls a Jira Cloud project instead of GitHub Issues — Jira Cloud only,
+not Data Center. Copy `crew.jira.toml` and fill in `[tracker.jira]`: `base_url`
+(`https://your-domain.atlassian.net`), `project` (the key, e.g. `PROJ`), and `assigned_to_me`
+to narrow dispatch further to issues assigned to the token's own account. `dispatch_label` is
+required for a Jira tracker and is the whole dispatch signal, the same way it works for GitHub —
+a Jira service account cannot be an assignee either, so there is no assignee fallback.
+
+Credentials are a TOML file named by `[tracker.jira] credentials` (`~/.crewd/jira.toml` in the
+shipped config), holding `email` and `api_token` — an Atlassian API token from
+[id.atlassian.com](https://id.atlassian.com/manage-profile/security/api-tokens), not the account
+password. Unset, it falls back to `JIRA_EMAIL` and `JIRA_API_TOKEN` in the environment. Every
+write — a comment, a transition, the pull request's remote link — is authored by that token's
+own account, the same way a GitHub PAT authors as its owner.
+
+A Jira-tracked issue is not a GitHub issue, so delivery still needs a repository to push to and
+open a pull request against: `[forge]` names it (`owner`, `repo`). Set `tracker.kind = "github"`
+and the two repositories are the same one, so a GitHub-tracker config needs no `[forge]` table
+at all.
 
 ### Giving it its own identity
 
@@ -101,6 +122,10 @@ environment, argv or `.git/config`. `crewd` refuses to start with a half-written
 the missing piece. A one-click `init` that registers the App for you is
 [#65](https://github.com/StGerman/crewd/issues/65). `GITHUB_TOKEN` stays supported for anyone
 not running an App.
+
+Behind a TLS-intercepting corporate proxy, set `SSL_CERT_FILE` to the proxy's CA bundle — the
+same variable curl, Python and Node already read — and every tracker and forge call trusts
+exactly that bundle instead of the default roots.
 
 Two findings from setting one up by hand, since they shape how dispatch works: an App's
 `[bot]` account **cannot be an issue assignee** outside GitHub's partner agent program, and a
@@ -145,10 +170,10 @@ itself to, and an issue that names which invariant is at stake is one an agent c
 ## Status
 
 Slices 1–6 are complete: a deterministic core with a fake behind every seam, real git
-worktrees, a real GitHub Issues tracker, a real `claude -p` worker, a host-side tool broker
-that lets an agent write to its own ticket without ever holding the credential, an ops API with
-a status client and an MCP server over it, a handoff gate, and delivery through to pull
-requests and review round-trips.
+worktrees, a real GitHub Issues tracker and a real Jira Cloud tracker, a real `claude -p`
+worker, a host-side tool broker that lets an agent write to its own ticket without ever holding
+the credential, an ops API with a status client and an MCP server over it, a handoff gate, and
+delivery through to pull requests and review round-trips.
 
 It is a Rust reimplementation of the coordination layer in
 [openai/symphony](https://github.com/openai/symphony)'s `SPEC.md`, written after a review found

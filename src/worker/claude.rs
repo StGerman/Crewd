@@ -1188,7 +1188,7 @@ mod tests {
     fn the_default_allowlist_names_no_credential_variable() {
         for name in DEFAULT_ENV_ALLOWLIST {
             let upper = name.to_ascii_uppercase();
-            for marker in ["TOKEN", "KEY", "SECRET", "GITHUB", "GH_", "CREW"] {
+            for marker in ["TOKEN", "KEY", "SECRET", "GITHUB", "GH_", "CREW", "JIRA", "ATLASSIAN"] {
                 assert!(!upper.contains(marker), "{name} could carry a credential");
             }
         }

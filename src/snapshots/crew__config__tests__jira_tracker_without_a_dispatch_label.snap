@@ -1,0 +1,5 @@
+---
+source: src/config.rs
+expression: c.preflight().unwrap_err()
+---
+invalid config: tracker.dispatch_label is required when tracker.kind = "jira"; the label is the whole dispatch signal

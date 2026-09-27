@@ -1,0 +1,5 @@
+---
+source: src/tracker/jira/mod.rs
+expression: "t.http.calls()[0]"
+---
+https://x.atlassian.net/rest/api/3/search/jql?jql=project%20%3D%20%22PROJ%22%20AND%20status%20in%20%28%22in%20development%22%29%20AND%20labels%20%3D%20%22crewd%22%20ORDER%20BY%20created%20ASC&fields=summary,description,status,priority,labels,created,issuelinks,project,assignee&maxResults=100

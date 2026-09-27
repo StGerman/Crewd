@@ -1,0 +1,23 @@
+---
+source: src/tracker/jira/adf.rs
+expression: render(&doc)
+---
+## Summary
+
+This is **important**, see `the code` and [the docs](https://example.com).
+
+- first
+- second
+
+  1. nested one
+  2. nested two
+
+```rust
+fn main() {}
+```
+
+| Name | Role | Team |
+| --- | --- | --- |
+| Jane | Lead | Core |
+
+---

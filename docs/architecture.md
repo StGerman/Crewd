@@ -124,6 +124,76 @@ rate limit gets. That is the honest version of "an auth failure stops trying and
 this scope; a literal per-issue quarantine here would be quarantining tickets a bad token had
 nothing to do with.
 
+`Tracker`'s second real implementation is [src/tracker/jira/mod.rs](../src/tracker/jira/mod.rs):
+`JiraTracker<H: Http>`, over Jira Cloud's REST API v3 (#99) — Data Center and OAuth 3LO are out
+of scope, a design-review decision recorded in the module doc and in
+[#99](https://github.com/StGerman/crewd/issues/99)'s Decisions section. The issue key
+(`PROJ-123`) is the dispatch id: it changes only when an issue leaves its project, and the
+adapter then omits it, which the scheduler already treats as "not visible" rather than as an
+error — the same contract `by_ids` documents for a 404. Reads split the same way GitHub's do:
+`by_states` is `GET /rest/api/3/search/jql`, paged by `nextPageToken` rather than `POST`,
+because `Http::send_json` is the seam's write half and a poll going through it would make the
+read kernel indistinguishable from a mutation at the seam; `search_all` fails the whole call on
+a later page's error rather than returning a short list, and on a page token equal to the one
+that produced it rather than looping forever. `by_ids` makes one `GET` per key: a clean 404 or
+an issue now in another project is omitted, and anything else fails the whole call, the same
+"omit only on an unambiguous absence" rule `github.rs`'s own `by_ids` holds to. `by_states`
+quotes `active_states`/`terminal_states` verbatim as status names in its JQL, so a status this
+site's workflow does not have fails every poll with Jira's own 400 naming it — deliberately
+loud, since the alternative would be a poll that came back empty and looked like a healthy
+backlog with nothing ready.
+
+Dispatch needs
+`tracker.dispatch_label`, which is the whole signal — a Jira service account cannot be an
+assignee at all, the same finding #64 made for GitHub — and `tracker.jira.assigned_to_me`
+narrows further, checked per issue in *both* `by_states` and `by_ids`, because `refresh_running`
+stops a run the moment `by_ids` reports it as no longer dispatchable; narrowing only the poll's
+own JQL would leave a reassigned issue running past that point.
+
+The description is Atlassian
+Document Format, and the adapter renders it to Markdown in its own module
+([src/tracker/jira/adf.rs](../src/tracker/jira/adf.rs)) rather than pulling in a crate: `jc-adf`
+0.2 and `atlassian-markdown-converter` 0.1 are early 0.x releases from single maintainers.
+Priority ranks by the priority's *name* (`priority_rank` in `src/tracker/jira/issue.rs`), never by
+Jira's own priority id — a site's ids are creation order, not severity order; GETT's own
+"Trivial" is id 10000.
+
+`set_state` applies whichever transition's target status matches the
+requested state, case-insensitively, with no operator-configured state-to-transition map; a
+workflow with no path to the requested status fails naming every status a transition can reach,
+and a transition whose screen requires a field Jira does not accept from this call fails with
+Jira's own message. `link_pr` posts a remote link with `globalId` set to the PR URL, so a repeat
+call updates the link in place instead of adding a second one.
+
+Authentication is Basic auth —
+`JiraCredentialsFile::basic_token` base64-encodes `email:api_token` once, and the result is
+handed to the same `StaticToken` the `GITHUB_TOKEN` path uses, since a Cloud API token does not
+expire on a schedule this daemon needs to track; the file itself is read once at
+`Config::load` (`check_jira_credentials`), so a half-configured file is refused by name at
+startup rather than met as a 401 on the first poll. Jira Cloud's rate limiting is cost-based
+with no budget header the way GitHub's is, so there is no equivalent of `github.rs`'s per-hour
+arithmetic to size `interval_ms` against — it stays an empirical knob, tightened only if a 429
+starts showing up in the log.
+
+A Jira-tracked issue is not a GitHub issue, so delivery still needs a GitHub repository to push
+to and open a pull request against. `[forge]` (`ForgeConfig`) names one — `owner`, `repo`,
+`github_app` — and each key falls back to the matching `[tracker]` key when unset
+(`Config::forge_owner`/`forge_repo`/`forge_github_app`), so a GitHub-tracker config, where the
+two repositories are the same one, needs no `[forge]` table at all and `crew.github.toml` works
+unchanged. A GitHub tracker refuses a separate `[forge]` instead (`preflight`): naming another
+owner, repo or App there would silently move every tracker write and every push onto a different
+credential, with `tracker.github_app` never consulted again, so `[forge]` is for a tracker that
+is not GitHub. Delivery is `[forge]`'s only consumer, and `main.rs` builds neither the forge nor
+its credential for a non-GitHub tracker until `delivery.enabled` is true — `preflight`'s
+owner/repo check and `check_github_app` are gated the same way — so a Jira dry run, the "real
+tracker with the fake worker" shape `CLAUDE.md` recommends for watching real dispatch decisions,
+needs no GitHub App, token or repository on disk at all. The pull request body writes `Closes
+<url>` only when `url` is a GitHub issue's own permalink; otherwise, as for a Jira key, it writes
+`Issue: [PROJ-123](url)`, since Jira has no GitHub-recognised closing keyword. Nothing here moves
+the Jira ticket once that pull request merges (#180): a person or a Jira automation transitions
+it, and `refresh_running`'s cleanup reclaims its worktree once the ticket itself reaches a
+terminal status.
+
 `Worker` gets its real implementation in [src/worker/claude.rs](../src/worker/claude.rs):
 `ClaudeWorker`, over `claude -p --output-format stream-json`. Two things there were confirmed
 against a real install rather than assumed, because guessing wrong would have meant a worker

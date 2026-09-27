@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::credentials::GithubAppFile;
+use crate::credentials::{GithubAppFile, JiraCredentialsFile};
 use crate::worker::{Effort, ModelChoice};
 
 fn d_interval() -> u64 {
@@ -94,6 +94,8 @@ fn d_ci_timeout() -> u64 {
 pub struct Config {
     #[serde(default)]
     pub tracker: TrackerConfig,
+    #[serde(default)]
+    pub forge: ForgeConfig,
     #[serde(default)]
     pub polling: PollingConfig,
     #[serde(default)]
@@ -434,6 +436,31 @@ pub struct TrackerConfig {
     /// read-only marker account is only possible on an organization-owned repository.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// `kind = "jira"` only: which Jira Cloud site and project to poll (#99).
+    #[serde(default)]
+    pub jira: Option<JiraConfig>,
+}
+
+/// `kind = "jira"` only: the Jira Cloud site this daemon polls, resolved once here rather than
+/// spread across the tracker's own fields — a Jira credential, project and label all belong to
+/// one table an operator fills in together, not to keys interleaved with GitHub's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JiraConfig {
+    /// The site's REST base, e.g. `https://your-domain.atlassian.net`. `Config::normalize`
+    /// strips a trailing slash.
+    #[serde(default)]
+    pub base_url: String,
+    /// The project key issues are polled from, e.g. `PROJ`.
+    #[serde(default)]
+    pub project: String,
+    /// Narrows dispatch to issues assigned to the token's owner; see `src/tracker/jira`'s module
+    /// doc for why the label alone is still required even with this on.
+    #[serde(default)]
+    pub assigned_to_me: bool,
+    /// A TOML file naming `email` and `api_token`. Unset falls back to `JIRA_EMAIL` and
+    /// `JIRA_API_TOKEN`, resolved in `main.rs`.
+    #[serde(default)]
+    pub credentials: Option<PathBuf>,
 }
 
 /// The tracker a config selects; see [`WorkerKind`] for why this is parsed.
@@ -441,6 +468,7 @@ pub struct TrackerConfig {
 pub enum TrackerKind {
     Fake,
     Github,
+    Jira,
 }
 
 impl TrackerConfig {
@@ -449,12 +477,31 @@ impl TrackerConfig {
             "" => Err(ConfigError::Invalid("tracker.kind is required".into())),
             "fake" => Ok(TrackerKind::Fake),
             "github" => Ok(TrackerKind::Github),
+            "jira" => Ok(TrackerKind::Jira),
             _ => Err(ConfigError::Invalid(format!(
-                "unsupported tracker.kind {:?}; expected one of \"fake\", \"github\"",
+                "unsupported tracker.kind {:?}; expected one of \"fake\", \"github\", \"jira\"",
                 self.kind
             ))),
         }
     }
+}
+
+/// The GitHub repository pull requests and pushes go to (see [`crate::forge`]).
+///
+/// A Jira-tracked issue is not a GitHub issue, so the repository the tracker polls and the
+/// repository delivery opens a pull request against can differ. Each key falls back to the
+/// matching `[tracker]` key when unset, so a GitHub-tracker config — where the two repositories
+/// are the same one — needs no `[forge]` table at all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgeConfig {
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub repo: String,
+    /// Falls back to `tracker.github_app` when unset. See [`TrackerConfig::github_app`] for
+    /// what the file names.
+    #[serde(default)]
+    pub github_app: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,10 +597,32 @@ impl Config {
         self.gate.base.clone().or_else(|| self.delivery.enabled.then(|| self.delivery.base.clone()))
     }
 
-    /// Parse and preflight a config, then check the host has what `tracker.github_app` names.
+    /// The repository owner pull requests and pushes go to: `forge.owner` when set, else
+    /// `tracker.owner`. See [`ForgeConfig`].
+    pub fn forge_owner(&self) -> &str {
+        let forge = self.forge.owner.trim();
+        if !forge.is_empty() { forge } else { &self.tracker.owner }
+    }
+
+    /// The repository name pull requests and pushes go to: `forge.repo` when set, else
+    /// `tracker.repo`. See [`ForgeConfig`].
+    pub fn forge_repo(&self) -> &str {
+        let forge = self.forge.repo.trim();
+        if !forge.is_empty() { forge } else { &self.tracker.repo }
+    }
+
+    /// The GitHub App settings file the forge credential is minted from: `forge.github_app`
+    /// when set, else `tracker.github_app`. See [`ForgeConfig`].
+    pub fn forge_github_app(&self) -> Option<&Path> {
+        self.forge.github_app.as_deref().or(self.tracker.github_app.as_deref())
+    }
+
+    /// Parse and preflight a config, then check the host has what `tracker.github_app` and
+    /// `tracker.jira.credentials` name.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let cfg = Self::parse(path)?;
         cfg.check_github_app()?;
+        cfg.check_jira_credentials()?;
         Ok(cfg)
     }
 
@@ -573,15 +642,36 @@ impl Config {
     /// Once, at load, and not in `preflight`: preflight runs every tick, and a key file briefly
     /// replaced on disk must not stop dispatch while the key `main` already loaded is still the
     /// one in use. A half-configured App would otherwise surface as a 401 on the first poll,
-    /// naming none of the pieces actually missing. The fake tracker never reads the file.
+    /// naming none of the pieces actually missing. The fake tracker never reads the file; a
+    /// GitHub tracker always checks the *resolved* forge path, since there it is the tracker's
+    /// own credential; any other tracker checks it only while `delivery.enabled`, the one path
+    /// that reads it at all — a Jira dry run with delivery off needs no GitHub App on disk.
     pub fn check_github_app(&self) -> Result<(), ConfigError> {
-        let Some(path) = &self.tracker.github_app else { return Ok(()) };
-        if self.tracker.kind()? != TrackerKind::Github {
+        let kind = self.tracker.kind()?;
+        if kind == TrackerKind::Fake || (kind != TrackerKind::Github && !self.delivery.enabled) {
             return Ok(());
         }
+        let Some(path) = self.forge_github_app() else { return Ok(()) };
+        let key =
+            if self.forge.github_app.is_some() { "forge.github_app" } else { "tracker.github_app" };
         GithubAppFile::load(path)
             .and_then(|file| file.load_key().map(drop))
-            .map_err(|e| ConfigError::Invalid(format!("tracker.github_app: {e}")))
+            .map_err(|e| ConfigError::Invalid(format!("{key}: {e}")))
+    }
+
+    /// Mirrors `check_github_app`: once at load, not in `preflight`, so a credentials file
+    /// replaced on disk mid-run cannot stop dispatch. Unset `tracker.jira.credentials` is not
+    /// checked here — the `JIRA_EMAIL`/`JIRA_API_TOKEN` fallback is resolved in `main.rs`, which
+    /// names whichever variable is missing.
+    pub fn check_jira_credentials(&self) -> Result<(), ConfigError> {
+        if self.tracker.kind()? != TrackerKind::Jira {
+            return Ok(());
+        }
+        let Some(jira) = &self.tracker.jira else { return Ok(()) };
+        let Some(path) = &jira.credentials else { return Ok(()) };
+        JiraCredentialsFile::load(path)
+            .map(drop)
+            .map_err(|e| ConfigError::Invalid(format!("tracker.jira.credentials: {e}")))
     }
 
     /// Lowercase every state used for comparison, so provider spelling never leaks into lookups.
@@ -599,6 +689,10 @@ impl Config {
             .as_deref()
             .map(|l| l.trim().to_lowercase())
             .filter(|l| !l.is_empty());
+        if let Some(jira) = &mut self.tracker.jira {
+            jira.base_url = jira.base_url.trim().trim_end_matches('/').to_string();
+            jira.project = jira.project.trim().to_string();
+        }
 
         self.agent.max_concurrent_by_state = self
             .agent
@@ -617,6 +711,61 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "tracker.owner and tracker.repo are required when tracker.kind = \"github\"".into(),
+            ));
+        }
+        if self.tracker.kind()? == TrackerKind::Jira {
+            let jira = self.tracker.jira.as_ref().ok_or_else(|| {
+                ConfigError::Invalid(
+                    "[tracker.jira] is required when tracker.kind = \"jira\"".into(),
+                )
+            })?;
+            if jira.base_url.is_empty() || !jira.base_url.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "tracker.jira.base_url must be set and start with https://".into(),
+                ));
+            }
+            if jira.project.is_empty() {
+                return Err(ConfigError::Invalid("tracker.jira.project is required".into()));
+            }
+            // The label is the whole dispatch signal for Jira (#99): there is no free-JQL or
+            // any-assignee fallback the way `DispatchRule` has for GitHub.
+            if self.tracker.dispatch_label.is_none() {
+                return Err(ConfigError::Invalid(
+                    "tracker.dispatch_label is required when tracker.kind = \"jira\"; the label \
+                     is the whole dispatch signal"
+                        .into(),
+                ));
+            }
+        }
+        // A GitHub tracker's own repository is the forge; a separate one would silently swap the
+        // credential every tracker write and every push use, with `tracker.github_app` then never
+        // consulted. `[forge]` exists for a tracker that is not GitHub.
+        if self.tracker.kind()? == TrackerKind::Github
+            && (!self.forge.owner.trim().is_empty()
+                || !self.forge.repo.trim().is_empty()
+                || self.forge.github_app.is_some())
+        {
+            return Err(ConfigError::Invalid(
+                "[forge] is not allowed when tracker.kind = \"github\": the tracker's own \
+                 repository and credential already are the forge; [forge] is for a tracker that \
+                 is not GitHub"
+                    .into(),
+            ));
+        }
+        // A Jira dry run with delivery off must not need a GitHub repository at all — delivery is
+        // the only thing that ever reads `[forge]` for a non-GitHub tracker — so this only fires
+        // for a GitHub tracker (its own repository, always) or for any other tracker once
+        // `delivery.enabled`; each `[forge]` key falls back to the matching `[tracker]` key.
+        let forge_required = match self.tracker.kind()? {
+            TrackerKind::Fake => false,
+            TrackerKind::Github => true,
+            TrackerKind::Jira => self.delivery.enabled,
+        };
+        if forge_required && (self.forge_owner().is_empty() || self.forge_repo().is_empty()) {
+            return Err(ConfigError::Invalid(
+                "forge.owner and forge.repo are required when tracker.kind is not \"fake\" and \
+                 delivery is enabled; each falls back to tracker.owner and tracker.repo"
+                    .into(),
             ));
         }
         // The spec omits this, so a service with no active states polls forever, dispatches
@@ -824,6 +973,7 @@ mod tests {
                 repo: String::new(),
                 ..Default::default()
             },
+            forge: Default::default(),
             polling: Default::default(),
             workspace: Default::default(),
             agent: Default::default(),
@@ -880,6 +1030,117 @@ mod tests {
         c.preflight().expect("a key replaced after load does not stop dispatch");
         c.tracker.kind = "fake".into();
         c.check_github_app().expect("the fake tracker never reads the App file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn jira_base() -> Config {
+        let mut c = base();
+        c.tracker.kind = "jira".into();
+        c.tracker.dispatch_label = Some("crewd".into());
+        c.forge.owner = "o".into();
+        c.forge.repo = "r".into();
+        c.tracker.jira = Some(JiraConfig {
+            base_url: "https://example.atlassian.net".into(),
+            project: "PROJ".into(),
+            assigned_to_me: false,
+            credentials: None,
+        });
+        c.normalize();
+        c
+    }
+
+    #[test]
+    fn a_jira_tracker_without_a_dispatch_label_is_rejected() {
+        let mut c = jira_base();
+        c.tracker.dispatch_label = None;
+        insta::assert_snapshot!(
+            "jira_tracker_without_a_dispatch_label",
+            c.preflight().unwrap_err()
+        );
+        c.tracker.dispatch_label = Some("crewd".into());
+        assert!(c.preflight().is_ok());
+    }
+
+    /// #99: delivery is the only consumer of `[forge]` for a non-GitHub tracker, so a dry
+    /// run — a real tracker with the fake worker, watching real dispatch decisions with nothing
+    /// pushed anywhere — needs no GitHub repository at all.
+    #[test]
+    fn a_jira_tracker_with_delivery_off_needs_no_forge() {
+        let mut c = jira_base();
+        assert!(!c.delivery.enabled, "the default this test relies on");
+        c.forge.owner = String::new();
+        c.forge.repo = String::new();
+        assert!(c.preflight().is_ok(), "delivery off: no forge needed");
+    }
+
+    #[test]
+    fn a_jira_tracker_without_a_forge_repo_is_rejected() {
+        let mut c = jira_base();
+        c.delivery.enabled = true;
+        c.forge.owner = String::new();
+        c.forge.repo = String::new();
+        assert!(c.preflight().is_err());
+    }
+
+    /// F2: a GitHub tracker's own repository already is the forge; a separate `[forge]` would
+    /// silently move every write and every push onto another credential while
+    /// `tracker.github_app` stopped being consulted at all.
+    #[test]
+    fn a_github_tracker_refuses_a_separate_forge_rather_than_sharing_its_credential() {
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        assert!(c.preflight().is_ok(), "no [forge] at all is the common case");
+
+        c.forge.owner = "other-org".into();
+        assert!(c.preflight().is_err(), "a separate owner");
+        c.forge.owner = String::new();
+        c.forge.repo = "other-repo".into();
+        assert!(c.preflight().is_err(), "a separate repo");
+        c.forge.repo = String::new();
+        c.forge.github_app = Some(PathBuf::from("other-app.toml"));
+        assert!(c.preflight().is_err(), "a separate App file");
+    }
+
+    #[test]
+    fn a_jira_tracker_needs_an_https_base_url_and_a_project() {
+        let mut c = jira_base();
+        c.tracker.jira.as_mut().unwrap().base_url = "http://example.atlassian.net".into();
+        assert!(c.preflight().is_err(), "http, not https");
+        c.tracker.jira.as_mut().unwrap().base_url = "https://example.atlassian.net".into();
+        c.tracker.jira.as_mut().unwrap().project = String::new();
+        assert!(c.preflight().is_err(), "project required");
+        c.tracker.jira.as_mut().unwrap().project = "PROJ".into();
+        assert!(c.preflight().is_ok());
+        c.tracker.jira = None;
+        assert!(c.preflight().is_err(), "the whole table is required");
+    }
+
+    /// Mirrors `a_half_configured_github_app_is_refused_naming_the_missing_piece`.
+    #[test]
+    fn a_half_configured_jira_credential_is_refused_naming_the_missing_piece() {
+        let dir = std::env::temp_dir().join(format!("crew-cfg-jira-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("jira.toml");
+        let mut c = jira_base();
+        c.tracker.jira.as_mut().unwrap().credentials = Some(creds.clone());
+        // The path carries the process id, so it is redacted before it is snapshotted.
+        let redact =
+            |err: String| err.replace(&creds.display().to_string(), "<tracker.jira.credentials>");
+
+        std::fs::write(&creds, "api_token = \"t\"").unwrap();
+        let err = redact(c.check_jira_credentials().unwrap_err().to_string());
+        insta::assert_snapshot!("half_configured_jira_credential_missing_email", err);
+
+        std::fs::write(&creds, "email = \"a@b.com\"").unwrap();
+        let err = redact(c.check_jira_credentials().unwrap_err().to_string());
+        insta::assert_snapshot!("half_configured_jira_credential_missing_api_token", err);
+
+        std::fs::write(&creds, "email = \"a@b.com\"\napi_token = \"t\"").unwrap();
+        c.check_jira_credentials().expect("a complete file passes");
+        c.preflight().expect("preflight never reads the file");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1082,14 +1343,24 @@ mod tests {
         let mut c = base();
         c.tracker.owner = "o".into();
         c.tracker.repo = "r".into();
+        c.tracker.dispatch_label = Some("agent".into());
+        c.tracker.jira = Some(JiraConfig {
+            base_url: "https://example.atlassian.net".into(),
+            project: "PROJ".into(),
+            assigned_to_me: false,
+            credentials: None,
+        });
+        c.normalize();
         for (kind, want) in [
             ("fake", TrackerKind::Fake),
             (" GitHub ", TrackerKind::Github),
             ("FAKE", TrackerKind::Fake),
+            ("jira", TrackerKind::Jira),
+            (" Jira ", TrackerKind::Jira),
         ] {
             c.tracker.kind = kind.into();
             assert_eq!(c.tracker.kind().unwrap(), want);
-            assert!(c.preflight().is_ok());
+            assert!(c.preflight().is_ok(), "{kind}: {:?}", c.preflight());
         }
         for (kind, want) in [
             ("", WorkerKind::Fake),
@@ -1107,7 +1378,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_configs_load() {
-        for name in ["crew.toml", "crew.github.toml"] {
+        for name in ["crew.toml", "crew.github.toml", "crew.jira.toml"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
             if let Err(e) = Config::parse(&path) {
                 panic!("{name}: {e}");
@@ -1117,6 +1388,8 @@ mod tests {
         // host's, so only `load` checks it.
         let github = Config::parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("crew.github.toml"));
         assert!(github.unwrap().tracker.github_app.is_some());
+        let jira = Config::parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("crew.jira.toml"));
+        assert!(jira.unwrap().tracker.jira.is_some());
     }
 
     #[test]
@@ -1134,6 +1407,34 @@ mod tests {
         c.tracker.owner = "o".into();
         assert!(c.preflight().is_err(), "repo is still missing");
         c.tracker.repo = "r".into();
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_forge_section_falls_back_to_the_tracker_fields_when_unset() {
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        c.tracker.github_app = Some(PathBuf::from("tracker-app.toml"));
+        assert_eq!(c.forge_owner(), "o");
+        assert_eq!(c.forge_repo(), "r");
+        assert_eq!(c.forge_github_app(), Some(Path::new("tracker-app.toml")));
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn an_explicit_forge_section_overrides_the_tracker_fields() {
+        // Not a GitHub tracker: F2 refuses a GitHub tracker naming a separate `[forge]`, so this
+        // is the kind whose repository legitimately differs from the one it polls (#99).
+        let mut c = jira_base();
+        c.tracker.github_app = Some(PathBuf::from("tracker-app.toml"));
+        c.forge.owner = "fo".into();
+        c.forge.repo = "fr".into();
+        c.forge.github_app = Some(PathBuf::from("forge-app.toml"));
+        assert_eq!(c.forge_owner(), "fo");
+        assert_eq!(c.forge_repo(), "fr");
+        assert_eq!(c.forge_github_app(), Some(Path::new("forge-app.toml")));
         assert!(c.preflight().is_ok());
     }
 
