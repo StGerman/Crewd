@@ -137,7 +137,11 @@ read kernel indistinguishable from a mutation at the seam; `search_all` fails th
 a later page's error rather than returning a short list, and on a page token equal to the one
 that produced it rather than looping forever. `by_ids` makes one `GET` per key: a clean 404 or
 an issue now in another project is omitted, and anything else fails the whole call, the same
-"omit only on an unambiguous absence" rule `github.rs`'s own `by_ids` holds to.
+"omit only on an unambiguous absence" rule `github.rs`'s own `by_ids` holds to. `by_states`
+quotes `active_states`/`terminal_states` verbatim as status names in its JQL, so a status this
+site's workflow does not have fails every poll with Jira's own 400 naming it — deliberately
+loud, since the alternative would be a poll that came back empty and looked like a healthy
+backlog with nothing ready.
 
 Dispatch needs
 `tracker.dispatch_label`, which is the whole signal — a Jira service account cannot be an
@@ -176,10 +180,19 @@ to and open a pull request against. `[forge]` (`ForgeConfig`) names one — `own
 `github_app` — and each key falls back to the matching `[tracker]` key when unset
 (`Config::forge_owner`/`forge_repo`/`forge_github_app`), so a GitHub-tracker config, where the
 two repositories are the same one, needs no `[forge]` table at all and `crew.github.toml` works
-unchanged. The pull request body writes `Closes <url>` only when `url` is a GitHub issue's own
-permalink; otherwise, as for a Jira key, it writes `Issue: [PROJ-123](url)`, since Jira has no
-GitHub-recognised closing keyword and the issue itself is still moved by `set_state`, through
-the broker, once the agent calls it.
+unchanged. A GitHub tracker refuses a separate `[forge]` instead (`preflight`): naming another
+owner, repo or App there would silently move every tracker write and every push onto a different
+credential, with `tracker.github_app` never consulted again, so `[forge]` is for a tracker that
+is not GitHub. Delivery is `[forge]`'s only consumer, and `main.rs` builds neither the forge nor
+its credential for a non-GitHub tracker until `delivery.enabled` is true — `preflight`'s
+owner/repo check and `check_github_app` are gated the same way — so a Jira dry run, the "real
+tracker with the fake worker" shape `CLAUDE.md` recommends for watching real dispatch decisions,
+needs no GitHub App, token or repository on disk at all. The pull request body writes `Closes
+<url>` only when `url` is a GitHub issue's own permalink; otherwise, as for a Jira key, it writes
+`Issue: [PROJ-123](url)`, since Jira has no GitHub-recognised closing keyword. Nothing here moves
+the Jira ticket once that pull request merges (#180): a person or a Jira automation transitions
+it, and `refresh_running`'s cleanup reclaims its worktree once the ticket itself reaches a
+terminal status.
 
 `Worker` gets its real implementation in [src/worker/claude.rs](../src/worker/claude.rs):
 `ClaudeWorker`, over `claude -p --output-format stream-json`. Two things there were confirmed

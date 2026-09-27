@@ -85,8 +85,9 @@ commands = []
 
 # Delivery (src/sched/delivery.rs): push a finished run's branch and open a pull request against
 # `base`. The pull request body writes `Issue: [PROJ-123](url)` rather than `Closes <url>` — Jira
-# has no GitHub-recognised closing keyword, so the issue itself is still moved by `set_state`,
-# through the broker, once the agent calls it.
+# has no GitHub-recognised closing keyword. Nothing here moves the Jira ticket once that pull
+# request merges (#180): a person or a Jira automation transitions it, and its worktree is
+# reclaimed once it reaches a terminal status.
 [delivery]
 enabled = true
 base = "main"

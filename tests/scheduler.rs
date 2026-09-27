@@ -3105,16 +3105,7 @@ fn a_jira_issue_is_linked_rather_than_closed_by_keyword() {
 
     let prs = forge.open_prs();
     let spec = forge.spec_of(prs[0].number).unwrap();
-    assert!(
-        spec.body.contains("Issue: [MT-1](https://your-domain.atlassian.net/browse/PROJ-12)"),
-        "linked, not closed: {}",
-        spec.body
-    );
-    assert!(
-        !spec.body.contains("Closes "),
-        "a Jira URL never uses the closing keyword: {}",
-        spec.body
-    );
+    insta::assert_snapshot!("jira_issue_pr_body_is_linked_not_closed", spec.body);
 }
 
 /// The counterpart to the Jira case above: a GitHub issue's own permalink is the one shape the
@@ -3132,11 +3123,7 @@ fn a_github_issue_still_uses_closes() {
 
     let prs = forge.open_prs();
     let spec = forge.spec_of(prs[0].number).unwrap();
-    assert!(
-        spec.body.contains("Closes https://github.com/StGerman/crewd/issues/99"),
-        "a GitHub issue's own permalink still closes it: {}",
-        spec.body
-    );
+    insta::assert_snapshot!("github_issue_pr_body_still_uses_closes", spec.body);
 }
 
 /// The done bar this project states: a red gate is a `Continue`, never a `Done`. The run said

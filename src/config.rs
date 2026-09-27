@@ -642,11 +642,13 @@ impl Config {
     /// Once, at load, and not in `preflight`: preflight runs every tick, and a key file briefly
     /// replaced on disk must not stop dispatch while the key `main` already loaded is still the
     /// one in use. A half-configured App would otherwise surface as a 401 on the first poll,
-    /// naming none of the pieces actually missing. The fake tracker never reads the file; every
-    /// other tracker checks the *resolved* forge path, since delivery needs a GitHub credential
-    /// even when the tracker itself is not GitHub.
+    /// naming none of the pieces actually missing. The fake tracker never reads the file; a
+    /// GitHub tracker always checks the *resolved* forge path, since there it is the tracker's
+    /// own credential; any other tracker checks it only while `delivery.enabled`, the one path
+    /// that reads it at all — a Jira dry run with delivery off needs no GitHub App on disk.
     pub fn check_github_app(&self) -> Result<(), ConfigError> {
-        if self.tracker.kind()? == TrackerKind::Fake {
+        let kind = self.tracker.kind()?;
+        if kind == TrackerKind::Fake || (kind != TrackerKind::Github && !self.delivery.enabled) {
             return Ok(());
         }
         let Some(path) = self.forge_github_app() else { return Ok(()) };
@@ -735,15 +737,34 @@ impl Config {
                 ));
             }
         }
-        // Delivery needs a GitHub repository to push to and open a pull request against even
-        // when the tracker itself is not GitHub (a Jira tracker, say); each `[forge]` key falls
-        // back to the matching `[tracker]` key, so this only fires when neither names one.
-        if self.tracker.kind()? != TrackerKind::Fake
-            && (self.forge_owner().is_empty() || self.forge_repo().is_empty())
+        // A GitHub tracker's own repository is the forge; a separate one would silently swap the
+        // credential every tracker write and every push use, with `tracker.github_app` then never
+        // consulted. `[forge]` exists for a tracker that is not GitHub.
+        if self.tracker.kind()? == TrackerKind::Github
+            && (!self.forge.owner.trim().is_empty()
+                || !self.forge.repo.trim().is_empty()
+                || self.forge.github_app.is_some())
         {
             return Err(ConfigError::Invalid(
-                "forge.owner and forge.repo are required when tracker.kind is not \"fake\"; \
-                 each falls back to tracker.owner and tracker.repo"
+                "[forge] is not allowed when tracker.kind = \"github\": the tracker's own \
+                 repository and credential already are the forge; [forge] is for a tracker that \
+                 is not GitHub"
+                    .into(),
+            ));
+        }
+        // A Jira dry run with delivery off must not need a GitHub repository at all — delivery is
+        // the only thing that ever reads `[forge]` for a non-GitHub tracker — so this only fires
+        // for a GitHub tracker (its own repository, always) or for any other tracker once
+        // `delivery.enabled`; each `[forge]` key falls back to the matching `[tracker]` key.
+        let forge_required = match self.tracker.kind()? {
+            TrackerKind::Fake => false,
+            TrackerKind::Github => true,
+            TrackerKind::Jira => self.delivery.enabled,
+        };
+        if forge_required && (self.forge_owner().is_empty() || self.forge_repo().is_empty()) {
+            return Err(ConfigError::Invalid(
+                "forge.owner and forge.repo are required when tracker.kind is not \"fake\" and \
+                 delivery is enabled; each falls back to tracker.owner and tracker.repo"
                     .into(),
             ));
         }
@@ -1032,18 +1053,54 @@ mod tests {
     fn a_jira_tracker_without_a_dispatch_label_is_rejected() {
         let mut c = jira_base();
         c.tracker.dispatch_label = None;
-        let err = c.preflight().unwrap_err().to_string();
-        assert!(err.contains("dispatch_label"), "{err}");
+        insta::assert_snapshot!(
+            "jira_tracker_without_a_dispatch_label",
+            c.preflight().unwrap_err()
+        );
         c.tracker.dispatch_label = Some("crewd".into());
         assert!(c.preflight().is_ok());
+    }
+
+    /// #99, #180: delivery is the only consumer of `[forge]` for a non-GitHub tracker, so a dry
+    /// run — a real tracker with the fake worker, watching real dispatch decisions with nothing
+    /// pushed anywhere — needs no GitHub repository at all.
+    #[test]
+    fn a_jira_tracker_with_delivery_off_needs_no_forge() {
+        let mut c = jira_base();
+        assert!(!c.delivery.enabled, "the default this test relies on");
+        c.forge.owner = String::new();
+        c.forge.repo = String::new();
+        assert!(c.preflight().is_ok(), "delivery off: no forge needed");
     }
 
     #[test]
     fn a_jira_tracker_without_a_forge_repo_is_rejected() {
         let mut c = jira_base();
+        c.delivery.enabled = true;
         c.forge.owner = String::new();
         c.forge.repo = String::new();
         assert!(c.preflight().is_err());
+    }
+
+    /// F2: a GitHub tracker's own repository already is the forge; a separate `[forge]` would
+    /// silently move every write and every push onto another credential while
+    /// `tracker.github_app` stopped being consulted at all.
+    #[test]
+    fn a_github_tracker_refuses_a_separate_forge_rather_than_sharing_its_credential() {
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        assert!(c.preflight().is_ok(), "no [forge] at all is the common case");
+
+        c.forge.owner = "other-org".into();
+        assert!(c.preflight().is_err(), "a separate owner");
+        c.forge.owner = String::new();
+        c.forge.repo = "other-repo".into();
+        assert!(c.preflight().is_err(), "a separate repo");
+        c.forge.repo = String::new();
+        c.forge.github_app = Some(PathBuf::from("other-app.toml"));
+        assert!(c.preflight().is_err(), "a separate App file");
     }
 
     #[test]
@@ -1068,14 +1125,17 @@ mod tests {
         let creds = dir.join("jira.toml");
         let mut c = jira_base();
         c.tracker.jira.as_mut().unwrap().credentials = Some(creds.clone());
+        // The path carries the process id, so it is redacted before it is snapshotted.
+        let redact =
+            |err: String| err.replace(&creds.display().to_string(), "<tracker.jira.credentials>");
 
         std::fs::write(&creds, "api_token = \"t\"").unwrap();
-        let err = c.check_jira_credentials().unwrap_err().to_string();
-        assert!(err.contains("email") && err.contains("tracker.jira.credentials"), "{err}");
+        let err = redact(c.check_jira_credentials().unwrap_err().to_string());
+        insta::assert_snapshot!("half_configured_jira_credential_missing_email", err);
 
         std::fs::write(&creds, "email = \"a@b.com\"").unwrap();
-        let err = c.check_jira_credentials().unwrap_err().to_string();
-        assert!(err.contains("api_token"), "{err}");
+        let err = redact(c.check_jira_credentials().unwrap_err().to_string());
+        insta::assert_snapshot!("half_configured_jira_credential_missing_api_token", err);
 
         std::fs::write(&creds, "email = \"a@b.com\"\napi_token = \"t\"").unwrap();
         c.check_jira_credentials().expect("a complete file passes");
@@ -1365,10 +1425,9 @@ mod tests {
 
     #[test]
     fn an_explicit_forge_section_overrides_the_tracker_fields() {
-        let mut c = base();
-        c.tracker.kind = "github".into();
-        c.tracker.owner = "o".into();
-        c.tracker.repo = "r".into();
+        // Not a GitHub tracker: F2 refuses a GitHub tracker naming a separate `[forge]`, so this
+        // is the kind whose repository legitimately differs from the one it polls (#99).
+        let mut c = jira_base();
         c.tracker.github_app = Some(PathBuf::from("tracker-app.toml"));
         c.forge.owner = "fo".into();
         c.forge.repo = "fr".into();
