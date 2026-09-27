@@ -315,7 +315,8 @@ impl JiraCredentialsFile {
 fn jira_toml_error_message(text: &str, e: &toml::de::Error) -> String {
     match e.span() {
         Some(span) => {
-            let line = text[..span.start.min(text.len())].matches('\n').count() + 1;
+            let upto = &text.as_bytes()[..span.start.min(text.len())];
+            let line = upto.iter().filter(|&&b| b == b'\n').count() + 1;
             format!("line {line}: {}", e.message())
         }
         None => e.message().to_string(),

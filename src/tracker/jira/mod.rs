@@ -523,7 +523,7 @@ mod tests {
         })
     }
 
-    /// Every write now confirms the project live before it does anything else (#99, F9); this
+    /// Every write now confirms the project live before it does anything else (#99); this
     /// is that check's response, scripted first in every write test below.
     fn project_ok() -> Result<HttpResponse, HttpTransportError> {
         ok(json!({"fields": {"project": {"key": "PROJ"}}}))
@@ -727,7 +727,7 @@ mod tests {
         http.push(ok(json!({ "transitions": [{"id": "11", "to": {"name": "Überprüfung"}}] })));
         http.push(ok(json!({})));
         let t = tracker(http);
-        // The broker hands over a Unicode-lowercased state (#99, F4): `eq_ignore_ascii_case`
+        // The broker hands over a Unicode-lowercased state (#99): `eq_ignore_ascii_case`
         // never folds `Ü` to `ü`, so the match must go through `to_lowercase` on both sides.
         let out = t.set_state("PROJ-1", "überprüfung").unwrap();
         assert_eq!(t.http.writes().len(), 1, "the transition was posted, not just confirmed");

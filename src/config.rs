@@ -1061,7 +1061,7 @@ mod tests {
         assert!(c.preflight().is_ok());
     }
 
-    /// #99, #180: delivery is the only consumer of `[forge]` for a non-GitHub tracker, so a dry
+    /// #99: delivery is the only consumer of `[forge]` for a non-GitHub tracker, so a dry
     /// run — a real tracker with the fake worker, watching real dispatch decisions with nothing
     /// pushed anywhere — needs no GitHub repository at all.
     #[test]
