@@ -7,6 +7,8 @@
 pub mod fake;
 pub mod github;
 pub mod jira;
+#[cfg(test)]
+pub(crate) mod test_http;
 
 use crate::model::{ErrorClass, Issue};
 

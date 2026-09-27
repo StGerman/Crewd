@@ -617,85 +617,8 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
     use super::*;
-
-    struct FakeHttp {
-        inner: Mutex<FakeHttpInner>,
-    }
-
-    #[derive(Default)]
-    struct FakeHttpInner {
-        responses: VecDeque<Result<HttpResponse, HttpTransportError>>,
-        calls: Vec<String>,
-        writes: Vec<(String, String, Value)>,
-    }
-
-    impl FakeHttp {
-        fn new() -> Self {
-            Self { inner: Mutex::new(FakeHttpInner::default()) }
-        }
-
-        fn push(&self, resp: Result<HttpResponse, HttpTransportError>) {
-            self.inner.lock().unwrap().responses.push_back(resp);
-        }
-
-        fn calls(&self) -> Vec<String> {
-            self.inner.lock().unwrap().calls.clone()
-        }
-
-        /// Method, URL and parsed body of every write, in order.
-        fn writes(&self) -> Vec<(String, String, Value)> {
-            self.inner.lock().unwrap().writes.clone()
-        }
-    }
-
-    impl Http for FakeHttp {
-        fn get(
-            &self,
-            url: &str,
-            _headers: &[(&str, String)],
-        ) -> Result<HttpResponse, HttpTransportError> {
-            let mut g = self.inner.lock().unwrap();
-            g.calls.push(url.to_string());
-            g.responses
-                .pop_front()
-                .unwrap_or_else(|| Err(HttpTransportError("no scripted response".into())))
-        }
-
-        fn send_json(
-            &self,
-            method: &str,
-            url: &str,
-            _headers: &[(&str, String)],
-            body: &[u8],
-        ) -> Result<HttpResponse, HttpTransportError> {
-            let mut g = self.inner.lock().unwrap();
-            let parsed = serde_json::from_slice(body).unwrap_or(Value::Null);
-            g.writes.push((method.to_string(), url.to_string(), parsed));
-            g.responses
-                .pop_front()
-                .unwrap_or_else(|| Err(HttpTransportError("no scripted response".into())))
-        }
-    }
-
-    fn ok(body: serde_json::Value) -> Result<HttpResponse, HttpTransportError> {
-        Ok(HttpResponse {
-            status: 200,
-            headers: HashMap::new(),
-            body: body.to_string().into_bytes(),
-        })
-    }
-
-    fn status(code: u16, headers: &[(&str, &str)]) -> Result<HttpResponse, HttpTransportError> {
-        Ok(HttpResponse {
-            status: code,
-            headers: headers.iter().map(|(k, v)| (k.to_lowercase(), v.to_string())).collect(),
-            body: b"{}".to_vec(),
-        })
-    }
+    use crate::tracker::test_http::{FakeHttp, ok, status};
 
     fn gh_issue(number: u64, labels: &[&str], state: &str, assigned: bool) -> serde_json::Value {
         serde_json::json!({
