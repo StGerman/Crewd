@@ -192,19 +192,20 @@ impl<H: Http> JiraTracker<H> {
         prefix_ok && rest_ok && prefix.eq_ignore_ascii_case(&self.project)
     }
 
-    /// A moved issue keeps its old key resolvable under whatever project it landed in
-    /// (`PROJ-12` -> `SECRET-3`), so the key-shape check in `owns` alone would let a write
-    /// follow a stale key into another project; every write confirms the project live, right
-    /// before it, with its own GET rather than trusting a cached or filtered issue. A
-    /// malformed or foreign-prefixed id fails `owns` locally, before any request; a 404 on the
-    /// live lookup is refused the same as a project mismatch.
-    fn validate(&self, issue_id: &str) -> Result<(), TrackerError> {
-        if !self.owns(issue_id) {
-            return Err(TrackerError::Status(format!(
-                "{issue_id} is not an issue in project {}",
-                self.project
-            )));
+    /// A malformed or foreign-prefixed id is refused here, before any request.
+    fn refuse_foreign(&self, issue_id: &str) -> Result<(), TrackerError> {
+        if self.owns(issue_id) {
+            return Ok(());
         }
+        Err(TrackerError::Status(format!("{issue_id} is not an issue in project {}", self.project)))
+    }
+
+    /// A moved issue keeps its old key resolvable under whatever project it landed in
+    /// (`PROJ-12` -> `SECRET-3`), so `owns` alone would let a write follow a stale key into
+    /// another project. Every write calls this as its last read before the write request, not
+    /// trusting a cached or filtered issue; a 404 is refused like a project mismatch. Jira has
+    /// no conditional transition, so a move inside that last round-trip can still land.
+    fn confirm_project(&self, issue_id: &str) -> Result<(), TrackerError> {
         let url = format!("{}/rest/api/3/issue/{issue_id}?fields=project", self.base_url);
         let resp = self.request(&url)?;
         #[derive(Deserialize)]
@@ -371,7 +372,8 @@ impl<H: Http> Tracker for JiraTracker<H> {
 /// Ticket mutations, for the broker only — see the module doc for `set_state`'s transition rule.
 impl<H: Http> TrackerWrites for JiraTracker<H> {
     fn comment(&self, issue_id: &str, body: &str) -> Result<String, TrackerError> {
-        self.validate(issue_id)?;
+        self.refuse_foreign(issue_id)?;
+        self.confirm_project(issue_id)?;
         let url = format!("{}/rest/api/3/issue/{issue_id}/comment", self.base_url);
         let resp = self.write("POST", &url, &json!({ "body": adf::encode(body) }))?;
         let id = serde_json::from_slice::<Value>(&resp.body)
@@ -384,7 +386,7 @@ impl<H: Http> TrackerWrites for JiraTracker<H> {
     }
 
     fn set_state(&self, issue_id: &str, state: &str) -> Result<String, TrackerError> {
-        self.validate(issue_id)?;
+        self.refuse_foreign(issue_id)?;
         let transitions_url = format!("{}/rest/api/3/issue/{issue_id}/transitions", self.base_url);
         let resp = self.request(&transitions_url)?;
         let parsed: Transitions = serde_json::from_slice(&resp.body)
@@ -396,6 +398,7 @@ impl<H: Http> TrackerWrites for JiraTracker<H> {
         if let Some(t) =
             parsed.transitions.iter().find(|t| t.to.name.trim().to_lowercase() == want_lower)
         {
+            self.confirm_project(issue_id)?;
             self.write("POST", &transitions_url, &json!({ "transition": { "id": t.id } }))?;
             return Ok(format!("{issue_id} is now {}", t.to.name));
         }
@@ -403,7 +406,8 @@ impl<H: Http> TrackerWrites for JiraTracker<H> {
     }
 
     fn link_pr(&self, issue_id: &str, url: &str) -> Result<String, TrackerError> {
-        self.validate(issue_id)?;
+        self.refuse_foreign(issue_id)?;
+        self.confirm_project(issue_id)?;
         let remote_url = format!("{}/rest/api/3/issue/{issue_id}/remotelink", self.base_url);
         self.write(
             "POST",
@@ -523,8 +527,8 @@ mod tests {
         })
     }
 
-    /// Every write now confirms the project live before it does anything else (#99); this
-    /// is that check's response, scripted first in every write test below.
+    /// The live project check each write makes as its last read before the write request
+    /// (#99), scripted just before the write's own response in the tests below.
     fn project_ok() -> Result<HttpResponse, HttpTransportError> {
         ok(json!({"fields": {"project": {"key": "PROJ"}}}))
     }
@@ -704,13 +708,13 @@ mod tests {
     #[test]
     fn set_state_applies_the_transition_whose_target_matches_without_regard_to_case() {
         let http = FakeHttp::new();
-        http.push(project_ok());
         http.push(ok(json!({
             "transitions": [
                 {"id": "11", "to": {"name": "In Progress"}},
                 {"id": "31", "to": {"name": "DONE"}},
             ]
         })));
+        http.push(project_ok());
         http.push(ok(json!({})));
         let t = tracker(http);
         let out = t.set_state("PROJ-1", "done").unwrap();
@@ -723,8 +727,8 @@ mod tests {
     #[test]
     fn set_state_matches_a_non_ascii_status_name_without_regard_to_case() {
         let http = FakeHttp::new();
-        http.push(project_ok());
         http.push(ok(json!({ "transitions": [{"id": "11", "to": {"name": "Überprüfung"}}] })));
+        http.push(project_ok());
         http.push(ok(json!({})));
         let t = tracker(http);
         // The broker hands over a Unicode-lowercased state (#99): `eq_ignore_ascii_case`
@@ -737,7 +741,6 @@ mod tests {
     #[test]
     fn set_state_names_the_reachable_targets_when_none_matches() {
         let http = FakeHttp::new();
-        http.push(project_ok());
         http.push(ok(json!({ "transitions": [{"id": "11", "to": {"name": "In Progress"}}] })));
         http.push(ok(json!({"fields": {"status": {"name": "Open"}}})));
         let t = tracker(http);
@@ -751,7 +754,6 @@ mod tests {
     #[test]
     fn set_state_to_the_current_status_succeeds_without_a_transition() {
         let http = FakeHttp::new();
-        http.push(project_ok());
         http.push(ok(json!({"transitions": []})));
         http.push(ok(json!({"fields": {"status": {"name": "Done"}}})));
         let t = tracker(http);
@@ -779,6 +781,7 @@ mod tests {
         assert!(t.http.writes().is_empty());
 
         let http = FakeHttp::new();
+        http.push(ok(json!({ "transitions": [{"id": "31", "to": {"name": "Done"}}] })));
         http.push(status(404, &[]));
         let t = tracker(http);
         let err = t.set_state("PROJ-1", "done").unwrap_err();
@@ -787,6 +790,25 @@ mod tests {
             "a 404 on the project check is refused too"
         );
         assert!(t.http.writes().is_empty());
+    }
+
+    /// The project check is `set_state`'s last read, after the transitions (#99): an issue
+    /// that moves while they are read is refused rather than transitioned in its new project.
+    #[test]
+    fn a_set_state_to_an_issue_that_moved_after_its_transitions_were_read_is_refused() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "transitions": [{"id": "31", "to": {"name": "Done"}}] })));
+        http.push(ok(json!({"fields": {"project": {"key": "SECRET"}}})));
+        let t = tracker(http);
+        let err = t.set_state("PROJ-1", "done").unwrap_err();
+        match err {
+            TrackerError::Status(m) => insta::assert_snapshot!(m),
+            other => panic!("expected Status, got {other:?}"),
+        }
+        let calls = t.http.calls();
+        assert!(calls[0].ends_with("/transitions"), "{calls:?}");
+        assert!(calls[1].ends_with("?fields=project"), "{calls:?}");
+        assert!(t.http.writes().is_empty(), "no transition was posted");
     }
 
     #[test]
