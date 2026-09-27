@@ -20,8 +20,7 @@ instead of restating it; say what to do, not what to avoid.
    config, default `.transcripts` under `workspace.root`; `crewctl status <issue>` prints each
    run's path. Done when every file you will read is listed.
 
-2. **Read each run.** Pull the parts that carry lessons and skip the rest (`system` and
-   `rate_limit_event` are noise, hundreds per run):
+2. **Read each run.** Pull the parts that carry lessons and skip the rest (`system` records are noise; `rate_limit_event` is read below because utilization can explain wasted turns):
    ```bash
    jq -c 'select(.type | endswith("_run_start") or endswith("_run_end") or . == "result")' <run>.jsonl
    jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' <run>.jsonl
