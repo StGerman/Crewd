@@ -44,6 +44,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -111,8 +112,23 @@ pub struct UreqHttp {
     agent: ureq::Agent,
 }
 
+/// How long a connection may take to open. GitHub answers in well under a second.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The whole call, connect to last byte of the body. Search and GraphQL answers take seconds;
+/// this is only the ceiling that turns a dead connection into an error.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl Default for UreqHttp {
     fn default() -> Self {
+        Self::with_timeouts(CONNECT_TIMEOUT, CALL_TIMEOUT)
+    }
+}
+
+impl UreqHttp {
+    /// An unbounded call stops the scheduler, because every call runs on the tick's own thread
+    /// and ureq sets no timeout by default (#176). A call past either bound fails as an
+    /// `HttpTransportError`, which the tracker classes as retryable.
+    pub fn with_timeouts(connect: Duration, call: Duration) -> Self {
         // ureq's default turns a non-2xx status into an `Err` that drops the response body and
         // headers — exactly the rate-limit header and body snippet `request()` needs to
         // classify the failure. Disabling it is what makes every status code, not just 2xx,
@@ -126,6 +142,8 @@ impl Default for UreqHttp {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
+            .timeout_connect(Some(connect))
+            .timeout_global(Some(call))
             .build();
         Self { agent: ureq::Agent::new_with_config(config) }
     }
@@ -777,6 +795,17 @@ mod tests {
         assert!(matches!(err, TrackerError::Auth(_)));
     }
 
+    /// A timed-out call classed as permanent would be logged as a config fault that "will not
+    /// resolve on its own", when the next poll clears it (#176).
+    #[test]
+    fn a_transport_timeout_is_a_transient_tracker_error() {
+        let http = FakeHttp::new();
+        http.push(Err(HttpTransportError("timeout: global".into())));
+        let err = tracker(http).by_states(&["open".to_string()]).unwrap_err();
+        assert!(matches!(err, TrackerError::Request(_)), "got {err:?}");
+        assert!(err.class().retryable());
+    }
+
     #[test]
     fn pull_requests_are_excluded_from_by_states() {
         let http = FakeHttp::new();
@@ -1310,5 +1339,29 @@ mod ureq_http_tests {
             .unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(auth.recv().unwrap(), None, "the token must not follow a redirect off-host");
+    }
+
+    /// Without a bound, a call to a server that accepts and never answers blocks forever, and
+    /// the tick with it (#176). The server really accepts, rather than leaving the handshake to
+    /// the listen backlog, so the bound this exercises is the wait for a response.
+    #[test]
+    fn a_server_that_accepts_and_never_answers_fails_the_call_within_its_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut held, _) = listener.accept().unwrap();
+            // Reading to EOF holds the connection open, unanswered, until the client hangs up.
+            let _ = held.read_to_end(&mut Vec::new());
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let http = UreqHttp::with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+            let _ = tx.send(http.get(&format!("http://127.0.0.1:{port}/repos/o/r/issues"), &[]));
+        });
+
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the call is still blocked: no timeout bounded it");
+        assert!(got.is_err(), "a server that never answers returned {got:?}");
     }
 }
