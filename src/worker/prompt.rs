@@ -7,8 +7,9 @@
 //!
 //! HTML comments are stripped from the issue body here (#157). Left in, a template hint
 //! is dispatched as the task. A marker inside a fence or backticks is the issue quoting
-//! one, and stays. The scan copies every other byte through: a markdown crate would
-//! re-emit the description, and a body with no comment must reach the agent unchanged.
+//! one, and stays. Everything else is copied through — a markdown crate would re-emit the
+//! description — except the blank-line run that touches a removed comment. A body with no
+//! comment must reach the agent unchanged.
 
 use super::{RateLimitSignal, TokenUsage, ToolEndpoint};
 use crate::model::{Feedback, Issue, ReviewVerdict, Verdict, looks_like_commit};
@@ -114,13 +115,11 @@ pub(crate) fn truncate(s: &str, n: usize) -> String {
 /// A `<!-- -->` left in the body is dispatched as the task (#157). Spans are
 /// non-nested and dropped only outside fenced blocks and backticks. A body with
 /// none is returned unchanged — this is not a rewrite of the text `session_body`
-/// hashes (#109).
+/// hashes (#109). Only the blank-line run touching a removed comment is collapsed;
+/// a run elsewhere in the body is the author's and stays.
 fn prompt_body(body: &str) -> String {
     let (stripped, removed) = strip_html_comments(body);
-    if !removed {
-        return body.to_string();
-    }
-    tidy_outside_code(&stripped).trim_matches('\n').to_string()
+    if !removed { body.to_string() } else { stripped }
 }
 
 /// `(rewritten, removed a comment)`. An unclosed `<!--` is left in place: eating
@@ -138,9 +137,18 @@ fn strip_html_comments(input: &str) -> (String, bool) {
             continue;
         }
         if let Some(end) = comment_end(input, i) {
-            i = end;
             removed = true;
-            line_start = false;
+            if comment_owns_its_lines(&out, input, end) {
+                // The comment was the whole line. Drop that line, then fold only the
+                // blank run that met it — a run further up the body was not this comment.
+                trim_indent_before_comment(&mut out);
+                let j = skip_owned_line_ending(input, end);
+                i = shrink_blank_junction(&mut out, input, j);
+                line_start = true;
+            } else {
+                i = end;
+                line_start = false;
+            }
             continue;
         }
         let Some(ch) = input[i..].chars().next() else { break };
@@ -177,83 +185,82 @@ fn comment_end(input: &str, i: usize) -> Option<usize> {
     None
 }
 
-/// Collapse the blank lines a removed comment leaves, without rewriting a fence
-/// or a backtick span — a code sample's own blank lines are not that residue.
-fn tidy_outside_code(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut text = String::new();
-    let mut i = 0;
-    let mut line_start = true;
-    while i < input.len() {
-        if let Some((end, next_line)) = skip_code(input, i, line_start) {
-            flush_text(&mut text, &mut out);
-            out.push_str(&input[i..end]);
-            i = end;
-            line_start = next_line;
-            continue;
-        }
-        let Some(ch) = input[i..].chars().next() else { break };
-        text.push(ch);
-        i += ch.len_utf8();
-        line_start = ch == '\n';
+/// The comment occupies its own lines: only whitespace sits before it on its first
+/// line and after `-->` on its last. An inline comment is not a blank-line residue.
+fn comment_owns_its_lines(out: &str, input: &str, end: usize) -> bool {
+    let before = match out.rfind('\n') {
+        Some(i) => &out[i + 1..],
+        None => out,
+    };
+    if !before.trim().is_empty() {
+        return false;
     }
-    flush_text(&mut text, &mut out);
-    out
+    let after = &input[end..];
+    let rest = match after.find('\n') {
+        Some(i) => &after[..i],
+        None => after,
+    };
+    rest.trim().is_empty()
 }
 
-fn flush_text(text: &mut String, out: &mut String) {
-    if text.is_empty() {
-        return;
+fn trim_indent_before_comment(out: &mut String) {
+    let bytes = out.as_bytes();
+    let mut t = bytes.len();
+    while t > 0 && (bytes[t - 1] == b' ' || bytes[t - 1] == b'\t') {
+        t -= 1;
     }
-    out.push_str(&collapse_text(text));
-    text.clear();
+    out.truncate(t);
 }
 
-fn collapse_text(text: &str) -> String {
-    let b = text.as_bytes();
-    let mut normalized = String::with_capacity(text.len());
-    let mut start = 0;
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'\n' {
-            i += 1;
-            continue;
-        }
-        let mut end = i;
-        if end > start && b[end - 1] == b'\r' {
-            end -= 1;
-        }
-        let line = &text[start..end];
-        if line.trim().is_empty() {
-            normalized.push('\n');
-        } else {
-            normalized.push_str(line);
-            normalized.push('\n');
-        }
-        i += 1;
-        start = i;
+/// Past the newline that ended a comment's last line. The caller has already
+/// checked that the rest of that line is whitespace.
+fn skip_owned_line_ending(input: &str, end: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut j = end;
+    while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\r') {
+        j += 1;
     }
-    if start < text.len() {
-        let line = &text[start..];
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.trim().is_empty() {
-            normalized.push_str(line);
-        }
+    if j < bytes.len() && bytes[j] == b'\n' {
+        j += 1;
     }
-    let mut out = String::with_capacity(normalized.len());
-    let mut newlines = 0;
-    for c in normalized.chars() {
-        if c == '\n' {
-            newlines += 1;
-            if newlines <= 2 {
-                out.push('\n');
-            }
-        } else {
-            newlines = 0;
-            out.push(c);
+    j
+}
+
+/// Fold the blank-line run that now meets at `i` down to one blank line.
+///
+/// A run of two newlines or fewer is the author's and is left byte for byte. A
+/// longer run is the comment's line joining the blanks around it; only that run
+/// is reduced, and only when prose sits on both sides — a leading or trailing
+/// pile is residue and goes away rather than becoming a blank paragraph.
+fn shrink_blank_junction(out: &mut String, input: &str, i: usize) -> usize {
+    let out_bytes = out.as_bytes();
+    let mut t = out.len();
+    let mut trail = 0;
+    while t > 0 && (out_bytes[t - 1] == b'\n' || out_bytes[t - 1] == b'\r') {
+        if out_bytes[t - 1] == b'\n' {
+            trail += 1;
         }
+        t -= 1;
     }
-    out
+    let in_bytes = input.as_bytes();
+    let mut j = i;
+    let mut lead = 0;
+    while j < in_bytes.len() && (in_bytes[j] == b'\n' || in_bytes[j] == b'\r') {
+        if in_bytes[j] == b'\n' {
+            lead += 1;
+        }
+        j += 1;
+    }
+    if trail + lead <= 2 {
+        return i;
+    }
+    let content_before = t > 0;
+    let content_after = j < in_bytes.len();
+    out.truncate(t);
+    if content_before && content_after {
+        out.push_str("\n\n");
+    }
+    j
 }
 
 /// A fence or a closed backtick span at `i`, and whether the byte after it is a
@@ -630,8 +637,13 @@ mod tests {
 
     #[test]
     fn html_comments_in_an_issue_body_do_not_reach_the_prompt() {
+        // The gap above "Keep this gap." is the author's, not a comment's residue.
         let body = "\
 Do the work.\n\
+\n\
+\n\
+\n\
+Keep this gap.\n\
 \n\
 <!-- single-line hint: delete me -->\n\
 \n\
@@ -640,14 +652,9 @@ multi-line hint: also delete me\n\
 -->\n\
 \n\
 Then stop.\n";
-        for prompt in prompts_carrying_the_body(body) {
-            assert!(!prompt.contains("single-line hint"), "{prompt}");
-            assert!(!prompt.contains("multi-line hint"), "{prompt}");
-            assert!(!prompt.contains("<!--"), "{prompt}");
-            assert!(!prompt.contains("-->"), "{prompt}");
-            assert!(prompt.contains("Do the work.\n\nThen stop."), "{prompt}");
-            assert!(!prompt.contains("Do the work.\n\n\n"), "{prompt}");
-        }
+        let [new, continuation] = prompts_carrying_the_body(body);
+        insta::assert_snapshot!("html_comments_stripped_new", new);
+        insta::assert_snapshot!("html_comments_stripped_continuation", continuation);
     }
 
     #[test]
@@ -665,11 +672,8 @@ kept blank above\n\
 ```\n\
 \n\
 Inline `<!-- inline -->` and ``<!-- ticks -->``.\n";
-        for prompt in prompts_carrying_the_body(body) {
-            assert!(!prompt.contains("author hint"), "{prompt}");
-            assert!(prompt.contains("<!-- fenced -->\n\n\nkept blank above"), "{prompt}");
-            assert!(prompt.contains("`<!-- inline -->`"), "{prompt}");
-            assert!(prompt.contains("``<!-- ticks -->``"), "{prompt}");
-        }
+        let [new, continuation] = prompts_carrying_the_body(body);
+        insta::assert_snapshot!("comment_marker_in_code_new", new);
+        insta::assert_snapshot!("comment_marker_in_code_continuation", continuation);
     }
 }

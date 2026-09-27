@@ -1,0 +1,26 @@
+---
+source: src/worker/prompt.rs
+expression: new
+---
+You are working on issue MT-1: t
+
+Description:
+Before.
+
+```html
+<!-- fenced -->
+
+
+kept blank above
+```
+
+Inline `<!-- inline -->` and ``<!-- ticks -->``.
+
+
+Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
+
+If you have made real progress but need another turn to finish, end your final message with a line reading exactly:
+CREW_OUTCOME: continue: <one-sentence reason>
+
+If you are stuck and need a human to unblock you, end your final message with:
+CREW_OUTCOME: blocked: <one-sentence reason>

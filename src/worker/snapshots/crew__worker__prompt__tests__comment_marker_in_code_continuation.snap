@@ -1,0 +1,25 @@
+---
+source: src/worker/prompt.rs
+expression: continuation
+---
+Continue working on MT-1. Your previous session on this issue ended before the work was finished — either you asked for another turn, or the orchestrator's per-session turn budget stopped you. The working directory is the same worktree, with whatever you committed still in it. Pick up where you left off.
+
+The same rules apply: commit as you go, and when the work is fully complete, simply stop. If you need another turn, end your final message with a line reading exactly:
+CREW_OUTCOME: continue: <one-sentence reason>
+
+If you are stuck and need a human to unblock you, end with:
+CREW_OUTCOME: blocked: <one-sentence reason>
+
+The issue description has changed since your last session. Re-read it: it may carry new decisions that override what you did before.
+
+Description:
+Before.
+
+```html
+<!-- fenced -->
+
+
+kept blank above
+```
+
+Inline `<!-- inline -->` and ``<!-- ticks -->``.
