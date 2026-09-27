@@ -238,6 +238,11 @@ impl Worker for FakeWorker {
     fn model(&self) -> ModelChoice {
         self.model.lock().unwrap().clone()
     }
+
+    /// The fake writes Claude's shape, so it reads it back the same way.
+    fn last_text(&self, transcript: &str) -> Option<String> {
+        super::claude::last_assistant_text(transcript)
+    }
 }
 
 struct FakeRun {

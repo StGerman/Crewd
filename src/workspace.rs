@@ -55,6 +55,10 @@ pub struct Prepared {
     /// there is none. Reported rather than applied: a stale snapshot applied silently can
     /// conflict with work committed since, so the agent is told it exists and decides (#22).
     pub wip: Vec<WipSnapshot>,
+    /// The commit the worktree sits on, for impls that have one. A session handed off to
+    /// another worker is resumed only while this has not moved since the handoff (#165); `None`
+    /// never matches, so a workspace that cannot say starts the returning worker fresh.
+    pub head: Option<String>,
 }
 
 /// A side ref holding the uncommitted state of a worktree at the moment it was removed.
@@ -155,7 +159,7 @@ impl Workspace for DirWorkspace {
         let created_now = !path.exists();
         std::fs::create_dir_all(&path)
             .map_err(|source| WorkspaceError::Io { path: path.clone(), source })?;
-        Ok(Prepared { path, created_now, branch: None, wip: Vec::new() })
+        Ok(Prepared { path, created_now, branch: None, wip: Vec::new(), head: None })
     }
 
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
@@ -653,7 +657,8 @@ impl Workspace for GitWorktreeWorkspace {
         let branch = Self::branch_name(issue_id, identifier);
         let wip = self.existing_wip(issue_id);
         if Self::is_worktree_checkout(&path) {
-            return Ok(Prepared { path, created_now: false, branch: Some(branch), wip });
+            let head = Self::git(&path, &["rev-parse", "HEAD"]).ok();
+            return Ok(Prepared { path, created_now: false, branch: Some(branch), wip, head });
         }
 
         let path_str = path.to_string_lossy().into_owned();
@@ -670,7 +675,8 @@ impl Workspace for GitWorktreeWorkspace {
         } else {
             Self::git(&self.repo, &["worktree", "add", "-B", &branch, &path_str])?;
         }
-        Ok(Prepared { path, created_now: true, branch: Some(branch), wip })
+        let head = Self::git(&path, &["rev-parse", "HEAD"]).ok();
+        Ok(Prepared { path, created_now: true, branch: Some(branch), wip, head })
     }
 
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {

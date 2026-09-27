@@ -199,6 +199,12 @@ pub enum Feedback {
     /// the gate tried, which the agent is told to rebase onto: `base` resolves in its worktree,
     /// where an unset base's `HEAD` is its own branch.
     Conflict { base: String, base_sha: String, paths: Vec<String> },
+    /// Another worker ran this issue last and stopped (#165): `from` names it, `why` says how
+    /// its run ended, and `last_text` is its agent's last message, read off the run's
+    /// transcript and truncated. A session never crosses providers, so this is all the new one
+    /// learns of the old conversation besides the commits. First in the list when present, so
+    /// whatever else this attempt was sent back with reads as that worker's unfinished business.
+    Handoff { from: String, why: String, last_text: Option<String> },
 }
 
 impl Feedback {
@@ -208,6 +214,7 @@ impl Feedback {
             Feedback::Review { .. } => "review",
             Feedback::Gate { .. } => "gate",
             Feedback::Conflict { .. } => "conflict",
+            Feedback::Handoff { .. } => "handoff",
         }
     }
 }

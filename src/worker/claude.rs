@@ -401,6 +401,25 @@ impl Worker for ClaudeWorker {
     fn model(&self) -> ModelChoice {
         self.model.clone()
     }
+
+    fn last_text(&self, transcript: &str) -> Option<String> {
+        last_assistant_text(transcript)
+    }
+}
+
+/// Every text block of the last `assistant` event in a `stream-json` transcript that has any.
+/// Read from the end, because the transcript of a long run is mostly tool traffic before it.
+pub(crate) fn last_assistant_text(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        if v.get("type")?.as_str()? != "assistant" {
+            return None;
+        }
+        let blocks = v.pointer("/message/content")?.as_array()?;
+        let text: Vec<&str> =
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect();
+        (!text.is_empty()).then(|| text.join("\n"))
+    })
 }
 
 /// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the
@@ -906,6 +925,41 @@ mod tests {
             "continuation_prompt_conflict_then_review",
             build_continuation_prompt(&issue(), None, &fb, &[], false)
         );
+    }
+
+    /// #165: the worker taking over is told who stopped, why and what it last said, and the
+    /// feedback the attempt was sent back with still follows.
+    #[test]
+    fn a_handoff_names_the_worker_that_stopped_and_keeps_the_feedback_after_it() {
+        let fb = [
+            Feedback::Handoff {
+                from: "claude".into(),
+                why: "its account hit a rate limit (five_hour), and its window has not reset"
+                    .into(),
+                last_text: Some("Migration written; the store tests are next.".into()),
+            },
+            Feedback::Gate { output: "continuation: more to do".into() },
+        ];
+        insta::assert_snapshot!("new_prompt_after_handoff", build_prompt(&issue(), None, &fb, &[]));
+        insta::assert_snapshot!(
+            "continuation_prompt_after_handoff",
+            build_continuation_prompt(&issue(), None, &fb, &[], false)
+        );
+    }
+
+    /// The brief carries the last message's text, not the tool traffic that followed it.
+    #[test]
+    fn the_last_assistant_text_is_read_past_later_tool_events() {
+        let t = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"},{"type":"tool_use","name":"Bash"},{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}"#,
+            r#"{"type":"crew_run_end"}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_text(&t).as_deref(), Some("a\nb"));
+        assert_eq!(last_assistant_text("not json"), None);
     }
 
     #[test]

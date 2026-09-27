@@ -258,4 +258,12 @@ pub trait Worker: Send + Sync {
     fn uses_tools(&self) -> bool {
         true
     }
+
+    /// The last message this worker's agent wrote in a run, read back from that run's
+    /// transcript, for the brief another worker is handed when it takes the issue over (#165).
+    /// Each CLI streams its own shape, so only the worker that wrote a transcript can read it.
+    /// Defaulted to `None`, which costs the brief its excerpt and nothing else.
+    fn last_text(&self, _transcript: &str) -> Option<String> {
+        None
+    }
 }

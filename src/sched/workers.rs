@@ -5,13 +5,15 @@
 //! five-hour limit stopped dispatch to Grok, which is exactly the idle time a second worker
 //! exists to fill. So capacity and the pause are both keyed by worker name, and dispatch is
 //! overflow — the first worker in config order with a free slot that is not paused. A
-//! continuation is never overflowed: a session id means nothing to another provider, so one
-//! whose worker is full or paused waits for it.
+//! continuation whose worker is full waits for it: a session id means nothing to another
+//! provider. One whose worker is paused overflows, and `launch` parks the paused worker's
+//! session and hands the next worker a brief of where the run stopped (#165).
 
 use std::sync::Arc;
 
 use super::{RateLimitPause, Reservations, Scheduler};
-use crate::worker::Worker;
+use crate::model::{Feedback, session_id};
+use crate::worker::{Session, Worker};
 
 /// One configured worker and its own slots.
 pub struct WorkerPool {
@@ -77,14 +79,18 @@ impl Scheduler {
         pool.max_concurrent.saturating_sub(used)
     }
 
-    /// The worker the next dispatch goes to, if any can take it. A pinned issue gets its own
-    /// worker or waits, even while another has room; an unpinned one gets the first worker in
-    /// order that is not paused and has a free slot.
+    /// The worker the next dispatch goes to, if any can take it. An unpinned issue gets the
+    /// first worker in order that is not paused and has a free slot. A pinned one gets its own
+    /// worker, and waits for it while it is only full: a full worker frees a slot within a run,
+    /// and moving would cost the session. A paused one may be minutes to hours from its
+    /// window, so its issue overflows like an unpinned one and `launch` hands it off (#165).
     pub(super) fn pick_worker(&self, pin: Option<&str>, reserved: &Reservations) -> Option<String> {
         let open = |w: &WorkerPool| !self.paused(&w.name) && self.worker_slots(w, reserved) > 0;
         match self.resolve_pin(pin) {
-            Some(p) => self.pool(&p).filter(|w| open(w)).map(|w| w.name.clone()),
-            None => self.workers.iter().find(|w| open(w)).map(|w| w.name.clone()),
+            Some(p) if !self.paused(&p) => {
+                self.pool(&p).filter(|w| open(w)).map(|w| w.name.clone())
+            }
+            _ => self.workers.iter().find(|w| open(w)).map(|w| w.name.clone()),
         }
     }
 
@@ -123,5 +129,106 @@ impl Scheduler {
     /// The published pauses, in dispatch order.
     pub(super) fn published_pauses(&self) -> Vec<RateLimitPause> {
         self.workers.iter().filter_map(|w| self.rate_limit_pauses.get(&w.name).cloned()).collect()
+    }
+}
+
+/// How much of the previous worker's last message a handoff brief carries (#165). The tail, not
+/// the head: a run cut off by a rate limit stops mid-thought, and the end of its last message is
+/// where it stood.
+const HANDOFF_TEXT_BYTES: usize = 4096;
+
+impl Scheduler {
+    /// The session `worker` runs `issue_id` under, and the worker it takes the issue over from
+    /// when that is another one.
+    ///
+    /// Each worker resumes only its own session (#119). The pinned worker's is
+    /// `issue_state.session_id`; dispatching anywhere else is a handoff (#165), which parks the
+    /// pinned session with the worktree's `head` rather than overwriting it. A worker resumes one
+    /// it parked earlier only while `head` has not moved since: once the other worker has
+    /// committed, that conversation describes a tree that is gone. A session no run names a
+    /// worker for predates v13: with one worker it can only be that worker's, and with several,
+    /// overflow may have sent it to another provider, so it is not resumed.
+    pub(super) fn choose_session(
+        &self,
+        issue_id: &str,
+        worker: &str,
+        head: Option<&str>,
+    ) -> anyhow::Result<(Session, Option<String>)> {
+        let pin = self.store.session_worker(issue_id)?;
+        let stored = self.store.get(issue_id)?.and_then(|s| s.session_id);
+        let resumable = match pin.as_deref() {
+            Some(p) if p == worker => stored.clone(),
+            None if self.workers.len() == 1 => stored.clone(),
+            _ => self
+                .store
+                .take_parked_session(issue_id, worker)?
+                .filter(|(_, at)| at.is_some() && at.as_deref() == head)
+                .map(|(id, _)| id),
+        };
+        let from = pin.filter(|p| p != worker);
+        if let (Some(from), Some(id)) = (from.as_deref(), stored.as_deref()) {
+            self.store.park_session(issue_id, from, id, head)?;
+        }
+        let session = match resumable {
+            Some(id) => Session::Resume(id),
+            None => Session::New(session_id(issue_id, self.clock.wall().0)),
+        };
+        if stored.as_deref() != Some(session.id()) {
+            self.store.set_session(self.clock.as_ref(), issue_id, Some(session.id()))?;
+        }
+        Ok((session, from))
+    }
+
+    /// What the worker taking an issue over from `from` is told of where `from` stopped: why its
+    /// last run ended, and that run's last message as `from` itself reads its transcript. The
+    /// raw stream stays a post-mortem; only the text reaches the prompt.
+    pub(super) fn handoff_brief(&self, issue_id: &str, from: &str) -> anyhow::Result<Feedback> {
+        let last =
+            self.store.runs_for(issue_id)?.into_iter().find(|r| r.worker.as_deref() == Some(from));
+        let why = match self.rate_limit_pauses.get(from) {
+            Some(p) => {
+                format!("its account hit a rate limit ({}), and its window has not reset", p.kind)
+            }
+            None => match last.as_ref().and_then(|r| r.outcome.as_deref()) {
+                Some(o) => format!("its last run ended {o}"),
+                None => "its last run left no outcome".into(),
+            },
+        };
+        let last_text = last
+            .and_then(|r| r.transcript)
+            .and_then(|t| std::fs::read(t).ok())
+            .zip(self.pool(from))
+            .and_then(|(bytes, pool)| pool.worker.last_text(&String::from_utf8_lossy(&bytes)))
+            .map(|t| tail(&t, HANDOFF_TEXT_BYTES));
+        Ok(Feedback::Handoff { from: from.to_string(), why, last_text })
+    }
+}
+
+/// The last `max` bytes of `s`, marker included, so the brief never exceeds its bound.
+fn tail(s: &str, max: usize) -> String {
+    const MARK: &str = "…";
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max.saturating_sub(MARK.len());
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARK}{}", &s[start..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail;
+
+    /// Copilot on #175: the marker was added on top of `max`, so a 4 KiB brief came out at 4099
+    /// bytes. A multi-byte character at the cut moves it forward, never past the bound.
+    #[test]
+    fn a_truncated_brief_fits_its_bound_marker_included() {
+        let long = "é".repeat(5_000);
+        let t = tail(&long, 4096);
+        assert!(t.len() <= 4096 && t.starts_with('…'), "{}", t.len());
+        assert_eq!(tail("short", 4096), "short");
+        assert_eq!(tail(&"a".repeat(5_000), 4096).len(), 4096);
     }
 }

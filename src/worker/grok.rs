@@ -145,6 +145,27 @@ impl Worker for GrokWorker {
         self.model.clone()
     }
 
+    /// The `text` chunks of the last response, joined. A `usage` line closes a response, so
+    /// text after one starts the next message rather than extending the last.
+    fn last_text(&self, transcript: &str) -> Option<String> {
+        let mut text = String::new();
+        let mut closed = false;
+        for line in transcript.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if std::mem::take(&mut closed) {
+                        text.clear();
+                    }
+                    text.push_str(v.get("data").and_then(|d| d.as_str()).unwrap_or_default());
+                }
+                Some("usage") => closed = true,
+                _ => {}
+            }
+        }
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
         let Spawn {
             issue,
@@ -534,6 +555,26 @@ mod tests {
     use super::*;
     use crate::model::Issue;
     use crate::worker::{Session, Spawn, ToolEndpoint};
+
+    /// Text arrives in chunks, and a `usage` line closes a response: the brief is the chunks
+    /// of the last response, joined.
+    #[test]
+    fn the_last_text_is_the_final_responses_chunks_joined() {
+        let t = [
+            r#"{"type":"text","data":"old "}"#,
+            r#"{"type":"text","data":"message"}"#,
+            r#"{"type":"usage"}"#,
+            r#"{"type":"thought","data":"hmm"}"#,
+            r#"{"type":"text","data":"I'll "}"#,
+            r#"{"type":"text","data":"stop here"}"#,
+            r#"{"type":"usage"}"#,
+            r#"{"type":"end"}"#,
+        ]
+        .join("\n");
+        let w = GrokWorker::new("grok", vec![], 0);
+        assert_eq!(w.last_text(&t).as_deref(), Some("I'll stop here"));
+        assert_eq!(w.last_text(""), None);
+    }
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_grok").join(name)
