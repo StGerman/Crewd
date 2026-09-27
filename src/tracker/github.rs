@@ -55,6 +55,7 @@ use super::{Tracker, TrackerError};
 use crate::broker::TrackerWrites;
 use crate::credentials::{Credentials, StaticToken};
 use crate::model::Issue;
+use crate::tracker::normalize_labels;
 
 const API_BASE: &str = "https://api.github.com";
 const PER_PAGE: u32 = 100;
@@ -256,20 +257,6 @@ fn parse_created_at(s: &str) -> Option<i64> {
     OffsetDateTime::parse(s, &Rfc3339).ok().map(|t| t.unix_timestamp() * 1000)
 }
 
-/// Without this an issue labelled `Agent` never matches a configured `agent` and is never
-/// dispatched (#70): `routable` compares with plain equality against `required_labels`, which
-/// `Config::normalize` has already given this same shape.
-fn normalize_labels(labels: Vec<GhLabel>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for label in labels {
-        let name = label.name.trim().to_lowercase();
-        if !name.is_empty() && !out.contains(&name) {
-            out.push(name);
-        }
-    }
-    out
-}
-
 /// Which issues are for Crew (#64). With `label` set, carrying it is the whole signal — an
 /// assignee is neither needed nor sufficient, because a teammate taking a ticket must not hand it
 /// to an agent. Unset, any assignee makes an issue dispatchable, as before the label existed.
@@ -295,7 +282,7 @@ impl DispatchRule {
 }
 
 fn to_issue(owner: &str, repo: &str, rule: &DispatchRule, gh: GhIssue) -> Issue {
-    let labels = normalize_labels(gh.labels);
+    let labels = normalize_labels(gh.labels.into_iter().map(|l| l.name));
     let dispatchable = rule.dispatchable(&labels, &gh.assignees);
     let closed = gh.state == "closed";
     Issue {
