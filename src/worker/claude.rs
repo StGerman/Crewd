@@ -404,9 +404,11 @@ impl Worker for ClaudeWorker {
 }
 
 /// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the
-/// transcript, updates shared progress and outcome as events arrive, drains stderr on a second
-/// thread so a chatty child cannot deadlock on a full pipe, then reaps the process and fills in
-/// a verdict if the stream never gave one.
+/// transcript, updates shared progress as events arrive, drains stderr on a second thread so a
+/// chatty child cannot deadlock on a full pipe, then reaps the process. The verdict — the
+/// stream's, the budget's, or a crash — is published only after `wait` returns: a verdict
+/// published on `result` lets the scheduler reuse the worktree while the child is still in it
+/// (#169).
 fn run_reader(
     mut child: Child,
     stdout: ChildStdout,
@@ -424,6 +426,9 @@ fn run_reader(
     // The CLI's own classification of a failed request, which it puts on the synthetic
     // `assistant` event and not on `result` — the only place an unknown `--model` is named.
     let mut api_error: Option<String> = None;
+    // The `result` verdict, held until the child is reaped, like the budget's `Continue`.
+    // `harvest_finished` treats a published outcome as the run being over (#169).
+    let mut terminal: Option<Outcome> = None;
     // Set at the budget, applied only after `wait`. Publishing `Continue` earlier lets the
     // scheduler reuse the worktree while this process is still in it.
     let mut budget_hit = false;
@@ -494,6 +499,7 @@ fn run_reader(
                 }
             }
             Some("result") => {
+                let outcome = interpret_result(&value, api_error.as_deref());
                 let mut g = state.0.lock().unwrap();
                 // The one place totals come from. A budget cut or a kill never reaches here —
                 // confirmed on a real install: SIGTERM mid-run ends the stream with no `result`
@@ -502,8 +508,8 @@ fn run_reader(
                 g.verdicts = extract_verdicts(
                     value.get("result").and_then(|x| x.as_str()).unwrap_or_default(),
                 );
-                g.outcome = Some(interpret_result(&value, api_error.as_deref()));
                 drop(g);
+                terminal = Some(outcome);
                 break;
             }
             _ => {} // system/etc: nothing this module needs
@@ -536,7 +542,9 @@ fn run_reader(
     let mut g = state.0.lock().unwrap();
     if budget_hit {
         g.outcome = Some(Outcome::Continue { why: "session turn budget reached".into() });
-    } else if g.outcome.is_none() {
+    } else if let Some(outcome) = terminal {
+        g.outcome = Some(outcome);
+    } else {
         let msg = if !saw_any_line {
             "process produced no output before exiting".to_string()
         } else if !saw_valid_line {
@@ -1185,6 +1193,19 @@ mod tests {
             Outcome::Continue { why: "session turn budget reached".into() }
         );
         assert_eq!(h.progress().tokens, None);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// #169: a `result` is not the process's exit. Published on the line, the verdict let the
+    /// scheduler reclaim a workspace a live `claude` was still flushing into.
+    #[test]
+    fn a_claude_run_is_reported_finished_only_once_the_child_has_exited() {
+        let ws = tmp_workspace("result-lingers");
+        let w = ClaudeWorker::new(fixture("result_then_lingers.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        assert!(ws.join("exited").exists(), "the verdict came while the child was still running");
+        assert_eq!(h.progress().tokens.map(|t| (t.input, t.output)), Some((14, 4)));
         std::fs::remove_dir_all(&ws).ok();
     }
 
