@@ -204,13 +204,31 @@ impl Scheduler {
     }
 }
 
+/// The last `max` bytes of `s`, marker included, so the brief never exceeds its bound.
 fn tail(s: &str, max: usize) -> String {
+    const MARK: &str = "…";
     if s.len() <= max {
         return s.to_string();
     }
-    let mut start = s.len() - max;
+    let mut start = s.len() - max.saturating_sub(MARK.len());
     while !s.is_char_boundary(start) {
         start += 1;
     }
-    format!("…{}", &s[start..])
+    format!("{MARK}{}", &s[start..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail;
+
+    /// Copilot on #175: the marker was added on top of `max`, so a 4 KiB brief came out at 4099
+    /// bytes. A multi-byte character at the cut moves it forward, never past the bound.
+    #[test]
+    fn a_truncated_brief_fits_its_bound_marker_included() {
+        let long = "é".repeat(5_000);
+        let t = tail(&long, 4096);
+        assert!(t.len() <= 4096 && t.starts_with('…'), "{}", t.len());
+        assert_eq!(tail("short", 4096), "short");
+        assert_eq!(tail(&"a".repeat(5_000), 4096).len(), 4096);
+    }
 }
