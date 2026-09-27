@@ -412,6 +412,37 @@ impl GitWorktreeWorkspace {
         Ok((args, Some(file)))
     }
 
+    /// `git <cmd> <where> <refspec>` in `worktree`, where `where` is the URL and credential
+    /// `publish` pushes with when there is one, and `remote` otherwise. A read on the ambient
+    /// credential while the push uses the App's fails wherever only the App can reach the
+    /// repository, and a sync that cannot read leaves the lease refusing a push whose missing
+    /// commits the worktree never got to take in. Retried on a fresh token as a push is.
+    fn read_remote(
+        &self,
+        worktree: &Path,
+        remote: &str,
+        cmd: &[&str],
+        refspec: &str,
+    ) -> Result<Result<String, WorkspaceError>, ForgeError> {
+        self.retry_on_auth(|| {
+            let (mut args, file, target) = match &self.push_auth {
+                None => (Vec::new(), None, remote.to_string()),
+                Some(PushAuth { creds, url }) => {
+                    let file = PushCredentialFile::new(&creds.token()?).map_err(|e| {
+                        ForgeError::Transient(format!("writing the fetch credential: {e}"))
+                    })?;
+                    (file.git_config(), Some(file), url.clone())
+                }
+            };
+            args.extend(cmd.iter().map(|c| c.to_string()));
+            args.extend([target, refspec.to_string()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = Self::git(worktree, &args);
+            drop(file);
+            Ok(out)
+        })
+    }
+
     /// The remote head the worktree last took in, by `sync` or by its own push: the only value
     /// the push lease may hold. Outside `refs/remotes/` so no fetch moves it, and in the shared
     /// `.git` rather than `refs/worktree/` so it outlives a worktree removed and re-prepared.
@@ -736,14 +767,20 @@ impl Publisher for GitWorktreeWorkspace {
         // Asked of the remote, not read off `refs/remotes/`: that ref is what `workspace.repo`
         // last fetched, which is neither current nor anything this worktree took in.
         let full = format!("refs/heads/{branch}");
-        let listed = Self::git(worktree, &["ls-remote", "--heads", remote, &full])
+        let lease_ref = Self::lease_ref(branch);
+        let listed = self
+            .read_remote(worktree, remote, &["ls-remote", "--heads"], &full)?
             .map_err(|e| ForgeError::Transient(format!("reading {remote}/{branch}: {e}")))?;
         if listed.is_empty() {
+            // A lease left from a branch since deleted (merged, or by hand) would make the push
+            // that recreates it expect a head the remote no longer has, and be refused forever.
+            Self::git(worktree, &["update-ref", "-d", &lease_ref])
+                .map_err(|e| ForgeError::Transient(format!("clearing the lease: {e}")))?;
             return Ok(Synced::Absent);
         }
         // Into `FETCH_HEAD`, which is per worktree, rather than any shared ref a fetch in
         // `workspace.repo` could also move.
-        Self::git(worktree, &["fetch", "--quiet", remote, &full])
+        self.read_remote(worktree, remote, &["fetch", "--quiet"], &full)?
             .map_err(|e| ForgeError::Transient(format!("fetching {remote}/{branch}: {e}")))?;
         let remote_head = Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"])
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
@@ -780,7 +817,7 @@ impl Publisher for GitWorktreeWorkspace {
             Synced::Advanced { remote_head: remote_head.clone(), merged: !fast_forward }
         };
         // Only now: the lease may name a head only once the worktree holds it.
-        Self::git(worktree, &["update-ref", &Self::lease_ref(branch), &remote_head])
+        Self::git(worktree, &["update-ref", &lease_ref, &remote_head])
             .map_err(|e| ForgeError::Transient(format!("recording the fetched head: {e}")))?;
         Ok(synced)
     }
@@ -1724,6 +1761,57 @@ mod tests {
         );
 
         for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Review on #174: with an App credential the sync read through the operator's remote,
+    /// which a host with only the App's access cannot reach.
+    #[test]
+    fn an_app_credentialed_sync_reads_the_branch_where_the_push_goes() {
+        let root = tmp_root("wt-sync-app");
+        let (repo, bare) = repo_with_remote("wt-sync-app");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(
+            Arc::new(crate::credentials::StaticToken::new("tok")),
+            bare.to_str().unwrap(),
+        );
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        git_out(&repo, &["remote", "set-url", "origin", "/nonexistent/crew-test.git"]).unwrap();
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: first.head_sha }
+        );
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Review on #174: a lease outliving its remote branch refused the push recreating it.
+    #[test]
+    fn a_branch_deleted_on_the_remote_can_be_pushed_again() {
+        let root = tmp_root("wt-sync-deleted");
+        let (repo, bare) = repo_with_remote("wt-sync-deleted");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        git_out(&bare, &["branch", "-D", &branch]).unwrap();
+        commit_in(&p.path, "b.txt", "second");
+
+        assert_eq!(ws.sync(&p.path, &branch, "origin").unwrap(), Synced::Absent);
+        let again = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            again.head_sha
+        );
+
+        for d in [&root, &repo, &bare] {
             std::fs::remove_dir_all(d).ok();
         }
     }
