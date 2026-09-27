@@ -1,4 +1,8 @@
-//! Where a GitHub credential comes from: asked for per request, never captured once.
+//! Where a GitHub or Jira credential comes from: asked for per request, never captured once.
+//!
+//! Jira's is the simpler of the two: a Cloud API token does not expire on a schedule this
+//! daemon needs to track, so [`JiraCredentialsFile::basic_token`] is Basic-encoded once and
+//! handed to [`StaticToken`] unchanged, with no mint-and-refresh loop of its own (#99).
 //!
 //! An installation token expires an hour after it is minted and this daemon runs for days, so a
 //! tracker or forge that took its token as a `String` at construction would start failing on
@@ -219,6 +223,88 @@ impl AppSigner {
             .sign(&RSA_PKCS1_SHA256, &self.rng, signing_input.as_bytes(), &mut sig)
             .map_err(|_| "signing the App's JWT failed".to_string())?;
         Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig)))
+    }
+}
+
+// ---- Jira Basic auth --------------------------------------------------------
+
+/// What `tracker.jira.credentials` names: the operator's own Atlassian account email and API
+/// token. Both are read together because Jira Cloud's Basic auth needs the pair — the token
+/// alone does not identify an account the way a GitHub PAT does.
+#[derive(Clone)]
+pub struct JiraCredentialsFile {
+    pub(crate) email: String,
+    pub(crate) api_token: String,
+}
+
+impl std::fmt::Debug for JiraCredentialsFile {
+    /// Hand-written so the token can never reach a log line or a panic message through a
+    /// derived `Debug`, the way `GithubAppFile`'s key path (never its contents) is the only
+    /// thing that type prints either.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JiraCredentialsFile")
+            .field("email", &self.email)
+            .field("api_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JiraCredentialsError {
+    #[error("cannot read {path}: {source}")]
+    Read { path: PathBuf, source: std::io::Error },
+    #[error("cannot parse {path}: {message}")]
+    Parse { path: PathBuf, message: String },
+    #[error("{path} has no {field}")]
+    Missing { path: PathBuf, field: &'static str },
+    /// The `JIRA_EMAIL`/`JIRA_API_TOKEN` fallback names the variable, not a path, so this stays
+    /// a separate variant rather than reusing [`JiraCredentialsError::Missing`].
+    #[error("{0} is not set")]
+    MissingEnv(&'static str),
+}
+
+#[derive(Deserialize)]
+struct RawJiraCredentials {
+    email: Option<String>,
+    api_token: Option<String>,
+}
+
+impl JiraCredentialsFile {
+    /// Each missing or blank field is named on its own, mirroring [`GithubAppFile::load`].
+    pub fn load(path: &Path) -> Result<Self, JiraCredentialsError> {
+        let path = expand_home(path);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|source| JiraCredentialsError::Read { path: path.clone(), source })?;
+        let raw: RawJiraCredentials = toml::from_str(&text).map_err(|e| {
+            JiraCredentialsError::Parse { path: path.clone(), message: e.to_string() }
+        })?;
+        let field = |value: Option<String>, name| match value.as_deref().map(str::trim) {
+            Some(v) if !v.is_empty() => Ok(v.to_string()),
+            _ => Err(JiraCredentialsError::Missing { path: path.clone(), field: name }),
+        };
+        Ok(Self {
+            email: field(raw.email, "email")?,
+            api_token: field(raw.api_token, "api_token")?,
+        })
+    }
+
+    /// `JIRA_EMAIL` and `JIRA_API_TOKEN`: the fallback when `tracker.jira.credentials` is unset.
+    pub fn from_env() -> Result<Self, JiraCredentialsError> {
+        let var = |name: &'static str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .ok_or(JiraCredentialsError::MissingEnv(name))
+        };
+        Ok(Self { email: var("JIRA_EMAIL")?, api_token: var("JIRA_API_TOKEN")? })
+    }
+
+    /// Basic auth's `base64(email:api_token)`, sent in every request's `Authorization` header —
+    /// Jira Cloud's REST v3 accepts the API token this way, with no token exchange to cache.
+    pub fn basic_token(&self) -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", self.email, self.api_token))
     }
 }
 
@@ -485,6 +571,15 @@ pub(crate) mod tests {
         assert!(matches!(app.token(), Err(CredentialError::Permanent(_))));
         http.push(502, json!({}));
         assert!(matches!(app.token(), Err(CredentialError::Transient(_))));
+    }
+
+    #[test]
+    fn a_jira_api_token_never_appears_in_debug_output() {
+        let creds =
+            JiraCredentialsFile { email: "a@b.com".into(), api_token: "super-secret".into() };
+        let dump = format!("{creds:?}");
+        assert!(!dump.contains("super-secret"), "{dump}");
+        assert!(dump.contains("a@b.com"));
     }
 
     #[test]

@@ -87,3 +87,13 @@ pub(crate) fn status(
         body: b"{}".to_vec(),
     })
 }
+
+/// A non-2xx response with a real JSON body, for classification tests that read a provider's
+/// own error shape (Jira's `errorMessages`/`errors`, GitHub's `message`).
+pub(crate) fn status_body(code: u16, body: Value) -> Result<HttpResponse, HttpTransportError> {
+    Ok(HttpResponse {
+        status: code,
+        headers: Default::default(),
+        body: body.to_string().into_bytes(),
+    })
+}

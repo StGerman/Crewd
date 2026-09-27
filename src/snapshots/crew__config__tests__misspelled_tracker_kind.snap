@@ -2,4 +2,4 @@
 source: src/config.rs
 expression: c.preflight().unwrap_err()
 ---
-invalid config: unsupported tracker.kind "gihub"; expected one of "fake", "github"
+invalid config: unsupported tracker.kind "gihub"; expected one of "fake", "github", "jira"

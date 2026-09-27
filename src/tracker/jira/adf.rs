@@ -17,9 +17,6 @@
 //! Jira feature this module has not been taught about degrades to visible text in the prompt
 //! instead of a silent gap.
 
-// Nothing calls this module yet; the `#[allow]` goes when the tracker calls it (#99).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 

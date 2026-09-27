@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::credentials::GithubAppFile;
+use crate::credentials::{GithubAppFile, JiraCredentialsFile};
 use crate::worker::{Effort, ModelChoice};
 
 fn d_interval() -> u64 {
@@ -436,6 +436,31 @@ pub struct TrackerConfig {
     /// read-only marker account is only possible on an organization-owned repository.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// `kind = "jira"` only: which Jira Cloud site and project to poll (#99).
+    #[serde(default)]
+    pub jira: Option<JiraConfig>,
+}
+
+/// `kind = "jira"` only: the Jira Cloud site this daemon polls, resolved once here rather than
+/// spread across the tracker's own fields — a Jira credential, project and label all belong to
+/// one table an operator fills in together, not to keys interleaved with GitHub's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JiraConfig {
+    /// The site's REST base, e.g. `https://your-domain.atlassian.net`. `Config::normalize`
+    /// strips a trailing slash.
+    #[serde(default)]
+    pub base_url: String,
+    /// The project key issues are polled from, e.g. `PROJ`.
+    #[serde(default)]
+    pub project: String,
+    /// Narrows dispatch to issues assigned to the token's owner; see `src/tracker/jira`'s module
+    /// doc for why the label alone is still required even with this on.
+    #[serde(default)]
+    pub assigned_to_me: bool,
+    /// A TOML file naming `email` and `api_token`. Unset falls back to `JIRA_EMAIL` and
+    /// `JIRA_API_TOKEN`, resolved in `main.rs`.
+    #[serde(default)]
+    pub credentials: Option<PathBuf>,
 }
 
 /// The tracker a config selects; see [`WorkerKind`] for why this is parsed.
@@ -443,6 +468,7 @@ pub struct TrackerConfig {
 pub enum TrackerKind {
     Fake,
     Github,
+    Jira,
 }
 
 impl TrackerConfig {
@@ -451,8 +477,9 @@ impl TrackerConfig {
             "" => Err(ConfigError::Invalid("tracker.kind is required".into())),
             "fake" => Ok(TrackerKind::Fake),
             "github" => Ok(TrackerKind::Github),
+            "jira" => Ok(TrackerKind::Jira),
             _ => Err(ConfigError::Invalid(format!(
-                "unsupported tracker.kind {:?}; expected one of \"fake\", \"github\"",
+                "unsupported tracker.kind {:?}; expected one of \"fake\", \"github\", \"jira\"",
                 self.kind
             ))),
         }
@@ -590,10 +617,12 @@ impl Config {
         self.forge.github_app.as_deref().or(self.tracker.github_app.as_deref())
     }
 
-    /// Parse and preflight a config, then check the host has what `tracker.github_app` names.
+    /// Parse and preflight a config, then check the host has what `tracker.github_app` and
+    /// `tracker.jira.credentials` name.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let cfg = Self::parse(path)?;
         cfg.check_github_app()?;
+        cfg.check_jira_credentials()?;
         Ok(cfg)
     }
 
@@ -628,6 +657,21 @@ impl Config {
             .map_err(|e| ConfigError::Invalid(format!("{key}: {e}")))
     }
 
+    /// Mirrors `check_github_app`: once at load, not in `preflight`, so a credentials file
+    /// replaced on disk mid-run cannot stop dispatch. Unset `tracker.jira.credentials` is not
+    /// checked here — the `JIRA_EMAIL`/`JIRA_API_TOKEN` fallback is resolved in `main.rs`, which
+    /// names whichever variable is missing.
+    pub fn check_jira_credentials(&self) -> Result<(), ConfigError> {
+        if self.tracker.kind()? != TrackerKind::Jira {
+            return Ok(());
+        }
+        let Some(jira) = &self.tracker.jira else { return Ok(()) };
+        let Some(path) = &jira.credentials else { return Ok(()) };
+        JiraCredentialsFile::load(path)
+            .map(drop)
+            .map_err(|e| ConfigError::Invalid(format!("tracker.jira.credentials: {e}")))
+    }
+
     /// Lowercase every state used for comparison, so provider spelling never leaks into lookups.
     fn normalize(&mut self) {
         let norm = |v: &Vec<String>| -> Vec<String> {
@@ -643,6 +687,10 @@ impl Config {
             .as_deref()
             .map(|l| l.trim().to_lowercase())
             .filter(|l| !l.is_empty());
+        if let Some(jira) = &mut self.tracker.jira {
+            jira.base_url = jira.base_url.trim().trim_end_matches('/').to_string();
+            jira.project = jira.project.trim().to_string();
+        }
 
         self.agent.max_concurrent_by_state = self
             .agent
@@ -662,6 +710,30 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "tracker.owner and tracker.repo are required when tracker.kind = \"github\"".into(),
             ));
+        }
+        if self.tracker.kind()? == TrackerKind::Jira {
+            let jira = self.tracker.jira.as_ref().ok_or_else(|| {
+                ConfigError::Invalid(
+                    "[tracker.jira] is required when tracker.kind = \"jira\"".into(),
+                )
+            })?;
+            if jira.base_url.is_empty() || !jira.base_url.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "tracker.jira.base_url must be set and start with https://".into(),
+                ));
+            }
+            if jira.project.is_empty() {
+                return Err(ConfigError::Invalid("tracker.jira.project is required".into()));
+            }
+            // The label is the whole dispatch signal for Jira (#99): there is no free-JQL or
+            // any-assignee fallback the way `DispatchRule` has for GitHub.
+            if self.tracker.dispatch_label.is_none() {
+                return Err(ConfigError::Invalid(
+                    "tracker.dispatch_label is required when tracker.kind = \"jira\"; the label \
+                     is the whole dispatch signal"
+                        .into(),
+                ));
+            }
         }
         // Delivery needs a GitHub repository to push to and open a pull request against even
         // when the tracker itself is not GitHub (a Jira tracker, say); each `[forge]` key falls
@@ -940,6 +1012,78 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn jira_base() -> Config {
+        let mut c = base();
+        c.tracker.kind = "jira".into();
+        c.tracker.dispatch_label = Some("crewd".into());
+        c.forge.owner = "o".into();
+        c.forge.repo = "r".into();
+        c.tracker.jira = Some(JiraConfig {
+            base_url: "https://example.atlassian.net".into(),
+            project: "PROJ".into(),
+            assigned_to_me: false,
+            credentials: None,
+        });
+        c.normalize();
+        c
+    }
+
+    #[test]
+    fn a_jira_tracker_without_a_dispatch_label_is_rejected() {
+        let mut c = jira_base();
+        c.tracker.dispatch_label = None;
+        let err = c.preflight().unwrap_err().to_string();
+        assert!(err.contains("dispatch_label"), "{err}");
+        c.tracker.dispatch_label = Some("crewd".into());
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_jira_tracker_without_a_forge_repo_is_rejected() {
+        let mut c = jira_base();
+        c.forge.owner = String::new();
+        c.forge.repo = String::new();
+        assert!(c.preflight().is_err());
+    }
+
+    #[test]
+    fn a_jira_tracker_needs_an_https_base_url_and_a_project() {
+        let mut c = jira_base();
+        c.tracker.jira.as_mut().unwrap().base_url = "http://example.atlassian.net".into();
+        assert!(c.preflight().is_err(), "http, not https");
+        c.tracker.jira.as_mut().unwrap().base_url = "https://example.atlassian.net".into();
+        c.tracker.jira.as_mut().unwrap().project = String::new();
+        assert!(c.preflight().is_err(), "project required");
+        c.tracker.jira.as_mut().unwrap().project = "PROJ".into();
+        assert!(c.preflight().is_ok());
+        c.tracker.jira = None;
+        assert!(c.preflight().is_err(), "the whole table is required");
+    }
+
+    /// Mirrors `a_half_configured_github_app_is_refused_naming_the_missing_piece`.
+    #[test]
+    fn a_half_configured_jira_credential_is_refused_naming_the_missing_piece() {
+        let dir = std::env::temp_dir().join(format!("crew-cfg-jira-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("jira.toml");
+        let mut c = jira_base();
+        c.tracker.jira.as_mut().unwrap().credentials = Some(creds.clone());
+
+        std::fs::write(&creds, "api_token = \"t\"").unwrap();
+        let err = c.check_jira_credentials().unwrap_err().to_string();
+        assert!(err.contains("email") && err.contains("tracker.jira.credentials"), "{err}");
+
+        std::fs::write(&creds, "email = \"a@b.com\"").unwrap();
+        let err = c.check_jira_credentials().unwrap_err().to_string();
+        assert!(err.contains("api_token"), "{err}");
+
+        std::fs::write(&creds, "email = \"a@b.com\"\napi_token = \"t\"").unwrap();
+        c.check_jira_credentials().expect("a complete file passes");
+        c.preflight().expect("preflight never reads the file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_dispatch_label_is_normalized_like_the_labels_it_is_compared_with() {
         let mut c = base();
@@ -1139,14 +1283,24 @@ mod tests {
         let mut c = base();
         c.tracker.owner = "o".into();
         c.tracker.repo = "r".into();
+        c.tracker.dispatch_label = Some("agent".into());
+        c.tracker.jira = Some(JiraConfig {
+            base_url: "https://example.atlassian.net".into(),
+            project: "PROJ".into(),
+            assigned_to_me: false,
+            credentials: None,
+        });
+        c.normalize();
         for (kind, want) in [
             ("fake", TrackerKind::Fake),
             (" GitHub ", TrackerKind::Github),
             ("FAKE", TrackerKind::Fake),
+            ("jira", TrackerKind::Jira),
+            (" Jira ", TrackerKind::Jira),
         ] {
             c.tracker.kind = kind.into();
             assert_eq!(c.tracker.kind().unwrap(), want);
-            assert!(c.preflight().is_ok());
+            assert!(c.preflight().is_ok(), "{kind}: {:?}", c.preflight());
         }
         for (kind, want) in [
             ("", WorkerKind::Fake),
@@ -1164,7 +1318,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_configs_load() {
-        for name in ["crew.toml", "crew.github.toml"] {
+        for name in ["crew.toml", "crew.github.toml", "crew.jira.toml"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
             if let Err(e) = Config::parse(&path) {
                 panic!("{name}: {e}");
@@ -1174,6 +1328,8 @@ mod tests {
         // host's, so only `load` checks it.
         let github = Config::parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("crew.github.toml"));
         assert!(github.unwrap().tracker.github_app.is_some());
+        let jira = Config::parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("crew.jira.toml"));
+        assert!(jira.unwrap().tracker.jira.is_some());
     }
 
     #[test]

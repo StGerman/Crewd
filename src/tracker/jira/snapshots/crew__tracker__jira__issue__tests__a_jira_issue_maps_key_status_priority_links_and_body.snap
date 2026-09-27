@@ -1,0 +1,36 @@
+---
+source: src/tracker/jira/issue.rs
+expression: "format!(\"{issue:#?}\")"
+---
+Issue {
+    id: "PROJ-7",
+    identifier: "PROJ-7",
+    title: "Fix the thing",
+    body: Some(
+        "details",
+    ),
+    state: "In Progress",
+    priority: Some(
+        2,
+    ),
+    url: Some(
+        "https://x.atlassian.net/browse/PROJ-7",
+    ),
+    labels: [
+        "crewd",
+        "bug",
+    ],
+    dispatchable: true,
+    created_at: Some(
+        1790487151000,
+    ),
+    native_ref: Some(
+        Object {
+            "key": String("PROJ-7"),
+            "project": String("PROJ"),
+        },
+    ),
+    blocked_by: [
+        "PROJ-1",
+    ],
+}
