@@ -1,0 +1,5 @@
+---
+source: src/tracker/jira/mod.rs
+expression: m
+---
+400: bad jql

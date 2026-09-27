@@ -21,6 +21,10 @@
 //! is no equivalent of `github.rs`'s per-hour arithmetic to size `interval_ms` against — it stays
 //! an empirical knob, tightened only if a 429 (classified
 //! [`crate::model::ErrorClass::RateLimited`]) starts showing up in the log.
+//!
+//! A status name the site does not know makes Jira reject the poll's JQL with a 400 naming it,
+//! which fails every poll until the config is fixed; this is deliberate, a loud config error
+//! rather than a silently empty poll.
 
 mod adf;
 mod issue;
@@ -38,6 +42,11 @@ use crate::credentials::{CredentialError, Credentials};
 use crate::model::Issue;
 use crate::tracker::github::{Http, HttpResponse, HttpTransportError};
 use issue::{FIELDS, JiIssue, MapContext};
+
+/// `search_all`'s ceiling on pages of `search_page`'s own 100-result page size. Jira Cloud
+/// documents no bound on `nextPageToken`'s cardinality, so a search that never sets `isLast`
+/// and never repeats a token would otherwise page forever on the tick thread.
+const MAX_SEARCH_PAGES: usize = 100;
 
 /// A construction with no credential set. `new` alone is never enough for a live call — every
 /// site builds one with `with_credentials` right after, the way `tracker.jira.credentials` or
@@ -183,14 +192,38 @@ impl<H: Http> JiraTracker<H> {
         prefix_ok && rest_ok && prefix.eq_ignore_ascii_case(&self.project)
     }
 
-    /// A foreign or malformed id is refused before any request, on every write — the write-path
-    /// mirror of `owns`, named the way `GithubTracker::number_for` names its own refusal.
+    /// A moved issue keeps its old key resolvable under whatever project it landed in
+    /// (`PROJ-12` -> `SECRET-3`), so the key-shape check in `owns` alone would let a write
+    /// follow a stale key into another project; every write confirms the project live, right
+    /// before it, with its own GET rather than trusting a cached or filtered issue. A
+    /// malformed or foreign-prefixed id fails `owns` locally, before any request; a 404 on the
+    /// live lookup is refused the same as a project mismatch.
     fn validate(&self, issue_id: &str) -> Result<(), TrackerError> {
-        if self.owns(issue_id) {
+        if !self.owns(issue_id) {
+            return Err(TrackerError::Status(format!(
+                "{issue_id} is not an issue in project {}",
+                self.project
+            )));
+        }
+        let url = format!("{}/rest/api/3/issue/{issue_id}?fields=project", self.base_url);
+        let resp = self.request(&url)?;
+        #[derive(Deserialize)]
+        struct ProjectOnly {
+            fields: ProjectField,
+        }
+        #[derive(Deserialize)]
+        struct ProjectField {
+            #[serde(default)]
+            project: Option<issue::JiProject>,
+        }
+        let parsed: ProjectOnly = serde_json::from_slice(&resp.body)
+            .map_err(|e| TrackerError::Response(e.to_string()))?;
+        let project_key = parsed.fields.project.map(|p| p.key).unwrap_or_default();
+        if project_key.eq_ignore_ascii_case(&self.project) {
             Ok(())
         } else {
             Err(TrackerError::Status(format!(
-                "{issue_id} is not an issue in project {}",
+                "{issue_id} now belongs to project {project_key}, not {}",
                 self.project
             )))
         }
@@ -235,23 +268,31 @@ impl<H: Http> JiraTracker<H> {
     }
 
     /// Pages while a token is present and `isLast` is not `true`. A page failing fails the whole
-    /// call rather than returning what was gathered so far, and a token equal to the one that
-    /// produced it is treated as a malformed response rather than looped on forever.
+    /// call rather than returning what was gathered so far. Every token seen is remembered, not
+    /// just the previous one, so a cycle (`A, B, A`) fails the same as an immediate repeat; a
+    /// search that advances to a new token every time without ever setting `isLast` fails once
+    /// it passes [`MAX_SEARCH_PAGES`] rather than paging forever on the tick thread.
     fn search_all(&self, jql: &str) -> Result<Vec<JiIssue>, TrackerError> {
         let mut all = Vec::new();
         let mut token: Option<String> = None;
-        loop {
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+        for _ in 0..MAX_SEARCH_PAGES {
             let page = self.search_page(jql, token.as_deref())?;
             all.extend(page.issues);
-            if page.is_last.unwrap_or(false) || page.next_page_token.is_none() {
-                break;
+            if page.is_last.unwrap_or(false) {
+                return Ok(all);
             }
-            if page.next_page_token == token {
-                return Err(TrackerError::Response("pagination did not advance".into()));
+            let Some(next) = page.next_page_token else { return Ok(all) };
+            if !seen_tokens.insert(next.clone()) {
+                return Err(TrackerError::Response(format!(
+                    "page token {next} was seen twice; refusing to loop forever"
+                )));
             }
-            token = page.next_page_token;
+            token = Some(next);
         }
-        Ok(all)
+        Err(TrackerError::Response(format!(
+            "search did not finish within {MAX_SEARCH_PAGES} pages"
+        )))
     }
 
     /// `filter_states`, when non-empty, narrows the mapped output to those state keys — the same
@@ -292,7 +333,7 @@ impl<H: Http> JiraTracker<H> {
         let current: CurrentStatus = serde_json::from_slice(&resp.body)
             .map_err(|e| TrackerError::Response(e.to_string()))?;
         let current_name = current.fields.status.name;
-        if current_name.trim().eq_ignore_ascii_case(want) {
+        if current_name.trim().to_lowercase() == want.trim().to_lowercase() {
             return Ok(format!("{issue_id} is already {current_name}"));
         }
         let targets: Vec<&str> = transitions.iter().map(|t| t.to.name.as_str()).collect();
@@ -349,8 +390,11 @@ impl<H: Http> TrackerWrites for JiraTracker<H> {
         let parsed: Transitions = serde_json::from_slice(&resp.body)
             .map_err(|e| TrackerError::Response(e.to_string()))?;
         let want = state.trim();
+        let want_lower = want.to_lowercase();
+        // `eq_ignore_ascii_case` never matches a non-ASCII status (e.g. "Überprüfung") against
+        // the broker's Unicode-lowercased argument, so both sides fold through `to_lowercase`.
         if let Some(t) =
-            parsed.transitions.iter().find(|t| t.to.name.trim().eq_ignore_ascii_case(want))
+            parsed.transitions.iter().find(|t| t.to.name.trim().to_lowercase() == want_lower)
         {
             self.write("POST", &transitions_url, &json!({ "transition": { "id": t.id } }))?;
             return Ok(format!("{issue_id} is now {}", t.to.name));
@@ -479,6 +523,12 @@ mod tests {
         })
     }
 
+    /// Every write now confirms the project live before it does anything else (#99, F9); this
+    /// is that check's response, scripted first in every write test below.
+    fn project_ok() -> Result<HttpResponse, HttpTransportError> {
+        ok(json!({"fields": {"project": {"key": "PROJ"}}}))
+    }
+
     #[test]
     fn empty_queries_make_no_jira_request() {
         let http = FakeHttp::new();
@@ -546,6 +596,31 @@ mod tests {
         let t = tracker(http);
         let err = t.by_states(&["open".to_string()]).unwrap_err();
         assert!(matches!(err, TrackerError::Response(_)));
+    }
+
+    #[test]
+    fn a_page_token_cycle_fails_the_call_rather_than_looping_forever() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "issues": [], "nextPageToken": "A", "isLast": false })));
+        http.push(ok(json!({ "issues": [], "nextPageToken": "B", "isLast": false })));
+        http.push(ok(json!({ "issues": [], "nextPageToken": "A", "isLast": false })));
+        let t = tracker(http);
+        let err = t.by_states(&["open".to_string()]).unwrap_err();
+        assert!(matches!(err, TrackerError::Response(_)), "A, B, A is a cycle, not a repeat");
+    }
+
+    #[test]
+    fn a_search_that_never_ends_fails_after_the_page_cap() {
+        let http = FakeHttp::new();
+        for i in 0..MAX_SEARCH_PAGES {
+            http.push(ok(
+                json!({ "issues": [], "nextPageToken": format!("tok-{i}"), "isLast": false }),
+            ));
+        }
+        let t = tracker(http);
+        let err = t.by_states(&["open".to_string()]).unwrap_err();
+        assert!(matches!(err, TrackerError::Response(_)));
+        assert_eq!(t.http.calls().len(), MAX_SEARCH_PAGES, "stops at the cap, not past it");
     }
 
     #[test]
@@ -621,7 +696,7 @@ mod tests {
         http.push(status_body(400, json!({"errorMessages": ["bad jql"]})));
         let err = tracker(http).by_ids(&["PROJ-1".to_string()]).unwrap_err();
         match err {
-            TrackerError::Status(m) => assert!(m.contains("bad jql"), "{m}"),
+            TrackerError::Status(m) => insta::assert_snapshot!(m),
             other => panic!("expected Status, got {other:?}"),
         }
     }
@@ -629,6 +704,7 @@ mod tests {
     #[test]
     fn set_state_applies_the_transition_whose_target_matches_without_regard_to_case() {
         let http = FakeHttp::new();
+        http.push(project_ok());
         http.push(ok(json!({
             "transitions": [
                 {"id": "11", "to": {"name": "In Progress"}},
@@ -638,24 +714,36 @@ mod tests {
         http.push(ok(json!({})));
         let t = tracker(http);
         let out = t.set_state("PROJ-1", "done").unwrap();
-        assert!(out.contains("PROJ-1"));
+        insta::assert_snapshot!(out);
         let writes = t.http.writes();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].2["transition"]["id"], "31");
     }
 
     #[test]
+    fn set_state_matches_a_non_ascii_status_name_without_regard_to_case() {
+        let http = FakeHttp::new();
+        http.push(project_ok());
+        http.push(ok(json!({ "transitions": [{"id": "11", "to": {"name": "Überprüfung"}}] })));
+        http.push(ok(json!({})));
+        let t = tracker(http);
+        // The broker hands over a Unicode-lowercased state (#99, F4): `eq_ignore_ascii_case`
+        // never folds `Ü` to `ü`, so the match must go through `to_lowercase` on both sides.
+        let out = t.set_state("PROJ-1", "überprüfung").unwrap();
+        assert_eq!(t.http.writes().len(), 1, "the transition was posted, not just confirmed");
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
     fn set_state_names_the_reachable_targets_when_none_matches() {
         let http = FakeHttp::new();
+        http.push(project_ok());
         http.push(ok(json!({ "transitions": [{"id": "11", "to": {"name": "In Progress"}}] })));
         http.push(ok(json!({"fields": {"status": {"name": "Open"}}})));
         let t = tracker(http);
         let err = t.set_state("PROJ-1", "done").unwrap_err();
         match err {
-            TrackerError::Status(m) => {
-                assert!(m.contains("Open"), "{m}");
-                assert!(m.contains("In Progress"), "{m}");
-            }
+            TrackerError::Status(m) => insta::assert_snapshot!(m),
             other => panic!("expected Status, got {other:?}"),
         }
     }
@@ -663,11 +751,12 @@ mod tests {
     #[test]
     fn set_state_to_the_current_status_succeeds_without_a_transition() {
         let http = FakeHttp::new();
+        http.push(project_ok());
         http.push(ok(json!({"transitions": []})));
         http.push(ok(json!({"fields": {"status": {"name": "Done"}}})));
         let t = tracker(http);
         let out = t.set_state("PROJ-1", "done").unwrap();
-        assert!(out.contains("already"), "{out}");
+        insta::assert_snapshot!(out);
         assert!(t.http.writes().is_empty(), "no transition was posted");
     }
 
@@ -680,8 +769,30 @@ mod tests {
     }
 
     #[test]
+    fn a_write_to_an_issue_moved_out_of_the_project_is_refused() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({"fields": {"project": {"key": "SECRET"}}})));
+        let t = tracker(http);
+        let err = t.comment("PROJ-1", "hi").unwrap_err();
+        assert!(matches!(err, TrackerError::Status(_)));
+        assert_eq!(t.http.calls().len(), 1, "only the project check, no comment request follows");
+        assert!(t.http.writes().is_empty());
+
+        let http = FakeHttp::new();
+        http.push(status(404, &[]));
+        let t = tracker(http);
+        let err = t.set_state("PROJ-1", "done").unwrap_err();
+        assert!(
+            matches!(err, TrackerError::Status(_)),
+            "a 404 on the project check is refused too"
+        );
+        assert!(t.http.writes().is_empty());
+    }
+
+    #[test]
     fn link_pr_posts_an_idempotent_remote_link() {
         let http = FakeHttp::new();
+        http.push(project_ok());
         http.push(ok(json!({})));
         let t = tracker(http);
         let url = "https://github.com/o/r/pull/9";
@@ -695,10 +806,11 @@ mod tests {
     #[test]
     fn a_comment_is_posted_as_adf() {
         let http = FakeHttp::new();
+        http.push(project_ok());
         http.push(ok(json!({"id": "10001"})));
         let t = tracker(http);
         let out = t.comment("PROJ-1", "hello").unwrap();
-        assert!(out.contains("focusedCommentId=10001"), "{out}");
+        insta::assert_snapshot!(out);
         let writes = t.http.writes();
         assert_eq!(writes[0].2["body"]["type"], "doc");
     }

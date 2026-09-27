@@ -5,9 +5,12 @@
 //! priority field, an issue with no assignee), and a payload this tolerant never fails to parse
 //! over a shape difference the scheduler does not care about.
 
+use std::sync::LazyLock;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use time::format_description::BorrowedFormatItem;
 use time::format_description::well_known::Rfc3339;
 
 use super::adf;
@@ -109,18 +112,27 @@ fn priority_rank(name: &str) -> Option<i32> {
     }
 }
 
+/// Jira's colonless-offset format, e.g. `2026-09-27T08:32:31.410+0300`, parsed once rather than
+/// on every call: the description is a fixed literal, so re-parsing it bought nothing but an
+/// `expect` that could only fail if this literal itself were wrong. `None` only if the literal
+/// stops parsing, which `created_at_parses_jiras_colonless_offset` would catch.
+static JIRA_CREATED_FORMAT: LazyLock<Option<Vec<BorrowedFormatItem<'static>>>> =
+    LazyLock::new(|| {
+        time::format_description::parse_borrowed::<2>(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]\
+         [offset_hour sign:mandatory][offset_minute]",
+        )
+        .ok()
+    });
+
 /// Jira's `2026-09-27T08:32:31.410+0300`: a four-digit, colonless offset that is not valid RFC
 /// 3339. Tried first; RFC 3339 is the fallback for a site or a webhook payload that sends the
 /// standard form instead.
 fn parse_created_at(s: &str) -> Option<i64> {
-    let jira_format = time::format_description::parse_borrowed::<2>(
-        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]\
-         [offset_hour sign:mandatory][offset_minute]",
-    )
-    .expect("fixed literal format description");
-    OffsetDateTime::parse(s, &jira_format)
-        .or_else(|_| OffsetDateTime::parse(s, &Rfc3339))
-        .ok()
+    JIRA_CREATED_FORMAT
+        .as_ref()
+        .and_then(|fmt| OffsetDateTime::parse(s, fmt).ok())
+        .or_else(|| OffsetDateTime::parse(s, &Rfc3339).ok())
         .map(|t| t.unix_timestamp() * 1000)
 }
 

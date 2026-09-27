@@ -1,0 +1,5 @@
+---
+source: src/tracker/jira/jql.rs
+expression: q
+---
+project = "PROJ" AND status in ("open") AND labels = "crewd" ORDER BY created ASC

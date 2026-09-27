@@ -275,9 +275,11 @@ impl JiraCredentialsFile {
         let path = expand_home(path);
         let text = std::fs::read_to_string(&path)
             .map_err(|source| JiraCredentialsError::Read { path: path.clone(), source })?;
-        let raw: RawJiraCredentials = toml::from_str(&text).map_err(|e| {
-            JiraCredentialsError::Parse { path: path.clone(), message: e.to_string() }
-        })?;
+        let raw: RawJiraCredentials =
+            toml::from_str(&text).map_err(|e| JiraCredentialsError::Parse {
+                path: path.clone(),
+                message: jira_toml_error_message(&text, &e),
+            })?;
         let field = |value: Option<String>, name| match value.as_deref().map(str::trim) {
             Some(v) if !v.is_empty() => Ok(v.to_string()),
             _ => Err(JiraCredentialsError::Missing { path: path.clone(), field: name }),
@@ -305,6 +307,18 @@ impl JiraCredentialsFile {
     pub fn basic_token(&self) -> String {
         base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", self.email, self.api_token))
+    }
+}
+
+/// `e.message()` and a line number from `e.span()`, never `toml::de::Error`'s `Display`: the
+/// latter prints the offending source line, which for `api_token = "...` is the secret itself.
+fn jira_toml_error_message(text: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let line = text[..span.start.min(text.len())].matches('\n').count() + 1;
+            format!("line {line}: {}", e.message())
+        }
+        None => e.message().to_string(),
     }
 }
 
@@ -580,6 +594,27 @@ pub(crate) mod tests {
         let dump = format!("{creds:?}");
         assert!(!dump.contains("super-secret"), "{dump}");
         assert!(dump.contains("a@b.com"));
+    }
+
+    #[test]
+    fn a_malformed_jira_credentials_file_never_echoes_the_token() {
+        let dir = tmp("jira-malformed");
+        let path = dir.join("jira.toml");
+        let message = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            match JiraCredentialsFile::load(&path).unwrap_err() {
+                JiraCredentialsError::Parse { message, .. } => message,
+                other => panic!("expected Parse, got {other:?}"),
+            }
+        };
+
+        let unterminated = message("email = \"a@b.com\"\napi_token = \"SECRET-TOKEN-123");
+        assert!(!unterminated.contains("SECRET-TOKEN-123"), "{unterminated}");
+        insta::assert_snapshot!("unterminated_string", unterminated);
+
+        let unquoted = message("email = \"a@b.com\"\napi_token = SECRET-TOKEN-123");
+        assert!(!unquoted.contains("SECRET-TOKEN-123"), "{unquoted}");
+        insta::assert_snapshot!("unquoted_value", unquoted);
     }
 
     #[test]

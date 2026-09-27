@@ -58,6 +58,6 @@ mod tests {
     fn assigned_to_me_off_omits_the_current_user_clause() {
         let states = vec!["open".to_string()];
         let q = poll_query("PROJ", &states, "crewd", false);
-        assert!(!q.contains("currentUser"), "{q}");
+        insta::assert_snapshot!(q);
     }
 }
