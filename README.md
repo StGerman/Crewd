@@ -123,6 +123,10 @@ the missing piece. A one-click `init` that registers the App for you is
 [#65](https://github.com/StGerman/crewd/issues/65). `GITHUB_TOKEN` stays supported for anyone
 not running an App.
 
+Behind a TLS-intercepting corporate proxy, set `SSL_CERT_FILE` to the proxy's CA bundle — the
+same variable curl, Python and Node already read — and every tracker and forge call trusts
+exactly that bundle instead of the default roots.
+
 Two findings from setting one up by hand, since they shape how dispatch works: an App's
 `[bot]` account **cannot be an issue assignee** outside GitHub's partner agent program, and a
 separate marker account does not help because a collaborator on a personal repository cannot be

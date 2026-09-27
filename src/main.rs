@@ -119,6 +119,12 @@ async fn main() -> anyhow::Result<()> {
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
+    // One client for the whole process (#150): `SSL_CERT_FILE` is read once, here, so a bundle
+    // that cannot be read stops startup instead of failing the first poll as an opaque transport
+    // error, and the tracker, the forge and the GitHub App below share one connection pool and
+    // one root-certificate set rather than each reading the environment for their own.
+    let http = UreqHttp::from_env().context("building the HTTPS client")?;
+
     let db_path =
         std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
@@ -153,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
                 installation_id = file.installation_id,
                 "writes are authored by the GitHub App, not the operator"
             );
-            Some(Arc::new(GithubApp::new(UreqHttp::default(), &file, clock.clone())?))
+            Some(Arc::new(GithubApp::new(http.clone(), &file, clock.clone())?))
         }
         _ => None,
     };
@@ -208,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let gh = Arc::new(
                 GithubTracker::new(
-                    UreqHttp::default(),
+                    http.clone(),
                     &cfg.tracker.owner,
                     &cfg.tracker.repo,
                     "",
@@ -220,12 +226,12 @@ async fn main() -> anyhow::Result<()> {
             // `preflight` refuses a `[forge]` that names anything else when `tracker.kind =
             // "github"`, so the tracker and the forge always share this one credential.
             let forge: Arc<dyn Forge> = Arc::new(
-                GithubForge::new(UreqHttp::default(), cfg.forge_owner(), cfg.forge_repo(), "")
+                GithubForge::new(http.clone(), cfg.forge_owner(), cfg.forge_repo(), "")
                     .with_credentials(creds),
             );
             (gh.clone(), gh, Some(forge))
         }
-        TrackerKind::Jira => build_jira(&cfg, &app)?,
+        TrackerKind::Jira => build_jira(&cfg, &app, &http)?,
         TrackerKind::Fake => {
             // The demo tracker has nothing to write to, so broker calls are recorded and
             // dropped. That still exercises the whole path — scoping, budgets, audit —
@@ -502,8 +508,13 @@ type TrackerSet = (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Option<Arc<dyn Forg
 
 /// The Jira tracker and, only while `[delivery]` is on, the GitHub forge it delivers through,
 /// which `[forge]` names (#99). With delivery off nothing here reads `[forge]`, so a dry run with
-/// the fake worker needs no GitHub App, token or repository.
-fn build_jira(cfg: &Config, app: &Option<Arc<dyn Credentials>>) -> anyhow::Result<TrackerSet> {
+/// the fake worker needs no GitHub App, token or repository. `http` is the one client `main`
+/// built from the environment (#150), shared rather than rebuilt per tracker.
+fn build_jira(
+    cfg: &Config,
+    app: &Option<Arc<dyn Credentials>>,
+    http: &UreqHttp,
+) -> anyhow::Result<TrackerSet> {
     let jira = cfg
         .tracker
         .jira
@@ -525,7 +536,7 @@ fn build_jira(cfg: &Config, app: &Option<Arc<dyn Credentials>>) -> anyhow::Resul
     // Preflight already refused a Jira tracker with no dispatch_label, so this is always set.
     let dispatch_label = cfg.tracker.dispatch_label.clone().unwrap_or_default();
     let jira_tracker = Arc::new(
-        JiraTracker::new(UreqHttp::default(), &jira.base_url, &jira.project, &dispatch_label)
+        JiraTracker::new(http.clone(), &jira.base_url, &jira.project, &dispatch_label)
             .with_credentials(token)
             .with_assigned_to_me(jira.assigned_to_me),
     );
@@ -534,7 +545,7 @@ fn build_jira(cfg: &Config, app: &Option<Arc<dyn Credentials>>) -> anyhow::Resul
         .enabled
         .then(|| {
             anyhow::Ok(Arc::new(
-                GithubForge::new(UreqHttp::default(), cfg.forge_owner(), cfg.forge_repo(), "")
+                GithubForge::new(http.clone(), cfg.forge_owner(), cfg.forge_repo(), "")
                     .with_credentials(github_credentials(app)?),
             ) as Arc<dyn Forge>)
         })
@@ -687,8 +698,10 @@ fn run_init(
         // that an abandoned run ends.
         install_polls: 200,
     };
-    let registered =
-        init::run(&UreqHttp::default(), &SystemClock::new(), &mut TerminalOperator, &opts)?;
+    // `init` runs before a config is loaded and on its own thread (#150), so it builds its own
+    // client from the environment rather than sharing the daemon's.
+    let http = UreqHttp::from_env().context("building the HTTPS client")?;
+    let registered = init::run(&http, &SystemClock::new(), &mut TerminalOperator, &opts)?;
     println!(
         "\nApp {} (id {}) is installed (installation {}).\n  key:      {}\n  settings: {}\n\n\
          Name the settings from the daemon's config:\n\n  [tracker]\n  github_app = \"{}\"",

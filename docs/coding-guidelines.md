@@ -178,6 +178,7 @@ this file.
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
+| `rustls` (dev) | The TLS listener the CA-bundle test (#150) serves a real handshake from | Already in the tree under `ureq`; `default-features = false` with only the `ring` and `std` features, never `aws-lc-rs`, which needs a C toolchain |
 | `rustls-pki-types` | PEM parsing of the GitHub App private key | Already in the tree under `rustls` |
 | `serde`, `serde_json` | Config, `stream-json`, MCP framing, GitHub payloads | |
 | `thiserror` | Typed errors in library modules | |

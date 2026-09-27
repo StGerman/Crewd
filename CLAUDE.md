@@ -267,3 +267,9 @@ sudo xcode-select --switch /Library/Developer/CommandLineTools
 
 `xcode-select --install` does **not** fix this. It installs the Command Line Tools; it does
 not make them active, so the reported symptom is unchanged and the real cause stays hidden.
+
+If every tracker or forge call fails with `invalid peer certificate: UnknownIssuer`, a TLS
+proxy (Netskope, typically) is intercepting the connection with its own root. Set
+`SSL_CERT_FILE` to the proxy's full CA bundle, the same variable curl, Python and Node already
+read for the same problem: crewd trusts exactly the certificates that file names, replacing the
+default roots rather than adding to them (#150).

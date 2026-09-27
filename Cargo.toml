@@ -48,6 +48,13 @@ nix = { version = "0.30", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 insta = "1.48.0"
+# The TLS listener for the CA-bundle test (#150): a real handshake against a self-signed test CA
+# is what proves `RootCerts::Specific` actually replaces the default roots. `default-features =
+# false` plus `ring` keeps `aws-lc-rs` — a C toolchain dependency — out of the tree; `std` is
+# needed for `ServerConfig`. Already in the dependency tree under `ureq`'s own TLS, at the same
+# version (`Cargo.lock` pins both to 0.23.45), so this adds no new crate, only a dev-only feature
+# surface on one already there.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 
 [lints]
 workspace = true

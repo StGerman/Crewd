@@ -43,6 +43,8 @@
 //! A mint costs one more request an hour.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +52,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig, parse_pem};
 
 use super::{Tracker, TrackerError};
 use crate::broker::TrackerWrites;
@@ -109,6 +112,12 @@ pub trait Http: Send + Sync {
 /// The real implementation, over `ureq`. Picked for its blocking API — `Tracker` methods are
 /// synchronous, so an async client would need a runtime handle threaded through for no benefit
 /// — and its default TLS backend is pure-Rust `rustls`, which needs no C toolchain to link.
+///
+/// `Clone` is cheap: `ureq::Agent` is an `Arc`-backed handle to its connection pool, so cloning
+/// this shares one pool and one root-certificate set rather than opening a second (#150) — which
+/// is what lets `main` build one from the environment and hand every tracker, forge and
+/// `GithubApp` a clone instead of each reading `SSL_CERT_FILE` on its own.
+#[derive(Clone)]
 pub struct UreqHttp {
     agent: ureq::Agent,
 }
@@ -118,6 +127,51 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The whole call, connect to last byte of the body. Search and GraphQL answers take seconds;
 /// this is only the ceiling that turns a dead connection into an error.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The variable a Netskope-style TLS-intercepting proxy already makes an operator export for
+/// curl, Python and Node — reused rather than inventing a crewd-specific name (#150).
+const SSL_CERT_FILE: &str = "SSL_CERT_FILE";
+
+/// What can go wrong reading the bundle `SSL_CERT_FILE` names. Kept distinct from
+/// [`HttpTransportError`], which is a request failure: this one is a startup failure, so `main`
+/// can refuse to run rather than hand every tracker poll a client that was never built.
+#[derive(Debug, thiserror::Error)]
+pub enum CaBundleError {
+    #[error("{SSL_CERT_FILE} names {path}, which could not be read: {source}")]
+    Read { path: PathBuf, source: std::io::Error },
+    #[error("{SSL_CERT_FILE} names {path}, which holds no certificate")]
+    NoCertificates { path: PathBuf },
+    #[error("{SSL_CERT_FILE} names {path}, which could not be parsed as a PEM bundle: {source}")]
+    Parse { path: PathBuf, source: ureq::Error },
+}
+
+/// The whole trust store, read from `value` — the standard meaning `SSL_CERT_FILE` already has
+/// for curl, OpenSSL and Python, so `RootCerts::Specific` (which *replaces* ureq's default
+/// WebPki roots rather than adding to them) is the correct behaviour, not a shortcut. Non-
+/// certificate PEM items (a stray private key, a CRL) are ignored rather than refused, the same
+/// tolerance `openssl` extends to a bundle file. Takes the variable's value rather than reading
+/// the environment itself, so a test never has to mutate process-global state to exercise every
+/// branch.
+fn roots_from(value: Option<OsString>) -> Result<Option<Vec<Certificate<'static>>>, CaBundleError> {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    let bytes = std::fs::read(&path)
+        .map_err(|source| CaBundleError::Read { path: path.clone(), source })?;
+    let mut certs = Vec::new();
+    for item in parse_pem(&bytes) {
+        if let PemItem::Certificate(cert) =
+            item.map_err(|source| CaBundleError::Parse { path: path.clone(), source })?
+        {
+            certs.push(cert);
+        }
+    }
+    if certs.is_empty() {
+        return Err(CaBundleError::NoCertificates { path });
+    }
+    Ok(Some(certs))
+}
 
 impl Default for UreqHttp {
     fn default() -> Self {
@@ -130,6 +184,32 @@ impl UreqHttp {
     /// and ureq sets no timeout by default (#176). A call past either bound fails as an
     /// `HttpTransportError`, which the tracker classes as retryable.
     pub fn with_timeouts(connect: Duration, call: Duration) -> Self {
+        Self::build(connect, call, None)
+    }
+
+    /// The one client `main` builds for the whole process (#150): today's default-rooted client
+    /// when `SSL_CERT_FILE` is unset or empty, or one trusting exactly that bundle's certificates
+    /// when it names one — never both, since `ureq` 3's `RootCerts::Specific` replaces the
+    /// default roots rather than extending them. An operator who named a bundle that cannot be
+    /// read, or that holds no certificate, gets that refusal here, at startup, rather than as a
+    /// transport error on the first poll.
+    pub fn from_env() -> Result<Self, CaBundleError> {
+        let value = std::env::var_os(SSL_CERT_FILE);
+        let path = value.clone().map(PathBuf::from);
+        let roots = roots_from(value)?;
+        if let (Some(certs), Some(path)) = (&roots, &path) {
+            // Never the certificates themselves — only the count and the path the operator
+            // already knows they named.
+            tracing::info!(
+                path = %path.display(),
+                certificates = certs.len(),
+                "{SSL_CERT_FILE} set: trusting exactly its certificates instead of the default roots"
+            );
+        }
+        Ok(Self::build(CONNECT_TIMEOUT, CALL_TIMEOUT, roots))
+    }
+
+    fn build(connect: Duration, call: Duration, roots: Option<Vec<Certificate<'static>>>) -> Self {
         // ureq's default turns a non-2xx status into an `Err` that drops the response body and
         // headers — exactly the rate-limit header and body snippet `request()` needs to
         // classify the failure. Disabling it is what makes every status code, not just 2xx,
@@ -140,13 +220,19 @@ impl UreqHttp {
         // retry lands anonymous and burns the 60/hour IP-keyed limit in minutes (#68). `SameHost`
         // keeps the header only when the redirect stays on the same host under HTTPS, which is
         // this case, without weakening the cross-host protection the default exists for.
-        let config = ureq::Agent::config_builder()
+        let mut config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
             .timeout_connect(Some(connect))
-            .timeout_global(Some(call))
-            .build();
-        Self { agent: ureq::Agent::new_with_config(config) }
+            .timeout_global(Some(call));
+        // Left untouched (the `TlsConfig` default, `RootCerts::WebPki`) when `roots` is `None`,
+        // so an unset `SSL_CERT_FILE` really does build the client exactly as before (#150).
+        if let Some(certs) = roots {
+            config = config.tls_config(
+                TlsConfig::builder().root_certs(RootCerts::Specific(Arc::new(certs))).build(),
+            );
+        }
+        Self { agent: ureq::Agent::new_with_config(config.build()) }
     }
 }
 
@@ -1273,5 +1359,141 @@ mod ureq_http_tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the call is still blocked: no timeout bounded it");
         assert!(got.is_err(), "a server that never answers returned {got:?}");
+    }
+}
+
+/// `roots_from` is what `SSL_CERT_FILE` actually drives (#150); it takes the variable's value
+/// as a parameter rather than reading `std::env` itself, exactly so these tests never mutate the
+/// process environment shared with every other test in the binary.
+#[cfg(test)]
+mod ca_bundle_tests {
+    use super::*;
+
+    /// A directory under the OS temp root, unique to this process and this test's thread, so
+    /// concurrently running tests never race on the same path — no `tempfile` dependency needed
+    /// for two throwaway files.
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "crewd-ca-bundle-test-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// insta's `filters` feature is not enabled, so the temp directory — different on every
+    /// run — is swapped for a fixed placeholder before the message is snapshotted.
+    fn redact_tmp(message: &str, dir: &std::path::Path) -> String {
+        message.replace(&dir.display().to_string(), "<tmp>")
+    }
+
+    #[test]
+    fn an_unreadable_ca_bundle_refuses_startup_and_names_the_path() {
+        let dir = unique_temp_dir("missing");
+        let missing = dir.join("bundle.pem");
+        let err = roots_from(Some(missing.into_os_string())).unwrap_err();
+        insta::assert_snapshot!(
+            "a_missing_ca_bundle_refuses_startup_and_names_the_path",
+            redact_tmp(&err.to_string(), &dir)
+        );
+
+        let dir = unique_temp_dir("empty");
+        let empty = dir.join("bundle.pem");
+        std::fs::write(&empty, b"not a certificate\n").unwrap();
+        let err = roots_from(Some(empty.into_os_string())).unwrap_err();
+        insta::assert_snapshot!(
+            "a_ca_bundle_with_no_certificate_refuses_startup_and_names_the_path",
+            redact_tmp(&err.to_string(), &dir)
+        );
+    }
+
+    #[test]
+    fn an_unset_ssl_cert_file_leaves_the_default_roots() {
+        assert!(roots_from(None).unwrap().is_none(), "unset must add no root");
+        assert!(
+            roots_from(Some(OsString::new())).unwrap().is_none(),
+            "empty must add no root, the same as unset"
+        );
+
+        // `roots_from(None)` alone proves nothing about `UreqHttp::build`, which is the type
+        // that decides whether `TlsConfig::builder().root_certs(..)` is ever called at all — so
+        // this pins that a `None` really does leave the agent on the untouched `TlsConfig`
+        // default, `RootCerts::WebPki`, rather than an equivalent-looking `Specific([])`.
+        let http = UreqHttp::build(CONNECT_TIMEOUT, CALL_TIMEOUT, None);
+        assert!(
+            matches!(http.agent.config().tls_config().root_certs(), RootCerts::WebPki),
+            "an unset SSL_CERT_FILE must leave the client builder unchanged"
+        );
+    }
+}
+
+/// A real TLS handshake against a self-signed test CA is what proves `RootCerts::Specific`
+/// actually replaces `ureq`'s default roots rather than merely compiling — a `FakeHttp` test
+/// cannot reach this, the same gap `ureq_http_tests` closes for plain HTTP. Fixtures under
+/// `src/tracker/testdata/tls/` are throwaway test material: an EC P-256 CA (~100-year validity,
+/// key discarded right after signing) and a `localhost`/`127.0.0.1` server certificate it signed,
+/// generated once with the `openssl` CLI and never used outside this test.
+#[cfg(test)]
+mod tls_bundle_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use rustls::ServerConfig;
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    use super::*;
+
+    const CA_CERT_PEM: &[u8] = include_bytes!("testdata/tls/ca-cert.pem");
+    const SERVER_CERT_PEM: &[u8] = include_bytes!("testdata/tls/server-cert.pem");
+    const SERVER_KEY_PEM: &[u8] = include_bytes!("testdata/tls/server-key.pem");
+
+    /// Accepts exactly one TLS connection over `127.0.0.1`, answers a fixed HTTP/1.1 response
+    /// once the handshake completes, then exits — the TLS analogue of `ureq_http_tests::
+    /// serve_once`. A client that refuses the handshake (an untrusted issuer) never completes it,
+    /// so `write_all`'s error there is expected and ignored rather than unwrapped.
+    fn serve_tls_once(response: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let cert = CertificateDer::from_pem_slice(SERVER_CERT_PEM).unwrap();
+            let key = PrivateKeyDer::from_pem_slice(SERVER_KEY_PEM).unwrap();
+            // `ring`, never `aws-lc-rs`, which needs a C toolchain (#150); passed explicitly
+            // rather than installed process-wide, so this test never races another test over
+            // which provider `rustls::crypto::CryptoProvider::install_default` won.
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let (sock, _) = listener.accept().unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 1024];
+            let _ = tls.read(&mut buf); // drives the handshake and drains the request
+            let _ = tls.write_all(response.as_bytes());
+        });
+        port
+    }
+
+    #[test]
+    fn a_server_cert_signed_by_an_extra_ca_is_accepted_only_when_the_bundle_is_set() {
+        const RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+
+        let port = serve_tls_once(RESPONSE);
+        let unbundled = UreqHttp::default().get(&format!("https://localhost:{port}/"), &[]);
+        assert!(
+            unbundled.is_err(),
+            "the default roots must not trust a certificate the test CA signed, got {unbundled:?}"
+        );
+
+        let port = serve_tls_once(RESPONSE);
+        let ca = Certificate::from_pem(CA_CERT_PEM).unwrap();
+        let bundled = UreqHttp::build(CONNECT_TIMEOUT, CALL_TIMEOUT, Some(vec![ca]));
+        let resp = bundled.get(&format!("https://localhost:{port}/"), &[]).unwrap();
+        assert_eq!(resp.status, 200, "the bundle naming the signing CA must be trusted");
     }
 }
