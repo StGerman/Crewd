@@ -217,6 +217,9 @@ Reach for each at the moment named:
   and finish with a guard test that fails without the fix.
 - **`/code-review`**: every pull request before it merges, as well as Copilot's review. It
   catches a second implementation of something that already exists, as on #88.
+- **`/retro`**: a delivery closed, a run was quarantined or handed off, or it is the weekly
+  pass over the last transcripts. It reads the transcript and proposes environment changes as
+  Inbox issues; the operator files them (#182).
 
 Watching a running daemon is `/supervise-crewd`, typed by the operator's session. It is never
 loaded into a dispatched agent.
