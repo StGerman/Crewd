@@ -3088,6 +3088,57 @@ fn a_run_that_finishes_leaves_an_open_pull_request_not_only_a_branch() {
     assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Released);
 }
 
+/// GitHub's `Closes` keyword only closes an issue on that same repo; a Jira ticket's URL under
+/// it is inert, so it would tell a reviewer that merging closes a ticket the merge never
+/// touches. The tracker's own identifier, linked instead, says what the pull request is for
+/// without making a promise GitHub cannot keep.
+#[test]
+fn a_jira_issue_is_linked_rather_than_closed_by_keyword() {
+    let jira_issue = Issue {
+        url: Some("https://your-domain.atlassian.net/browse/PROJ-12".into()),
+        ..issue(1, "In Progress", Some(1))
+    };
+    let (mut h, forge) =
+        delivery_harness(vec![jira_issue], Store::open_in_memory().unwrap(), |_| {});
+
+    run_once(&mut h);
+
+    let prs = forge.open_prs();
+    let spec = forge.spec_of(prs[0].number).unwrap();
+    assert!(
+        spec.body.contains("Issue: [MT-1](https://your-domain.atlassian.net/browse/PROJ-12)"),
+        "linked, not closed: {}",
+        spec.body
+    );
+    assert!(
+        !spec.body.contains("Closes "),
+        "a Jira URL never uses the closing keyword: {}",
+        spec.body
+    );
+}
+
+/// The counterpart to the Jira case above: a GitHub issue's own permalink is the one shape the
+/// closing keyword understands, so it keeps using it.
+#[test]
+fn a_github_issue_still_uses_closes() {
+    let github_issue = Issue {
+        url: Some("https://github.com/StGerman/crewd/issues/99".into()),
+        ..issue(1, "In Progress", Some(1))
+    };
+    let (mut h, forge) =
+        delivery_harness(vec![github_issue], Store::open_in_memory().unwrap(), |_| {});
+
+    run_once(&mut h);
+
+    let prs = forge.open_prs();
+    let spec = forge.spec_of(prs[0].number).unwrap();
+    assert!(
+        spec.body.contains("Closes https://github.com/StGerman/crewd/issues/99"),
+        "a GitHub issue's own permalink still closes it: {}",
+        spec.body
+    );
+}
+
 /// The done bar this project states: a red gate is a `Continue`, never a `Done`. The run said
 /// done; CI disagreed; the issue must go back to an agent with the failure in its prompt rather
 /// than rest as finished.
