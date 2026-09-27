@@ -38,6 +38,29 @@ fn render_inline(nodes: &[Value]) -> String {
     nodes.iter().map(render_node).collect()
 }
 
+/// Node types ADF ever nests directly under `taskItem`, `decisionItem`, or another inline mark
+/// context — never a `paragraph` or other block, so a container holding only these is inline text
+/// rather than a list of blocks.
+const INLINE_NODE_TYPES: [&str; 8] =
+    ["text", "hardBreak", "mention", "emoji", "date", "status", "inlineCard", "mediaInline"];
+
+fn is_inline_node(node: &Value) -> bool {
+    INLINE_NODE_TYPES.contains(&node_type(node))
+}
+
+/// Renders a node's children as one inline run when every child is inline-level, and as blocks one
+/// blank line apart otherwise. Real Jira ADF gives `taskItem` and `decisionItem` inline content
+/// directly rather than paragraph-wrapped, so rendering them with [`render_blocks`] unconditionally
+/// split one line into one paragraph per child; an empty list falls to the block branch so a
+/// vacuous `all` never misreads "no children" as "inline".
+fn render_children(nodes: &[Value]) -> String {
+    if !nodes.is_empty() && nodes.iter().all(is_inline_node) {
+        render_inline(nodes)
+    } else {
+        render_blocks(nodes)
+    }
+}
+
 /// The single dispatch point over every ADF node type this module knows about. One small
 /// function per node family keeps this under the line and parameter limits; an unrecognized
 /// type falls through to [`render_unknown`] so its text is never silently dropped.
@@ -48,6 +71,7 @@ fn render_node(node: &Value) -> String {
         "bulletList" => render_list(node, ListKind::Bullet),
         "orderedList" => render_list(node, ListKind::Ordered),
         "taskList" => render_list(node, ListKind::Task),
+        "decisionList" => render_list(node, ListKind::Bullet),
         "codeBlock" => render_code_block(node),
         "blockquote" | "panel" => render_quote(node),
         "rule" => "---".to_string(),
@@ -67,11 +91,14 @@ fn render_node(node: &Value) -> String {
     }
 }
 
-/// An unrecognized node keeps its descendants' text: block children first, then a plain `text`
-/// field, so a Jira feature this module has not been taught about never disappears silently.
+/// Joining an unrecognized container's block children with no separator glued them onto one
+/// line (`layoutSection`, `bodiedExtension`), so its `content` renders through [`render_children`]
+/// instead — blocks one blank line apart, unless every child is inline-level. Falls back to a
+/// plain `text` field when there is no `content`, so a Jira feature this module has not been
+/// taught about never disappears silently.
 fn render_unknown(node: &Value) -> String {
     match node.get("content").and_then(Value::as_array) {
-        Some(content) => render_inline(content),
+        Some(content) => render_children(content),
         None => node.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
     }
 }
@@ -117,11 +144,13 @@ fn task_marker(item: &Value) -> String {
     }
 }
 
-/// The item's own marker replaces the first line; every following line — including a nested
-/// list's own markers — is indented by the marker's width, so nesting composes without tracking
-/// depth explicitly.
+/// Rendering a `taskItem`/`decisionItem`'s inline content through [`render_blocks`] wrapped each
+/// child in its own paragraph, since real Jira ADF gives them inline children directly rather than
+/// paragraph-wrapped; [`render_children`] tells the two shapes apart. The item's own marker then
+/// replaces the first line, and every following line — including a nested list's own markers — is
+/// indented by the marker's width, so nesting composes without tracking depth explicitly.
 fn render_list_item(item: &Value, marker: &str) -> String {
-    let body = render_blocks(children(item));
+    let body = render_children(children(item));
     if body.is_empty() {
         return marker.trim_end().to_string();
     }
@@ -326,6 +355,10 @@ fn encode_blocks(markdown: &str) -> Vec<Value> {
     blocks
 }
 
+/// A fenced block whose only lines are empty (or that has no lines at all) joins to an empty
+/// string; emitting that as `{"type": "text", "text": ""}` is an empty text node, which Jira's
+/// ADF validator rejects with a 400 and loses the whole comment, so an empty body omits `content`
+/// instead of a code block that carries no text.
 fn encode_code_block<'a>(lang: &str, lines: &mut std::str::Lines<'a>) -> Value {
     let mut code = Vec::new();
     for line in lines.by_ref() {
@@ -334,12 +367,12 @@ fn encode_code_block<'a>(lang: &str, lines: &mut std::str::Lines<'a>) -> Value {
         }
         code.push(line);
     }
-    let content = if code.is_empty() {
-        Vec::new()
+    let text = code.join("\n");
+    let mut node = if text.is_empty() {
+        json!({"type": "codeBlock"})
     } else {
-        vec![json!({"type": "text", "text": code.join("\n")})]
+        json!({"type": "codeBlock", "content": [{"type": "text", "text": text}]})
     };
-    let mut node = json!({"type": "codeBlock", "content": content});
     if !lang.is_empty() {
         node["attrs"] = json!({"language": lang});
     }
@@ -474,7 +507,24 @@ mod tests {
     }
 
     #[test]
-    fn task_items_render_as_checkboxes() {
+    fn a_task_item_holds_inline_content_directly_like_real_jira_adf() {
+        let doc = json!({"type": "doc", "version": 1, "content": [
+            {"type": "taskList", "content": [
+                {"type": "taskItem", "attrs": {"state": "DONE"}, "content": [
+                    {"type": "text", "text": "Fix the "},
+                    {"type": "text", "text": "login", "marks": [{"type": "strong"}]},
+                    {"type": "text", "text": " bug"}
+                ]},
+                {"type": "taskItem", "attrs": {"state": "TODO"}, "content": [
+                    {"type": "text", "text": "still open"}
+                ]}
+            ]}
+        ]});
+        insta::assert_snapshot!(render(&doc));
+    }
+
+    #[test]
+    fn a_paragraph_wrapped_task_item_still_renders_as_a_checkbox() {
         let doc = json!({"type": "doc", "version": 1, "content": [
             {"type": "taskList", "content": [
                 {"type": "taskItem", "attrs": {"state": "DONE"}, "content": [
@@ -489,12 +539,42 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_list_renders_as_a_bullet_list() {
+        let doc = json!({"type": "doc", "version": 1, "content": [
+            {"type": "decisionList", "content": [
+                {"type": "decisionItem", "content": [{"type": "text", "text": "Use Postgres"}]},
+                {"type": "decisionItem", "content": [{"type": "text", "text": "Ship Friday"}]}
+            ]}
+        ]});
+        insta::assert_snapshot!(render(&doc));
+    }
+
+    #[test]
     fn an_unknown_adf_node_keeps_its_text_rather_than_being_dropped() {
         let doc = json!({"type": "doc", "version": 1, "content": [
             {"type": "paragraph", "content": [
                 {"type": "text", "text": "before "},
                 {"type": "fancyWidget", "content": [{"type": "text", "text": "widget text"}]},
                 {"type": "text", "text": " after"}
+            ]}
+        ]});
+        insta::assert_snapshot!(render(&doc));
+    }
+
+    #[test]
+    fn an_unknown_container_keeps_its_blocks_apart() {
+        let doc = json!({"type": "doc", "version": 1, "content": [
+            {"type": "layoutSection", "content": [
+                {"type": "layoutColumn", "attrs": {"width": 50}, "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "left col"}]}
+                ]},
+                {"type": "layoutColumn", "attrs": {"width": 50}, "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "right col"}]}
+                ]}
+            ]},
+            {"type": "bodiedExtension", "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "extension line one"}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": "extension line two"}]}
             ]}
         ]});
         insta::assert_snapshot!(render(&doc));
@@ -525,5 +605,10 @@ mod tests {
         let doc = encode("\n\n```\n```\n\nonly line\n\n\n");
         let dump = serde_json::to_string(&doc).unwrap();
         assert!(!dump.contains("\"text\":\"\""));
+    }
+
+    #[test]
+    fn an_empty_code_fence_encodes_without_an_empty_text_node() {
+        insta::assert_snapshot!(serde_json::to_string_pretty(&encode("```\n\n```")).unwrap());
     }
 }
