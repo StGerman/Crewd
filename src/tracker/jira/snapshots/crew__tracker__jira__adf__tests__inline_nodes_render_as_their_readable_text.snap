@@ -1,0 +1,6 @@
+---
+source: src/tracker/jira/adf.rs
+expression: render(&doc)
+---
+@Jane reacted 👍
+https://example.com/PROJ-1 due 2023-11-14 status [Done]

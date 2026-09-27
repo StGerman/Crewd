@@ -1,0 +1,47 @@
+---
+source: src/tracker/jira/adf.rs
+expression: "serde_json::to_string_pretty(&encode(markdown)).unwrap()"
+---
+{
+  "content": [
+    {
+      "content": [
+        {
+          "text": "first paragraph",
+          "type": "text"
+        },
+        {
+          "type": "hardBreak"
+        },
+        {
+          "text": "still first paragraph",
+          "type": "text"
+        }
+      ],
+      "type": "paragraph"
+    },
+    {
+      "attrs": {
+        "language": "rust"
+      },
+      "content": [
+        {
+          "text": "fn main() {}",
+          "type": "text"
+        }
+      ],
+      "type": "codeBlock"
+    },
+    {
+      "content": [
+        {
+          "text": "last paragraph",
+          "type": "text"
+        }
+      ],
+      "type": "paragraph"
+    }
+  ],
+  "type": "doc",
+  "version": 1
+}

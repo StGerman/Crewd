@@ -1,0 +1,5 @@
+---
+source: src/tracker/jira/adf.rs
+expression: render(&doc)
+---
+before widget text after
