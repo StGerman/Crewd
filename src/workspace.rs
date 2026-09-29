@@ -207,11 +207,19 @@ pub struct GitWorktreeWorkspace {
 /// remote-tracking ref, and the one that loses `cannot lock ref` would be charged a failure (#161).
 pub type FetchLock = Arc<parking_lot::Mutex<()>>;
 
-/// Flags for every fetch of the base: `--no-write-fetch-head` leaves the `FETCH_HEAD` a merge of
-/// the operator's is waiting on, and `--no-auto-gc` stops the detached `git maintenance` that
-/// would otherwise lock `repo` under the next gate or `prepare`.
+/// Flags for every fetch of the base: `--no-write-fetch-head` leaves `repo`'s existing
+/// `FETCH_HEAD` untouched, so a merge the operator has pending still sees the fetch it made, and
+/// `--no-auto-gc` stops the detached `git maintenance` that would otherwise lock `repo` under the
+/// next gate or `prepare`.
 pub(crate) const BASE_FETCH: [&str; 5] =
     ["fetch", "--quiet", "--no-tags", "--no-auto-gc", "--no-write-fetch-head"];
+
+/// `prepare` runs on the scheduler's tick, so a wait here stops `harvest_gates` from timing out
+/// the gate whose fetch holds the lock. Past it, `prepare` fails as a retryable error instead.
+const PREPARE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Aborts a `prepare` fetch whose transfer has stalled, for the same reason: the tick waits on it.
+const PREPARE_FETCH_STALL: [&str; 4] = ["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60"];
 
 /// Where a new branch starts: `base` in `repo`, or `remote`'s copy of it after a fetch. Unset,
 /// a new branch starts from `repo`'s HEAD, the operator's checkout.
@@ -219,6 +227,7 @@ struct StartPoint {
     base: String,
     remote: Option<String>,
     fetch_lock: FetchLock,
+    lock_wait: std::time::Duration,
 }
 
 /// The credential `publish` pushes with when the orchestrator has an identity of its own (#64),
@@ -384,8 +393,8 @@ impl GitWorktreeWorkspace {
         Ok(Self { root, repo, push_auth: None, start: None })
     }
 
-    /// Start a new branch from `base` rather than from `repo`'s HEAD: the operator's checkout,
-    /// which can be any branch, eleven commits behind, as #163's was (#170). With `remote`, from
+    /// Start a new branch from `base` rather than from `repo`'s HEAD, the operator's checkout,
+    /// which can be any branch at any age (#170). With `remote`, from
     /// its copy of `base`, fetched as the gate fetches it and under the gate's `fetch_lock`, so
     /// the branch starts where the gate will measure it and the pull request will merge it.
     pub fn branching_from(
@@ -394,14 +403,15 @@ impl GitWorktreeWorkspace {
         remote: Option<String>,
         fetch_lock: FetchLock,
     ) -> Self {
-        self.start = Some(StartPoint { base: base.into(), remote, fetch_lock });
+        let lock_wait = PREPARE_LOCK_WAIT;
+        self.start = Some(StartPoint { base: base.into(), remote, fetch_lock, lock_wait });
         self
     }
 
     /// The ref a new branch starts from; `None` for `repo`'s HEAD. A failed fetch is an error,
     /// never a fall back to the local ref, which lags until someone pulls (#134).
     fn start_ref(&self) -> Result<Option<String>, WorkspaceError> {
-        let Some(StartPoint { base, remote, fetch_lock }) = &self.start else {
+        let Some(StartPoint { base, remote, fetch_lock, lock_wait }) = &self.start else {
             return Ok(None);
         };
         let Some(remote) = remote else {
@@ -409,14 +419,14 @@ impl GitWorktreeWorkspace {
         };
         let tracking = format!("refs/remotes/{remote}/{base}");
         let refspec = format!("+refs/heads/{base}:{tracking}");
-        let fetched = {
-            let _hold = fetch_lock.lock();
-            self.read_remote(&self.repo, remote, &BASE_FETCH, &refspec)
-        };
-        let reason = match fetched {
-            Ok(Ok(_)) => return Ok(Some(tracking)),
-            Ok(Err(e)) => e.to_string(),
-            Err(e) => e.to_string(),
+        let fetch: Vec<&str> = PREPARE_FETCH_STALL.into_iter().chain(BASE_FETCH).collect();
+        let reason = match fetch_lock.try_lock_for(*lock_wait) {
+            None => format!("another fetch of the base held the lock for {lock_wait:?}"),
+            Some(_hold) => match self.read_remote(&self.repo, remote, &fetch, &refspec) {
+                Ok(Ok(_)) => return Ok(Some(tracking)),
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => e.to_string(),
+            },
         };
         Err(WorkspaceError::BaseFetch { remote: remote.clone(), base: base.clone(), reason })
     }
@@ -1592,6 +1602,33 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Copilot on #194: `prepare` runs on the tick, and a gate's hung fetch holding the lock
+    /// would otherwise stop the tick from ever reaching the gate's timeout.
+    #[test]
+    fn a_base_fetch_lock_held_elsewhere_fails_prepare_rather_than_stalling_the_tick() {
+        let root = tmp_root("wt-lock-held");
+        let (repo, bare) = repo_with_remote("wt-lock-held");
+        let lock = FetchLock::default();
+        let mut ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            lock.clone(),
+        );
+        ws.start.as_mut().unwrap().lock_wait = std::time::Duration::from_millis(50);
+
+        let held = lock.lock();
+        let err = ws.prepare("id-1", "MT-1").unwrap_err();
+        drop(held);
+
+        assert!(matches!(err, WorkspaceError::BaseFetch { .. }), "got {err:?}");
+        assert!(!ws.path_for("id-1", "MT-1").exists());
+        assert!(ws.prepare("id-1", "MT-1").is_ok(), "the retry goes through once it is free");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     /// Without delivery there is no remote to fetch: the local base is the start point.
