@@ -1452,6 +1452,24 @@ pub struct DeliveryRecord {
     /// rather than any provider timestamp; `None` while CI is not pending. See
     /// [`Store::set_ci_pending`].
     pub ci_pending: Option<(String, i64)>,
+    /// The head the last push replaced, while the provider may still report it. See
+    /// [`Store::clear_replaced_head`].
+    pub replaced_head: Option<String>,
+}
+
+/// The head a push left on the remote, and the head it replaced there — `None` when it
+/// replaced none, or the remote already had it.
+#[derive(Debug, Clone, Copy)]
+pub struct PushedHead<'a> {
+    pub sha: &'a str,
+    pub replaced: Option<&'a str>,
+}
+
+impl<'a> PushedHead<'a> {
+    /// A head with no earlier one the provider could still be reporting.
+    pub fn fresh(sha: &'a str) -> Self {
+        Self { sha, replaced: None }
+    }
 }
 
 impl Store {
@@ -1513,12 +1531,12 @@ impl Store {
         pr_number: u64,
         pr_url: &str,
         base: &str,
-        head_sha: &str,
+        head: PushedHead<'_>,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = clock.wall().0;
         conn.execute(
-            "UPDATE delivery SET
+            "UPDATE delivery SET replaced_head = ?7,
                rounds_pr = CASE WHEN pr_number IS ?2 THEN rounds_pr ELSE 0 END,
                review_requested = CASE WHEN pr_number IS ?2 AND head_sha IS ?5
                                        THEN review_requested ELSE 0 END,
@@ -1527,7 +1545,19 @@ impl Store {
                pr_number = ?2, pr_url = ?3, base = ?4, head_sha = ?5, head_pushed_at = ?6,
                stage = 'awaiting', updated_at = ?6
              WHERE issue_id = ?1",
-            params![issue_id, pr_number as i64, pr_url, base, head_sha, now],
+            params![issue_id, pr_number as i64, pr_url, base, head.sha, now, head.replaced],
+        )?;
+        Ok(())
+    }
+
+    /// The provider reported a head other than the one the last push replaced: from here on its
+    /// reads are no longer behind that push, and every head it reports — crewd's, or one the
+    /// operator pushed since — is judged as it stands.
+    pub fn clear_replaced_head(&self, issue_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET replaced_head = NULL WHERE issue_id = ?1",
+            params![issue_id],
         )?;
         Ok(())
     }
@@ -1786,7 +1816,7 @@ impl Store {
 const DELIVERY_SELECT: &str = "SELECT issue_id, stage, pr_number, pr_url, base, head_sha,
     head_pushed_at, review_requested, review_error, rounds_pr, rounds_issue, pending_feedback,
     pending_verdicts, handed_comments, handoff_reason, updated_at, ci_pending_head,
-    ci_pending_since FROM delivery";
+    ci_pending_since, replaced_head FROM delivery";
 
 fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
     Ok(DeliveryRecord {
@@ -1810,6 +1840,7 @@ fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
             (Some(head), Some(since)) => Some((head, since)),
             _ => None,
         },
+        replaced_head: r.get(18)?,
     })
 }
 
@@ -1829,19 +1860,19 @@ mod delivery_tests {
     fn a_new_pull_request_resets_the_per_pr_round_count_but_never_the_per_issue_one() {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
-        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", PushedHead::fresh("aaa")).unwrap();
         assert_eq!(s.open_delivery_round(&c, "iss-1", Some("{}"), None).unwrap(), (1, 1));
         assert_eq!(s.open_delivery_round(&c, "iss-1", Some("{}"), None).unwrap(), (2, 2));
 
         // The same pull request, pushed again: both counts stand.
         s.begin_delivery(&c, "iss-1", None).unwrap();
-        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "bbb").unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", PushedHead::fresh("bbb")).unwrap();
         let d = s.delivery("iss-1").unwrap().unwrap();
         assert_eq!((d.rounds_pr, d.rounds_issue), (2, 2));
 
         // A different pull request: only the per-PR count starts over.
         s.begin_delivery(&c, "iss-1", None).unwrap();
-        s.set_delivery_pr(&c, "iss-1", 8, "u", "master", "ccc").unwrap();
+        s.set_delivery_pr(&c, "iss-1", 8, "u", "master", PushedHead::fresh("ccc")).unwrap();
         let d = s.delivery("iss-1").unwrap().unwrap();
         assert_eq!((d.rounds_pr, d.rounds_issue), (0, 2), "the issue-wide bound must survive");
     }
@@ -1854,16 +1885,16 @@ mod delivery_tests {
     fn a_new_head_on_the_same_pull_request_needs_its_review_requested_again() {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
-        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", PushedHead::fresh("aaa")).unwrap();
         s.set_review_requested(&c, "iss-1", None).unwrap();
         assert!(s.delivery("iss-1").unwrap().unwrap().review_requested);
 
         // The same head pushed again — idempotent — keeps the request.
-        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", PushedHead::fresh("aaa")).unwrap();
         assert!(s.delivery("iss-1").unwrap().unwrap().review_requested, "nothing changed");
 
         // A new head on the same pull request does not.
-        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "bbb").unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", PushedHead::fresh("bbb")).unwrap();
         let d = s.delivery("iss-1").unwrap().unwrap();
         assert!(!d.review_requested, "the reviewer verified against `aaa`, not `bbb`");
         assert!(d.review_error.is_none());

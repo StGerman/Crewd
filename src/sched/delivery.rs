@@ -53,7 +53,7 @@ use crate::forge::{
     summary_review_id,
 };
 use crate::model::{Feedback, Outcome, ReviewVerdict, Verdict};
-use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
+use crate::store::{DeliveryRecord, DeliveryStage, IssueState, PushedHead};
 use crate::worker::{KillResult, Progress, RunHandle};
 
 pub use libcrew::DeliveryView;
@@ -344,9 +344,9 @@ impl Scheduler {
             // After the gate, so anything taken in here reaches the pull request ungated; its CI
             // is what judges it. Pushing without it would be refused by the lease whenever the
             // agent took the commits in by hand, after a conflict the last sync reported.
-            if self.sync_for_delivery(issue_id, &d, &worktree, &branch)?.is_none() {
+            let Some(synced) = self.sync_for_delivery(issue_id, &d, &worktree, &branch)? else {
                 return Ok(());
-            }
+            };
             let default_base = self.cfg.delivery.base.clone();
             let remote = self.cfg.delivery.remote.clone();
             let base = publisher
@@ -389,7 +389,10 @@ impl Scheduler {
                 opened.number,
                 &opened.url,
                 &base,
-                &published.head_sha,
+                PushedHead {
+                    sha: &published.head_sha,
+                    replaced: synced.remote_head().filter(|h| *h != published.head_sha),
+                },
             )?;
             tracing::info!(
                 issue_id, identifier = %st.identifier, pr = opened.number, url = %opened.url, base, head = %published.head_sha,
@@ -399,23 +402,26 @@ impl Scheduler {
             d = self.store.delivery(issue_id)?.ok_or_else(|| {
                 StepError::Other(anyhow::anyhow!("delivery row vanished mid-step"))
             })?;
-            // Re-read rather than trusting `opened`, for mergeability and requested reviewers
-            // on the head the push just moved. The provider's read lags a push by seconds and
-            // can still report the head this push replaced, whose CI and reviews say nothing
-            // about this one (#178): wait a poll rather than judge a head crewd has replaced.
-            let reread = forge.pull_request(opened.number)?;
-            if reread.head_sha != published.head_sha {
-                tracing::debug!(
-                    issue_id, pr = reread.number, pushed = %published.head_sha, reported = %reread.head_sha,
-                    "pull request does not report the pushed head yet; awaiting CI"
-                );
-                return Ok(());
-            }
-            pr = Some(reread);
+            // Re-read rather than trusting `opened`: the head the push just moved is what CI
+            // and review are judged against from here on.
+            pr = Some(forge.pull_request(opened.number)?);
         }
 
         let pr = pr.ok_or_else(|| ForgeError::Permanent("no pull request".into()))?;
         let number = pr.number;
+
+        // The provider's pull-request read lags a push by seconds, for as many polls as it
+        // lags: while it still names the head crewd's push replaced, that head's green CI and
+        // settled reviews say nothing about the pushed one (#178). CI is pending on the pushed
+        // head until the read catches up, so a provider that never does ends at the CI timeout.
+        if let (Some(replaced), Some(pushed)) = (&d.replaced_head, &d.head_sha) {
+            if pr.head_sha == *replaced {
+                tracing::debug!(issue_id, pr = number, pushed = %pushed, reported = %pr.head_sha, "pull request does not report the pushed head yet");
+                let behind = PullRequest { head_sha: pushed.clone(), ..pr };
+                return self.await_ci(issue_id, &d, &behind, &[]);
+            }
+            self.store.clear_replaced_head(issue_id)?;
+        }
 
         // The last run's verdicts, before anything reads the threads: a verdict whose reply
         // has not landed is not settled, and a thread not settled would otherwise be read as
