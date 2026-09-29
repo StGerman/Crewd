@@ -25,15 +25,12 @@
 //!   out, and `AGENTS.md` is a symlink to it. `--always-approve` so a permission prompt
 //!   cannot stall the run. The run row records the `--model` flag that was passed
 //!   (`grok-4.7`); `end.modelUsage` named `grok-4.7-build` for that same run.
-//! * **A `tool_call_update` is not copied whole.** An `in_progress` update repeats the
-//!   command's output so far, and `rawOutput.output` is that text again as a JSON array of
-//!   bytes. Written verbatim, one long command fills the transcript's byte cap and everything
-//!   after it — the gate's feedback, the fix, `end` — is never recorded (#172). The reader
-//!   drops the byte array and writes that output once, when the call completes. `text`,
-//!   `usage`, `end` and `error` are copied through unchanged, because those are what this
-//!   parser reads.
+//! * **A `tool_call_update` is stored once per call** (#172). The latest `in_progress` update
+//!   is held until that call completes or the stream ends, and `rawOutput.output` is dropped.
+//!   `text`, `usage`, `end` and `error` are copied unchanged.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -379,13 +376,15 @@ fn run_reader(
     // Set at the budget, applied only after `wait`. Publishing `Continue` earlier lets the
     // scheduler reuse the worktree while this process is still in it.
     let mut budget_hit = false;
+    // Latest reduced `in_progress` update per call. Written only if the stream ends first (#172).
+    let mut pending_tools: BTreeMap<String, String> = BTreeMap::new();
 
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
         // `raw`, not the reduced line: rewriting what the parser reads would make `text`,
         // `usage`, `end` and `error` disagree with the stream grok emitted (#172).
         if let Some(t) = transcript.as_mut()
-            && let Some(line) = for_transcript(&raw)
+            && let Some(line) = for_transcript(&raw, &mut pending_tools)
         {
             t.write_line(&line);
         }
@@ -460,6 +459,10 @@ fn run_reader(
     let stderr_tail = stderr_thread.join().unwrap_or_default();
     remove_prompt(&prompt_path);
     if let Some(t) = transcript.as_mut() {
+        // A command still `in_progress` when the pipe closes would otherwise leave no tool output (#172).
+        for line in pending_tools.into_values() {
+            t.write_line(&line);
+        }
         let exit = match &status {
             Ok(s) => s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
             Err(e) => format!("wait failed: {e}"),
@@ -498,36 +501,42 @@ fn run_reader(
     state.1.notify_all();
 }
 
-/// The bytes to append for this stream line, or `None` when the line must not be stored.
+/// The line to append, or `None` when this `in_progress` update is held in `pending` (#172).
 ///
-/// An `in_progress` `tool_call_update` repeats the command's output accumulated so far, in
-/// `content`, in `rawOutput.output_for_prompt`, and in `rawOutput.output` as one JSON number
-/// per byte. Writing each one makes a single `cargo test` fill `transcripts.max_bytes_per_run`
-/// and drops the rest of the run, including `end` (#172). The output is kept on the
-/// `completed` update, which carries it again, and the byte array is removed there. Every
-/// other event is returned as it arrived: the parser reads `text`, `usage`, `end` and `error`
-/// from the original line, and the transcript has to show those same bytes.
-fn for_transcript(raw: &str) -> Option<Cow<'_, str>> {
+/// `pending` keeps the latest reduced update per `toolCallId`. A later update for that id
+/// drops it. Any other event is returned as it arrived.
+fn for_transcript<'a>(
+    raw: &'a str,
+    pending: &mut BTreeMap<String, String>,
+) -> Option<Cow<'a, str>> {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return Some(Cow::Borrowed(raw));
     };
     if value.get("type").and_then(|t| t.as_str()) != Some("tool_call_update") {
         return Some(Cow::Borrowed(raw));
     }
-    if value.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+    let id = value.get("toolCallId").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let in_progress = value.get("status").and_then(|s| s.as_str()) == Some("in_progress");
+    let rewritten = strip_output_bytes(&mut value);
+    if in_progress {
+        pending.insert(id, rewritten.unwrap_or_else(|| raw.to_string()));
         return None;
     }
-    let Some(raw_output) = value.get_mut("rawOutput").and_then(|v| v.as_object_mut()) else {
-        return Some(Cow::Borrowed(raw));
-    };
+    pending.remove(&id);
+    match rewritten {
+        Some(line) => Some(Cow::Owned(line)),
+        None => Some(Cow::Borrowed(raw)),
+    }
+}
+
+/// `rawOutput.output` removed, when it is a JSON array. `None` when the line is unchanged.
+fn strip_output_bytes(value: &mut serde_json::Value) -> Option<String> {
+    let raw_output = value.get_mut("rawOutput").and_then(|v| v.as_object_mut())?;
     if !raw_output.get("output").is_some_and(serde_json::Value::is_array) {
-        return Some(Cow::Borrowed(raw));
+        return None;
     }
     raw_output.remove("output");
-    match serde_json::to_string(&value) {
-        Ok(reduced) => Some(Cow::Owned(reduced)),
-        Err(_) => Some(Cow::Borrowed(raw)),
-    }
+    serde_json::to_string(value).ok()
 }
 
 fn outcome_from_text(text: &str, error: Option<&str>) -> Outcome {
@@ -927,6 +936,37 @@ mod tests {
         assert!(!text.contains("[2,2,2]"), "{text}");
         assert!(!text.contains("[3,3,3]"), "{text}");
         assert!(!text.contains("[9,9,9]"), "{text}");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// The call that reaches `completed` keeps that update. The call still `in_progress` when
+    /// the process exits keeps its last update, once, with the byte array gone.
+    #[test]
+    fn an_interrupted_grok_tool_call_keeps_its_last_output_once() {
+        let ws = tmp_workspace("interrupted");
+        let (outcome, text) = run_transcript(fixture("tool_output_interrupted.sh"), &ws);
+        assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }));
+
+        let updates = tool_updates(&text);
+        assert_eq!(updates.len(), 2, "{text}");
+        let done = updates
+            .iter()
+            .find(|v| v.get("toolCallId").and_then(|id| id.as_str()) == Some("call-done"))
+            .expect("completed call");
+        let open = updates
+            .iter()
+            .find(|v| v.get("toolCallId").and_then(|id| id.as_str()) == Some("call-open"))
+            .expect("interrupted call");
+        assert_eq!(done.get("status").and_then(|s| s.as_str()), Some("completed"));
+        assert_eq!(content_text(done), "done output");
+        assert_eq!(open.get("status").and_then(|s| s.as_str()), Some("in_progress"));
+        assert_eq!(content_text(open), "kept once");
+        assert!(done.pointer("/rawOutput/output").is_none());
+        assert!(open.pointer("/rawOutput/output").is_none());
+        assert!(!text.contains("EARLY_DONE"), "{text}");
+        assert!(!text.contains("EARLY_OPEN"), "{text}");
+        assert!(!text.contains("[1,1,1]") && !text.contains("[3,3,3]"), "{text}");
+        assert!(!text.contains("[4,4,4]") && !text.contains("[9,9,9]"), "{text}");
         std::fs::remove_dir_all(&ws).ok();
     }
 

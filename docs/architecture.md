@@ -263,8 +263,8 @@ each `stream-json` line to a per-run file *before* deciding whether the parser h
 — so the `system` and tool-call lines it drops, and the lines it could not parse at all, are
 still there afterwards — then appends how the process exited and what it said on stderr. A
 Grok `tool_call_update` is stored without the repeated `in_progress` output: writing each prefix
-fills the cap before `end` (#172). `text`, `usage`, `end` and `error` stay the bytes that got
-parsed. The
+fills the cap before `end` (#172). The latest of those updates is written when the stream ends
+before `completed`. `text`, `usage`, `end` and `error` stay the bytes that got parsed. The
 path is on the run row (`Store::run`, `runs_for`) and in the dispatch log line and the TUI
 detail pane, so "show me what run X did" needs no knowledge of the layout. Three
 things there are load-bearing and each looks removable: writes are **unbuffered, one per line**,
