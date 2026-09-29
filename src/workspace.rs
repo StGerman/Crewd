@@ -1620,8 +1620,10 @@ mod tests {
     fn advance_remote(bare: &Path, tag: &str) -> String {
         let clone = tmp_root(&format!("clone-{tag}"));
         std::fs::remove_dir_all(&clone).ok();
-        git_out(Path::new("."), &["clone", "-q", bare.to_str().unwrap(), clone.to_str().unwrap()])
-            .unwrap();
+        // `-b main`: the bare remote's HEAD names `init.defaultBranch`, `master` on CI, and a
+        // clone of a HEAD that does not exist commits an orphan that cannot fast-forward `main`.
+        let (bare, clone_str) = (bare.to_str().unwrap(), clone.to_str().unwrap());
+        git_out(Path::new("."), &["clone", "-q", "-b", "main", bare, clone_str]).unwrap();
         git_out(&clone, &["config", "user.email", "test@example.com"]).unwrap();
         git_out(&clone, &["config", "user.name", "test"]).unwrap();
         commit_in(&clone, "upstream.txt", "landed on the base meanwhile");
