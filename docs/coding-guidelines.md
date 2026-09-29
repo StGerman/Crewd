@@ -71,6 +71,11 @@ this file.
   effect. Why: the scheduler tests drive real `Scheduler::tick()` calls with no network, no
   disk and no clock, and a seam without a fake is a path those tests cannot reach. Example:
   `Clock` and `FakeClock` in [src/clock.rs](../src/clock.rs). Check: review.
+- **MUST** fix a divergence between `FakeForge` and the real forge in the fake, and add the
+  scenario that shows it as a case in [src/forge/contract.rs](../src/forge/contract.rs), which
+  runs every case against both. Why: every delivery test in `tests/scheduler.rs` runs against
+  the fake, so a fake that answers differently passes code that fails against GitHub, as the
+  per-branch head on #174 did (#190). Check: review; a case is never skipped for one backend.
 - **MUST** move time through `FakeClock` in scheduler and API tests. `std::thread::sleep` and
   `Instant::now` are allowed only in the tests that drive a real child process or a real
   socket, in [src/worker/claude.rs](../src/worker/claude.rs) and
