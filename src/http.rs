@@ -50,13 +50,15 @@ impl AuthScheme {
     }
 }
 
-/// A credential that could not be read, or a transport failure before a status arrived.
-/// Callers map this onto their own error type, so a tracker and a forge keep the variants
-/// they already classify on.
-#[derive(Debug)]
+/// A second message wrapped around a credential or transport failure would hide the text
+/// callers already classify on. Displaying this is displaying the inner error; callers still
+/// map the variant onto their own type.
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthError {
-    Credential(CredentialError),
-    Transport(HttpTransportError),
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+    #[error(transparent)]
+    Transport(#[from] HttpTransportError),
 }
 
 /// Sends once, and once more with a fresh token when the first answer is 401 and
@@ -71,11 +73,12 @@ pub(crate) fn authed(
     extra: &[(&'static str, String)],
     send: impl Fn(&[(&str, String)]) -> Result<HttpResponse, HttpTransportError>,
 ) -> Result<HttpResponse, AuthError> {
-    let resp = send(&with_authorization(creds, scheme, extra)?).map_err(AuthError::Transport)?;
+    let resp = send(&with_authorization(creds, scheme, extra)?)?;
     if resp.status == 401 && creds.invalidate() {
-        return send(&with_authorization(creds, scheme, extra)?).map_err(AuthError::Transport);
+        send(&with_authorization(creds, scheme, extra)?).map_err(Into::into)
+    } else {
+        Ok(resp)
     }
-    Ok(resp)
 }
 
 fn with_authorization(
@@ -83,7 +86,7 @@ fn with_authorization(
     scheme: AuthScheme,
     extra: &[(&'static str, String)],
 ) -> Result<Vec<(&'static str, String)>, AuthError> {
-    let token = creds.token().map_err(AuthError::Credential)?;
+    let token = creds.token()?;
     let mut headers = Vec::with_capacity(1 + extra.len());
     headers.push(("Authorization", scheme.value(&token)));
     headers.extend(extra.iter().map(|(name, value)| (*name, value.clone())));
