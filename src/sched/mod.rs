@@ -90,7 +90,12 @@ fn log_tracker_failure(context: &str, e: &TrackerError) {
 /// into the conflict again the next time the base moved (#177).
 fn conflict_brief(base: &str, base_sha: &str, paths: &[String], n: u32, max: u32) -> String {
     let mut s = format!(
-        "the handoff gate could not bring the branch onto {base} ({base_sha}): it conflicted in          {} (failure {n} of {max}). It was aborted, so the branch is where you left it. Another          branch appended to the same place; resolve it yourself with `git merge {base_sha}`,          keeping both sides' additions in each conflicted file, and commit the merge. Do not          rebase: the gate merges the base into a branch that has merged it, so a merge keeps          your resolution. Check the result still builds, and finish again.",
+        "the handoff gate could not bring the branch onto {base} ({base_sha}): it conflicted in \
+         {} (failure {n} of {max}). It was aborted, so the branch is where you left it. Another \
+         branch appended to the same place; resolve it yourself with `git merge {base_sha}`, \
+         keeping both sides' additions in each conflicted file, and commit the merge. Do not \
+         rebase: the gate merges the base into a branch that has merged it, so a merge keeps \
+         your resolution. Check the result still builds, and finish again.",
         paths.join(", ")
     );
     if paths.iter().any(|p| p == "src/store/schema.rs") {
