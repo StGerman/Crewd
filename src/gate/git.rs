@@ -1132,6 +1132,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `git merge` succeeds and leaves an edit to a file it does not touch uncommitted, and
+    /// delivery then pushes `HEAD` without it. The already-on-base and rebase dirty-tree tests
+    /// never reach this check.
+    #[test]
+    fn a_dirty_worktree_that_merged_an_older_base_fails_rather_than_merging_without_its_edit() {
+        let (dir, repo, wt) = repo_and_worktree("dirty-older-merge");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        commit(&repo, "first.txt", "first\n", "master moves once");
+        sh_git(&wt, &["merge", "-q", "--no-edit", "master"]);
+        commit(&repo, "second.txt", "second\n", "master moves again, elsewhere");
+        std::fs::write(wt.join("agent.txt"), "uncommitted edit\n").unwrap();
+        std::fs::write(wt.join("scratch.txt"), "untracked\n").unwrap();
+        let before = sh_git(&wt, &["rev-parse", "HEAD"]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        match verdict {
+            Verdict::Failed { step, output, on_base } => {
+                assert_eq!(step, "check the worktree is clean");
+                assert!(output.contains("agent.txt"), "names the edit: {output}");
+                assert!(!output.contains("scratch.txt"), "untracked files pass: {output}");
+                assert!(!on_base, "the merge that would put the branch on the base has not run");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(sh_git(&wt, &["rev-parse", "HEAD"]), before, "the branch must not move");
+        assert!(!wt.join("second.txt").exists(), "the new base must not have been merged");
+        assert_eq!(std::fs::read_to_string(wt.join("agent.txt")).unwrap(), "uncommitted edit\n");
+        assert!(!wt.join("gate-ran").exists(), "the commands do not run on an unshippable tree");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A worktree paused mid-rebase can already sit on the base with a clean status; the
     /// no-rebase path must not run the gate on it and pass what is half a branch.
     #[test]
