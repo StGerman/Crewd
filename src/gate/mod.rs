@@ -62,7 +62,8 @@ pub enum Verdict {
     },
     /// The rebase or merge stopped and could not be aborted: the worktree is still mid-way, so
     /// it is neither the branch the agent left nor a tree any brief describes. A human's,
-    /// always — an agent resumed into it would build on gate state or trip over a second rebase.
+    /// always — an agent resumed into it would build on gate state or trip over a second
+    /// rebase or merge.
     Stuck { step: String, output: String },
     /// A step failed for a reason the agent can act on: a command exited non-zero, the rebase
     /// or merge was refused (a dirty tree, most likely), or a command could not be started.

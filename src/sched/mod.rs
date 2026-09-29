@@ -10,8 +10,8 @@
 //! Two things are called a gate here and they are unrelated: `Config::preflight` gates
 //! *dispatch*, and the handoff gate ([`crate::gate`]) gates a `Done` verdict. `harvest_gates`
 //! is the second one's reconciliation step and runs with the rest of reconciliation, ahead of
-//! preflight, because a run whose branch is mid-rebase must reach a verdict even under a config
-//! typo — otherwise its claim is held for as long as the typo stands.
+//! preflight, because a run whose branch is mid-rebase or mid-merge must reach a verdict even
+//! under a config typo — otherwise its claim is held for as long as the typo stands.
 //!
 //! Deviation from the plan: reconciliation lives here rather than in its own module, because
 //! it mutates the same `running` map as dispatch and splitting it would mean threading the
@@ -864,7 +864,7 @@ impl Scheduler {
                 }
             }
             Verdict::Stuck { step, output } => {
-                tracing::error!(issue_id, identifier, step, "worktree left mid-rebase; blocking");
+                tracing::error!(issue_id, identifier, step, "worktree left unfinished; blocking");
                 Outcome::Blocked { why: format!("the handoff gate is stuck at `{step}`: {output}") }
             }
             Verdict::Failed { step, output, on_base } => {
