@@ -427,12 +427,12 @@ impl GitWorktreeWorkspace {
         Ok((args, Some(file)))
     }
 
-    /// `git <cmd> <where> <refspecs>` in `worktree`, where `where` is the URL and credential
-    /// `publish` pushes with when there is one, and `remote` otherwise. Every read of the remote
-    /// goes through here (#189). A read on the ambient
-    /// credential while the push uses the App's fails wherever only the App can reach the
-    /// repository, and a sync that cannot read leaves the lease refusing a push whose missing
-    /// commits the worktree never got to take in. Retried on a fresh token as a push is.
+    /// A read on the ambient credential while the push uses the App's fails wherever only the App
+    /// can reach the repository, and a sync that cannot read leaves the lease refusing a push
+    /// whose missing commits the worktree never got to take in (#189). Every read of the remote
+    /// goes through here: `git <cmd> <where> <refspecs>` in `worktree`, where `where` is the URL
+    /// and credential `publish` pushes with when there is one, and `remote` otherwise. Retried on
+    /// a fresh token as a push is.
     fn read_remote(
         &self,
         worktree: &Path,
