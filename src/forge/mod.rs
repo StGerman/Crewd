@@ -23,6 +23,8 @@
 //!   one still running. A repository with no CI at all therefore reads as pending forever; the
 //!   scheduler bounds that with a timeout rather than this trait guessing.
 
+#[cfg(test)]
+mod contract;
 pub mod fake;
 pub mod github;
 

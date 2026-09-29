@@ -580,20 +580,3 @@ impl Forge for FakeForge {
             .collect()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Review on #174: the fake answered a sync with the last head *any* branch published, so
-    /// a second issue's push read as the first one's branch moving.
-    #[test]
-    fn a_sync_reports_the_head_its_own_branch_last_published() {
-        let f = FakeForge::new();
-        let at = Path::new("/nowhere");
-        let first = f.publish(at, "crew/a", "origin", "master").unwrap().head_sha;
-        f.publish(at, "crew/b", "origin", "master").unwrap();
-        assert_eq!(f.sync(at, "crew/a", "origin").unwrap(), Synced::Current { remote_head: first });
-        assert_eq!(f.sync(at, "crew/c", "origin").unwrap(), Synced::Absent);
-    }
-}
