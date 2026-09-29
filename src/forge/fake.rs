@@ -110,6 +110,10 @@ struct Inner {
     pushed_heads: HashMap<String, String>,
     /// Every branch `sync` was called for, in order.
     syncs: Vec<String>,
+    /// How many `pull_request` reads after a `publish` still report the head it replaced.
+    lag_reads: u32,
+    /// Per pull request: the head a `publish` replaced, and the stale reads left to serve it.
+    stale: HashMap<u64, (String, u32)>,
 }
 
 pub struct FakeForge {
@@ -266,6 +270,12 @@ impl FakeForge {
         id
     }
 
+    /// GitHub's pull-request endpoint lags a push by seconds (#178): the next `n` reads of a pull
+    /// request a `publish` moved still report the head it replaced.
+    pub fn lag_reads_after_push(&self, n: u32) {
+        self.inner.lock().unwrap().lag_reads = n;
+    }
+
     /// Someone other than the orchestrator moves the head — the operator merging the base in,
     /// or the provider's "Update branch" — so the pull request's head is one no `publish` made.
     pub fn push_head(&self, number: u64, head_sha: &str) {
@@ -408,10 +418,18 @@ impl Publisher for FakeForge {
         g.pushed_heads.insert(branch.to_string(), head_sha.clone());
         // The pull request open for this branch moves with the push, as the real one does. A
         // push is the gate's rebased branch, so it merges again.
+        let lag = g.lag_reads;
+        let mut replaced = Vec::new();
         for rec in g.prs.values_mut() {
             if rec.spec.head == branch && rec.pr.state == PrState::Open {
-                rec.pr.head_sha = head_sha.clone();
+                let old = std::mem::replace(&mut rec.pr.head_sha, head_sha.clone());
+                replaced.push((rec.pr.number, old));
                 rec.pr.mergeable = Some(true);
+            }
+        }
+        if lag > 0 {
+            for (number, old) in replaced {
+                g.stale.insert(number, (old, lag));
             }
         }
         Ok(Published { head_sha, commits: g.commits.clone() })
@@ -499,10 +517,19 @@ impl Forge for FakeForge {
         let mut g = self.inner.lock().unwrap();
         g.pr_reads += 1;
         Self::gate(&g)?;
-        g.prs
+        let mut pr = g
+            .prs
             .get(&number)
             .map(|r| r.pr.clone())
-            .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))
+            .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?;
+        if let Some((old, left)) = g.stale.get_mut(&number) {
+            pr.head_sha = old.clone();
+            *left -= 1;
+            if *left == 0 {
+                g.stale.remove(&number);
+            }
+        }
+        Ok(pr)
     }
 
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError> {

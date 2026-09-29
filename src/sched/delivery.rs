@@ -399,9 +399,19 @@ impl Scheduler {
             d = self.store.delivery(issue_id)?.ok_or_else(|| {
                 StepError::Other(anyhow::anyhow!("delivery row vanished mid-step"))
             })?;
-            // Re-read rather than trusting `opened`: the head the push just moved is what CI
-            // and review are judged against from here on.
-            pr = Some(forge.pull_request(opened.number)?);
+            // Re-read rather than trusting `opened`, for mergeability and requested reviewers
+            // on the head the push just moved. The provider's read lags a push by seconds and
+            // can still report the head this push replaced, whose CI and reviews say nothing
+            // about this one (#178): wait a poll rather than judge a head crewd has replaced.
+            let reread = forge.pull_request(opened.number)?;
+            if reread.head_sha != published.head_sha {
+                tracing::debug!(
+                    issue_id, pr = reread.number, pushed = %published.head_sha, reported = %reread.head_sha,
+                    "pull request does not report the pushed head yet; awaiting CI"
+                );
+                return Ok(());
+            }
+            pr = Some(reread);
         }
 
         let pr = pr.ok_or_else(|| ForgeError::Permanent("no pull request".into()))?;
