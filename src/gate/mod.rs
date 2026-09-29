@@ -5,19 +5,18 @@
 //! green against the base it forked from and unknown against the base it will actually merge
 //! into — and the three defects in issue #21 existed only in that combination, where neither
 //! agent could have seen them. So a `Done` verdict is not applied until the run's branch has
-//! been rebased onto the configured base *and* the gate commands have passed on the rebased
-//! tree, in that order, in the agent's own worktree. The rebase has to come first because a
-//! gate run against a stale base answers a question nobody asked. A branch that already
-//! contains the base's tip is on it and is not rebased: a rebase would drop a merge of the base,
-//! and with it the conflict resolution an agent made that way (#122). For the same reason a
-//! branch that merged an older base is brought up to date by merging the new one, not rebased
-//! back into the conflict its merge settled (#177).
+//! been brought onto the configured base *and* the gate commands have passed on the resulting
+//! tree, in that order, in the agent's own worktree. The base has to come in first because a
+//! gate run against a stale base answers a question nobody asked. How it comes in depends on
+//! the branch: one that already contains the base's tip is left as it is, one that merged an
+//! older base has the new one merged in, and any other is rebased. A rebase drops a merge of
+//! the base, and with it the conflict resolution an agent made that way (#122, #177).
 //!
 //! Like the worker, a gate is a process the scheduler supervises rather than a call it makes:
 //! `cargo test` in a real worktree runs for minutes, and a tick that blocked on it would stall
 //! stall-detection for every other run. [`Gate::start`] returns a handle the scheduler polls;
 //! the claim stays held for as long as the handle is open, so nothing can dispatch a second
-//! agent onto a worktree that is mid-rebase.
+//! agent onto a worktree the gate is rebasing or merging.
 //!
 //! The verdict the scheduler derives from the gate is deliberately three-way. A conflict is a
 //! human's problem — the branch is restored to where the agent left it and the issue parks
@@ -66,7 +65,7 @@ pub enum Verdict {
     /// always — an agent resumed into it would build on gate state or trip over a second rebase.
     Stuck { step: String, output: String },
     /// A step failed for a reason the agent can act on: a command exited non-zero, the rebase
-    /// was refused (a dirty tree, most likely), or a command could not be started at all.
+    /// or merge was refused (a dirty tree, most likely), or a command could not be started.
     /// `step` names which, and `output` is what it said — bounded, tail-first, because a
     /// failing `cargo test` puts its summary at the end.
     Failed {
