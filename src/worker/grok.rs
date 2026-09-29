@@ -25,7 +25,15 @@
 //!   out, and `AGENTS.md` is a symlink to it. `--always-approve` so a permission prompt
 //!   cannot stall the run. The run row records the `--model` flag that was passed
 //!   (`grok-4.7`); `end.modelUsage` named `grok-4.7-build` for that same run.
+//! * **A `tool_call_update` is not copied whole.** An `in_progress` update repeats the
+//!   command's output so far, and `rawOutput.output` is that text again as a JSON array of
+//!   bytes. Written verbatim, one long command fills the transcript's byte cap and everything
+//!   after it — the gate's feedback, the fix, `end` — is never recorded (#172). The reader
+//!   drops the byte array and writes that output once, when the call completes. `text`,
+//!   `usage`, `end` and `error` are copied through unchanged, because those are what this
+//!   parser reads.
 
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -374,8 +382,12 @@ fn run_reader(
 
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
-        if let Some(t) = transcript.as_mut() {
-            t.write_line(&raw);
+        // `raw`, not the reduced line: rewriting what the parser reads would make `text`,
+        // `usage`, `end` and `error` disagree with the stream grok emitted (#172).
+        if let Some(t) = transcript.as_mut()
+            && let Some(line) = for_transcript(&raw)
+        {
+            t.write_line(&line);
         }
         // Past the budget the rest of the stream is discarded, not left unread. Parsing it
         // would let a late `end` invent a token total; dropping the read end fills the pipe
@@ -484,6 +496,38 @@ fn run_reader(
     g.reaped = true;
     drop(g);
     state.1.notify_all();
+}
+
+/// The bytes to append for this stream line, or `None` when the line must not be stored.
+///
+/// An `in_progress` `tool_call_update` repeats the command's output accumulated so far, in
+/// `content`, in `rawOutput.output_for_prompt`, and in `rawOutput.output` as one JSON number
+/// per byte. Writing each one makes a single `cargo test` fill `transcripts.max_bytes_per_run`
+/// and drops the rest of the run, including `end` (#172). The output is kept on the
+/// `completed` update, which carries it again, and the byte array is removed there. Every
+/// other event is returned as it arrived: the parser reads `text`, `usage`, `end` and `error`
+/// from the original line, and the transcript has to show those same bytes.
+fn for_transcript(raw: &str) -> Option<Cow<'_, str>> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Some(Cow::Borrowed(raw));
+    };
+    if value.get("type").and_then(|t| t.as_str()) != Some("tool_call_update") {
+        return Some(Cow::Borrowed(raw));
+    }
+    if value.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+        return None;
+    }
+    let Some(raw_output) = value.get_mut("rawOutput").and_then(|v| v.as_object_mut()) else {
+        return Some(Cow::Borrowed(raw));
+    };
+    if !raw_output.get("output").is_some_and(serde_json::Value::is_array) {
+        return Some(Cow::Borrowed(raw));
+    }
+    raw_output.remove("output");
+    match serde_json::to_string(&value) {
+        Ok(reduced) => Some(Cow::Owned(reduced)),
+        Err(_) => Some(Cow::Borrowed(raw)),
+    }
 }
 
 fn outcome_from_text(text: &str, error: Option<&str>) -> Outcome {
@@ -830,6 +874,195 @@ mod tests {
         let w = GrokWorker::new(fixture("past_the_cap.sh"), vec!["PATH".into()], 0);
         let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
         assert_eq!(wait_for_finish(&h), Outcome::Continue { why: "past the cap".into() });
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    fn run_transcript(bin: PathBuf, ws: &Path) -> (Outcome, String) {
+        let t = crate::transcript::Transcripts::new(&ws.join("transcripts"), 32 << 20, 10).unwrap();
+        let log = t.open("run-1").unwrap();
+        let path = log.path().to_path_buf();
+        let w = GrokWorker::new(bin, vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn { transcript: Some(log), ..Spawn::new(&issue(), ws, 1, &fresh()) });
+        let outcome = wait_for_finish(&h);
+        let text = std::fs::read_to_string(&path).expect("the transcript must be readable");
+        (outcome, text)
+    }
+
+    fn tool_updates(transcript: &str) -> Vec<serde_json::Value> {
+        transcript
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_call_update"))
+            .collect()
+    }
+
+    fn content_text(update: &serde_json::Value) -> String {
+        update
+            .pointer("/content/0/content/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Three `in_progress` snapshots and the `completed` update of one call. Only the completed
+    /// update is stored, and its `rawOutput.output` byte array is gone.
+    #[test]
+    fn a_grok_tool_output_is_stored_once_in_the_transcript() {
+        let ws = tmp_workspace("once");
+        let (outcome, text) = run_transcript(fixture("tool_output_once.sh"), &ws);
+        assert_eq!(outcome, Outcome::Done);
+        assert!(
+            text.lines().any(|l| l == r#"{"type":"tool_call","toolCallId":"call-once","toolName":"run_terminal_command","status":"pending"}"#),
+            "a tool_call is not a tool_call_update and is copied unchanged"
+        );
+
+        let updates = tool_updates(&text);
+        assert_eq!(updates.len(), 1, "in_progress copies must not be stored: {text}");
+        assert_eq!(updates[0].get("status").and_then(|s| s.as_str()), Some("completed"));
+        assert_eq!(content_text(&updates[0]), "alpha beta gamma");
+        assert!(updates[0].pointer("/rawOutput/output").is_none(), "{updates:?}");
+        assert!(!text.contains("EARLY1"), "the first snapshot was stored: {text}");
+        assert!(!text.contains("EARLY2"), "the second snapshot was stored: {text}");
+        assert!(!text.contains("[1,1,1]"), "{text}");
+        assert!(!text.contains("[2,2,2]"), "{text}");
+        assert!(!text.contains("[3,3,3]"), "{text}");
+        assert!(!text.contains("[9,9,9]"), "{text}");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// `text`, `usage`, `end` and `error` are the parser's inputs. Spacing a reserialize would
+    /// drop has to still be in the file, and the verdict has to come from those same bytes.
+    #[test]
+    fn the_events_the_parser_reads_are_copied_to_the_transcript_unchanged() {
+        let ws = tmp_workspace("parser-events");
+        let (outcome, text) = run_transcript(fixture("parser_events.sh"), &ws);
+        assert_eq!(outcome, Outcome::Continue { why: "unchanged".into() });
+        let lines = [
+            r#"{ "type" : "error" , "message" : "overloaded" }"#,
+            r#"{ "type" : "thought" , "data" : "leave this spacing" }"#,
+            r#"{ "type" : "text" , "data" : "CREW_OUTCOME: continue: unchanged" }"#,
+            r#"{ "type" : "usage" , "usage" : {"input_tokens":1} }"#,
+            r#"{ "type" : "end" , "usage" : {"input_tokens":3,"cache_creation_input_tokens":1,"cache_read_input_tokens":2,"output_tokens":4} }"#,
+        ];
+        for line in lines {
+            assert!(text.lines().any(|l| l == line), "missing or rewritten: {line}\n{text}");
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// The #118 recording, plus one update of each shape #172 reduces. Replaying it keeps the
+    /// parser's own lines byte for byte and stores the pinned call's output once.
+    #[test]
+    fn the_recorded_grok_stream_stores_each_tool_update_shape_once() {
+        let ws = tmp_workspace("recorded-shapes");
+        let (outcome, text) = run_transcript(fixture("replay_stream.sh"), &ws);
+        assert_eq!(outcome, Outcome::Continue { why: "probe-fresh".into() });
+
+        let fixture_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok/stream.jsonl");
+        let recorded = std::fs::read_to_string(fixture_path).unwrap();
+        for line in recorded.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = v.get("type").and_then(|t| t.as_str());
+            let in_progress = v.get("status").and_then(|s| s.as_str()) == Some("in_progress");
+            if kind == Some("tool_call_update") && in_progress {
+                assert!(!text.contains(line), "an in_progress update was copied whole");
+                continue;
+            }
+            let has_byte_array = v.pointer("/rawOutput/output").is_some_and(|o| o.is_array());
+            if has_byte_array {
+                assert!(!text.contains(line), "a byte array survived in the transcript");
+            } else {
+                assert!(
+                    text.lines().any(|l| l == line),
+                    "a line the reducer must not touch was dropped or rewritten: {line}"
+                );
+            }
+        }
+
+        let finals: Vec<_> = tool_updates(&text)
+            .into_iter()
+            .filter(|v| content_text(v) == "pin-172-final")
+            .collect();
+        assert_eq!(finals.len(), 1, "the completed pin update: {finals:?}");
+        assert!(finals[0].pointer("/rawOutput/output").is_none());
+        assert_eq!(
+            finals[0].pointer("/rawOutput/output_for_prompt").and_then(|t| t.as_str()),
+            Some("exit: 0\npin-172-final")
+        );
+        assert!(!text.contains("pin-172-partial"), "the in_progress pin was stored");
+        assert!(!text.contains("[172,1,1]"), "the byte-array-only update was stored");
+        for update in tool_updates(&text) {
+            assert!(update.pointer("/rawOutput/output").is_none(), "{update}");
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// One command's output grows across `in_progress` updates, each carrying it in `content`,
+    /// `output_for_prompt` and a `rawOutput.output` byte array (#169). The transcript stays
+    /// under a tenth of that stream, and it still holds `end`.
+    #[test]
+    fn a_long_cargo_test_keeps_the_grok_transcript_under_a_tenth_of_the_unreduced_stream() {
+        let ws = tmp_workspace("cargo-shape");
+        let mut acc = String::new();
+        let mut lines = Vec::new();
+        for i in 1..=25 {
+            acc.push_str(&format!("test batch {i} :: ok {}\n", "x".repeat(800)));
+            let bytes: Vec<u64> = acc.bytes().map(u64::from).collect();
+            lines.push(
+                serde_json::json!({
+                    "type": "tool_call_update",
+                    "toolCallId": "call-cargo",
+                    "status": "in_progress",
+                    "content": [{"type": "content", "content": {"type": "text", "text": &acc}}],
+                    "rawOutput": {
+                        "type": "Bash",
+                        "command": "cargo test",
+                        "output_for_prompt": &acc,
+                        "output": bytes,
+                    }
+                })
+                .to_string(),
+            );
+        }
+        let bytes: Vec<u64> = acc.bytes().map(u64::from).collect();
+        lines.push(
+            serde_json::json!({
+                "type": "tool_call_update",
+                "toolCallId": "call-cargo",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": acc}}],
+                "rawOutput": {
+                    "type": "Bash",
+                    "command": "cargo test",
+                    "output_for_prompt": format!("exit: 0\n{acc}"),
+                    "output": bytes,
+                }
+            })
+            .to_string(),
+        );
+        lines.push(r#"{"type":"text","data":"CREW_OUTCOME: continue: cargo"}"#.to_string());
+        lines.push(r#"{"type":"usage"}"#.to_string());
+        lines.push(
+            r#"{"type":"end","usage":{"input_tokens":2,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#
+                .to_string(),
+        );
+        let raw = lines.join("\n") + "\n";
+        std::fs::write(ws.join("stream.jsonl"), &raw).unwrap();
+
+        let (outcome, text) = run_transcript(fixture("cat_stream.sh"), &ws);
+        assert_eq!(outcome, Outcome::Continue { why: "cargo".into() });
+        assert!(!text.contains("crew_transcript_truncated"), "the cap, not the reducer, shrank it");
+        assert!(text.contains(r#""type":"end""#), "the end of the run was not recorded");
+        assert!(
+            text.len() * 10 < raw.len(),
+            "transcript {} bytes, stream {} bytes",
+            text.len(),
+            raw.len()
+        );
+        let updates = tool_updates(&text);
+        assert_eq!(updates.len(), 1, "the growing snapshots were stored");
+        assert!(updates[0].pointer("/rawOutput/output").is_none());
         std::fs::remove_dir_all(&ws).ok();
     }
 
