@@ -1569,12 +1569,7 @@ fn a_conflict_confined_to_agent_resolvable_paths_is_handed_back_to_the_agent() {
     let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
-    assert!(output.contains("CLAUDE.md"), "which paths: {output}");
-    assert!(output.contains("master"), "onto which base: {output}");
-    assert!(output.contains(&format!("git merge {BASE}")), "by commit, not ref: {output}");
-    assert!(output.contains("aborted") && output.contains("where you left it"), "{output}");
-    assert!(output.contains("1 of 3"), "and how many tries are left: {output}");
-    assert!(!output.contains("RELEASED"), "the migration rule only when schema.rs conflicts");
+    insta::assert_snapshot!("resolvable_conflict_brief", output);
 }
 
 /// A real `GitGate` whose `start` returns only once its verdict is in, so the scheduler sees it
@@ -1674,7 +1669,7 @@ fn a_conflict_brief_with_no_configured_base_names_the_commit_not_head() {
     let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
-    assert!(output.contains(&format!("git merge {BASE}")), "{output}");
+    insta::assert_snapshot!("conflict_brief_with_no_configured_base", output);
     assert!(!output.contains("git merge HEAD"), "{output}");
 }
 
