@@ -286,6 +286,17 @@ fn classify_push(remote: &str, branch: &str, text: &str) -> ForgeError {
     }
 }
 
+/// A failed `read_remote`: a refused credential is permanent for the reason it is in
+/// [`classify_push`], and anything else is the network.
+fn classify_read(what: String, e: &WorkspaceError) -> ForgeError {
+    let text = e.to_string();
+    if is_auth_refusal(&text) {
+        ForgeError::Permanent(format!("{what}: the remote refused the credential: {text}"))
+    } else {
+        ForgeError::Transient(format!("{what}: {text}"))
+    }
+}
+
 /// What git prints when the remote refused the credential it sent: `Authentication failed` is
 /// git's own wording for a 401 over HTTPS, and `Invalid username or token` is GitHub's.
 pub(crate) fn is_auth_refusal(stderr: &str) -> bool {
@@ -778,7 +789,7 @@ impl Publisher for GitWorktreeWorkspace {
         let lease_ref = Self::lease_ref(branch);
         let listed = self
             .read_remote(worktree, remote, &["ls-remote", "--heads"], &[&full])?
-            .map_err(|e| ForgeError::Transient(format!("reading {remote}/{branch}: {e}")))?;
+            .map_err(|e| classify_read(format!("reading {remote}/{branch}"), &e))?;
         if listed.is_empty() {
             // A lease left from a branch since deleted (merged, or by hand) would make the push
             // that recreates it expect a head the remote no longer has, and be refused forever.
@@ -789,7 +800,7 @@ impl Publisher for GitWorktreeWorkspace {
         // Into `FETCH_HEAD`, which is per worktree, rather than any shared ref a fetch in
         // `workspace.repo` could also move.
         self.read_remote(worktree, remote, &["fetch", "--quiet"], &[&full])?
-            .map_err(|e| ForgeError::Transient(format!("fetching {remote}/{branch}: {e}")))?;
+            .map_err(|e| classify_read(format!("fetching {remote}/{branch}"), &e))?;
         let remote_head = Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"])
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
         let is_ancestor =
@@ -909,7 +920,7 @@ impl Publisher for GitWorktreeWorkspace {
         // transient the push after it would hit.
         let heads = self
             .read_remote(worktree, remote, &["ls-remote", "--heads"], &[])?
-            .map_err(|e| ForgeError::Transient(format!("listing {remote}'s branches: {e}")))?;
+            .map_err(|e| classify_read(format!("listing {remote}'s branches"), &e))?;
         let on_remote: HashSet<&str> = heads
             .lines()
             .filter_map(|l| l.split_once('\t'))
@@ -1807,8 +1818,7 @@ mod tests {
         }
     }
 
-    /// #189: with an App credential, `stacked_on` listed the operator's remote, which a host
-    /// with only the App's access cannot reach, and failed as a transient on every poll.
+    /// #189.
     #[test]
     fn stacked_on_lists_the_remote_with_the_push_credential() {
         let root = tmp_root("wt-stack-app");
@@ -1838,8 +1848,7 @@ mod tests {
         }
     }
 
-    /// #189: with an App credential, `publish` fetched the base through the operator's remote,
-    /// and where that fails it measured against a stale base and over-listed the commits.
+    /// #189.
     #[test]
     fn publish_fetches_the_base_with_the_push_credential() {
         let root = tmp_root("wt-publish-base-app");
@@ -1959,6 +1968,16 @@ mod tests {
             classify_push("origin", "crew/x", "Could not resolve host: github.com").retryable(),
             "the network is still transient"
         );
+    }
+
+    #[test]
+    fn a_read_refused_for_authentication_after_its_retry_is_permanent() {
+        let git =
+            |stderr: &str| WorkspaceError::Git { args: "ls-remote".into(), stderr: stderr.into() };
+        let refused = git("fatal: Authentication failed for 'https://github.com/o/r/'");
+        assert!(matches!(classify_read("listing".into(), &refused), ForgeError::Permanent(_)));
+        let offline = git("Could not resolve host: github.com");
+        assert!(classify_read("listing".into(), &offline).retryable(), "the network is transient");
     }
 
     #[test]
