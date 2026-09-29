@@ -108,7 +108,9 @@ fn git(at: &Path, args: &[&str]) {
 }
 
 /// Review on #174: the fake answered a sync with the last head *any* branch published, so a
-/// second issue's push read as the first one's branch moving.
+/// second issue's push read as the first one's branch moving. With `FakeForge::sync` put back
+/// as it was before `5a26b3d`, the fake fails this case: `Current { remote_head: "sha-0002" }`
+/// where the real forge answers with the first branch's own `"sha-0001"`.
 fn a_sync_reports_the_head_its_own_branch_last_published(b: &dyn PublisherBackend) {
     let p = b.publisher();
     let (at_a, a) = b.branch_with_work("MT-1");
