@@ -26,7 +26,7 @@ pub struct GateScript {
 
 impl GateScript {
     pub fn passes_in(ms: u64) -> Self {
-        Self { duration_ms: ms, verdict: Verdict::Passed { rebased: true } }
+        Self { duration_ms: ms, verdict: Verdict::Passed { base_updated: true } }
     }
 
     pub fn with_verdict(mut self, v: Verdict) -> Self {
@@ -36,7 +36,7 @@ impl GateScript {
 
     /// Never finishes on its own — a `cargo test` that hangs.
     pub fn hangs() -> Self {
-        Self { duration_ms: u64::MAX, verdict: Verdict::Passed { rebased: false } }
+        Self { duration_ms: u64::MAX, verdict: Verdict::Passed { base_updated: false } }
     }
 }
 

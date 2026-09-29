@@ -309,7 +309,7 @@ impl GateRun {
                 };
             }
         }
-        let rebased = if contains_base {
+        let base_updated = if contains_base {
             // Skipping the rebase skips its refusal of a dirty tree too, and delivery pushes
             // `HEAD` alone: a tracked edit left uncommitted would pass the gate and never ship.
             if let Some(verdict) = self.uncommitted(ws, true) {
@@ -335,7 +335,7 @@ impl GateRun {
                 Err(verdict) => return verdict,
             }
         };
-        tracing::debug!(issue = %self.identifier, base = base_label, rebased, "branch is on the base");
+        tracing::debug!(issue = %self.identifier, base = base_label, base_updated, "branch is on the base");
 
         for argv in &self.commands {
             if self.killed() {
@@ -347,7 +347,7 @@ impl GateRun {
                 return Verdict::Failed { step, output, on_base: true };
             }
         }
-        Verdict::Passed { rebased }
+        Verdict::Passed { base_updated }
     }
 
     /// Fetch `base` into `refs/remotes/<remote>/<base>`. Resolving the local ref instead passed
@@ -786,7 +786,7 @@ mod tests {
         );
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert_eq!(verdict, Verdict::Passed { rebased: true });
+        assert_eq!(verdict, Verdict::Passed { base_updated: true });
         assert!(wt.join("from_master.txt").exists(), "the worktree must now sit on master's tip");
         assert!(wt.join("agent.txt").exists(), "with the agent's commit replayed on top");
         assert!(wt.join("gate-ran").exists(), "and the gate must actually have run");
@@ -820,7 +820,7 @@ mod tests {
         );
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert_eq!(verdict, Verdict::Passed { rebased: false });
+        assert_eq!(verdict, Verdict::Passed { base_updated: false });
         assert_eq!(sh_git(&wt, &["rev-parse", "HEAD"]), merged, "the merge commit must survive");
         assert_eq!(std::fs::read_to_string(wt.join("base.txt")).unwrap(), "both versions\n");
         assert!(wt.join("gate-ran").exists(), "the commands still run on the merged branch");
@@ -912,7 +912,7 @@ mod tests {
         let gate = GitGate::new(&repo, Some("master".into()), vec![]).with_remote("origin");
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert!(matches!(verdict, Verdict::Passed { rebased: true }), "{verdict:?}");
+        assert!(matches!(verdict, Verdict::Passed { base_updated: true }), "{verdict:?}");
         assert_eq!(std::fs::read_to_string(repo.join(".git/FETCH_HEAD")).unwrap(), sentinel);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1199,7 +1199,7 @@ mod tests {
         let gate = GitGate::new(&repo, Some("master".into()), vec![]);
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert_eq!(verdict, Verdict::Passed { rebased: true });
+        assert_eq!(verdict, Verdict::Passed { base_updated: true });
         assert!(wt.join("second.txt").exists(), "the branch must now sit on master's tip");
         assert_eq!(std::fs::read_to_string(wt.join("base.txt")).unwrap(), "both versions\n");
         assert!(
@@ -1221,7 +1221,7 @@ mod tests {
         let gate = GitGate::new(&repo, Some("master".into()), vec![]);
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert_eq!(verdict, Verdict::Passed { rebased: true });
+        assert_eq!(verdict, Verdict::Passed { base_updated: true });
         let master = sh_git(&repo, &["rev-parse", "master"]);
         assert_eq!(sh_git(&wt, &["rev-parse", "HEAD^"]), master, "replayed onto master's tip");
         assert_eq!(sh_git(&wt, &["rev-list", "--merges", "HEAD"]), "", "and no merge made");
@@ -1434,7 +1434,7 @@ mod tests {
         let gate = GitGate::new(&repo, None, vec![]);
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert_eq!(verdict, Verdict::Passed { rebased: true });
+        assert_eq!(verdict, Verdict::Passed { base_updated: true });
         assert!(wt.join("from_master.txt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);

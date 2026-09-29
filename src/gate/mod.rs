@@ -49,7 +49,7 @@ pub enum Verdict {
     Passed {
         /// True when a rebase moved commits or a merge brought the base in, false when the
         /// branch was already current. For the log; the scheduler treats both the same.
-        rebased: bool,
+        base_updated: bool,
     },
     /// The rebase or merge stopped on conflicts and was aborted, so the branch is exactly where
     /// the agent left it: green against the old base, and safe for a human to pick up.
@@ -83,9 +83,9 @@ pub enum Verdict {
         /// was rebased describes a tree the agent will not find, and an agent that cannot
         /// reconcile the instruction with what it sees tends to report `Done` again unchanged.
         ///
-        /// Distinct from [`Verdict::Passed`]'s `rebased`, which answers a different question —
-        /// whether the rebase *moved* anything. A branch already on the base is `rebased:
-        /// false` there and `on_base: true` here.
+        /// Distinct from [`Verdict::Passed`]'s `base_updated`, which answers a different
+        /// question — whether a rebase or merge *moved* anything. A branch already on the base
+        /// is `base_updated: false` there and `on_base: true` here.
         on_base: bool,
     },
 }

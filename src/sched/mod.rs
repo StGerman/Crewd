@@ -823,8 +823,8 @@ impl Scheduler {
                 );
                 Outcome::Done
             }
-            Verdict::Passed { rebased } => {
-                tracing::info!(issue_id, identifier, rebased, "gate passed on the base");
+            Verdict::Passed { base_updated } => {
+                tracing::info!(issue_id, identifier, base_updated, "gate passed on the base");
                 Outcome::Done
             }
             Verdict::Conflict { paths, base_sha }
