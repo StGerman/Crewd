@@ -38,11 +38,10 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::clock::{Clock, Wall};
 use crate::forge::ForgeError;
+use crate::http::{Http, HttpResponse};
 use crate::tracker::TrackerError;
-use crate::tracker::github::{Http, HttpResponse};
 
 const API_BASE: &str = "https://api.github.com";
-const API_VERSION: &str = "2022-11-28";
 /// A token this close to expiry is re-minted: one handed out with seconds left would expire in
 /// flight on a paginated poll and reach the scheduler as a 401.
 pub const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
@@ -363,12 +362,8 @@ impl<H: Http> GithubApp<H> {
 
     fn mint(&self, now: Wall) -> Result<Cached, CredentialError> {
         let url = format!("{API_BASE}/app/installations/{}/access_tokens", self.installation_id);
-        let headers = [
-            ("Authorization", format!("Bearer {}", self.jwt(now)?)),
-            ("Accept", "application/vnd.github+json".to_string()),
-            ("X-GitHub-Api-Version", API_VERSION.to_string()),
-            ("User-Agent", "crewd".to_string()),
-        ];
+        let mut headers = crate::http::github_rest_headers();
+        headers.insert(0, ("Authorization", format!("Bearer {}", self.jwt(now)?)));
         let resp = self
             .http
             .send_json("POST", &url, &headers, b"{}")
@@ -438,7 +433,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::clock::FakeClock;
-    use crate::tracker::github::HttpTransportError;
+    use crate::http::HttpTransportError;
 
     /// A throwaway key generated for the test, never the operator's.
     pub(crate) fn throwaway_key(dir: &Path) -> PathBuf {

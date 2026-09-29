@@ -1,6 +1,6 @@
 //! Shared `FakeHttp` for tracker adapters' tests (#99).
 //!
-//! `GithubTracker` and `JiraTracker` both talk to the same [`super::github::Http`] seam, so one
+//! `GithubTracker` and `JiraTracker` both talk to the same [`crate::http::Http`] seam, so one
 //! scripted queue of responses serves both test modules instead of each declaring its own.
 
 use std::collections::VecDeque;
@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use super::github::{Http, HttpResponse, HttpTransportError};
+use crate::http::{Http, HttpResponse, HttpTransportError};
 
 pub(crate) struct FakeHttp {
     inner: Mutex<FakeHttpInner>,

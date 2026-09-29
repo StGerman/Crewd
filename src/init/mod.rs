@@ -33,7 +33,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::broker::server::Limits;
 use crate::clock::Clock;
-use crate::tracker::github::Http;
+use crate::http::Http;
 
 pub const SETTINGS_FILE: &str = "github-app.toml";
 pub const KEY_FILE: &str = "github-app.pem";

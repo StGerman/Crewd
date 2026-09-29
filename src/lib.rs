@@ -12,6 +12,7 @@ pub mod config;
 pub mod credentials;
 pub mod forge;
 pub mod gate;
+pub mod http;
 pub mod init;
 pub mod model;
 pub mod project;

@@ -19,13 +19,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::clock::Wall;
-use crate::tracker::github::{Http, HttpResponse};
+use crate::http::{Http, HttpResponse};
 
 use super::InitError;
 use super::manifest::PERMISSIONS;
 
 pub const API_BASE: &str = "https://api.github.com";
-const API_VERSION: &str = "2022-11-28";
 
 /// A private key in PEM form. Its `Debug` is what keeps it out of a `?`-formatted log field.
 pub struct Pem(String);
@@ -54,11 +53,7 @@ pub struct Converted {
 }
 
 fn headers(auth: Option<String>) -> Vec<(&'static str, String)> {
-    let mut h = vec![
-        ("Accept", "application/vnd.github+json".to_string()),
-        ("X-GitHub-Api-Version", API_VERSION.to_string()),
-        ("User-Agent", "crewd".to_string()),
-    ];
+    let mut h = crate::http::github_rest_headers();
     if let Some(token) = auth {
         h.push(("Authorization", format!("Bearer {token}")));
     }

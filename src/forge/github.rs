@@ -1,9 +1,9 @@
 //! `Forge` against real GitHub pull requests, reviews, checks and review-comment threads.
 //!
-//! Reuses the `Http` seam [`crate::tracker::github`] already defined for the tracker adapter
-//! rather than declaring a second one — a GET and an authenticated JSON write are the same
-//! two primitives whether the caller is reading issues or pull requests, and a second trait
-//! would just be a second place for the ureq-vs-fake split to drift. `GithubForge<H: Http>`
+//! Reuses the [`Http`](crate::http::Http) seam every adapter shares (#181) rather than
+//! declaring a second one — a GET and an authenticated JSON write are the same two primitives
+//! whether the caller is reading issues or pull requests, and a second trait would just be a
+//! second place for the ureq-vs-fake split to drift. `GithubForge<H: Http>`
 //! carries its own credential rather than borrowing `GithubTracker`'s, because a forge and a
 //! tracker are different providers on every platform except this one, and this adapter should
 //! not assume otherwise.
@@ -32,10 +32,9 @@ use super::{
     ReviewComment,
 };
 use crate::credentials::{Credentials, StaticToken};
-use crate::tracker::github::{Http, HttpResponse, HttpTransportError};
+use crate::http::{self, AuthScheme, Http, HttpResponse, HttpTransportError};
 
 const API_BASE: &str = "https://api.github.com";
-const API_VERSION: &str = "2022-11-28";
 const PER_PAGE: u32 = 100;
 /// Bound on [`CiFailure::detail`] — it lands in an agent's prompt, and a raw job log can run
 /// to megabytes. Kept as the tail rather than the head, because a compiler error sits at the
@@ -309,31 +308,12 @@ impl<H: Http> GithubForge<H> {
         self
     }
 
-    fn headers(&self) -> Result<Vec<(&'static str, String)>, ForgeError> {
-        Ok(vec![
-            ("Authorization", format!("Bearer {}", self.creds.token()?)),
-            ("Accept", "application/vnd.github+json".to_string()),
-            ("X-GitHub-Api-Version", API_VERSION.to_string()),
-            ("User-Agent", "crewd".to_string()),
-        ])
-    }
-
-    /// Sends once, and once more with a fresh token if the first was refused with a 401: an
-    /// installation token revoked before its expiry would otherwise read as a permanent auth
-    /// failure and hand delivery off, though the next mint would have worked. A refused request
-    /// was not applied, so repeating it is safe; a second 401 is the credential really being
-    /// wrong, and stands.
     fn authed(
         &self,
         send: impl Fn(&[(&str, String)]) -> Result<HttpResponse, HttpTransportError>,
     ) -> Result<HttpResponse, ForgeError> {
-        let transport =
-            |e: HttpTransportError| ForgeError::Transient(format!("transport error: {}", e.0));
-        let resp = send(&self.headers()?).map_err(transport)?;
-        if resp.status == 401 && self.creds.invalidate() {
-            return send(&self.headers()?).map_err(transport);
-        }
-        Ok(resp)
+        http::authed(self.creds.as_ref(), AuthScheme::Bearer, &http::github_rest_headers(), send)
+            .map_err(Into::into)
     }
 
     /// One authenticated GET, classified onto [`ForgeError`].
@@ -526,7 +506,7 @@ impl<H: Http> Forge for GithubForge<H> {
             "{API_BASE}/repos/{}/{}/pulls?state=open&head={}&per_page=1",
             self.owner,
             self.repo,
-            urlencode(&head_qualifier)
+            http::percent_encode(&head_qualifier)
         );
         let existing: Vec<GhPullRequest> = self.get_json(&list_url)?;
         if let Some(gh) = existing.into_iter().next() {
@@ -797,19 +777,6 @@ fn cap_tail(s: String, max_bytes: usize) -> String {
     s[start..].to_string()
 }
 
-/// The only characters this adapter ever puts in a query value: an owner/branch qualifier for
-/// `head=`. Covers exactly that rather than pulling in a general-purpose URL crate.
-fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            other => format!("%{:02X}", other as u32),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -817,7 +784,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::tracker::github::HttpTransportError;
+    use crate::http::HttpTransportError;
 
     struct FakeHttp {
         inner: Mutex<FakeHttpInner>,
