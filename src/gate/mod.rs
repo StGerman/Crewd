@@ -44,7 +44,7 @@ pub enum Verdict {
     /// The branch holds nothing the base does not. There is nothing to hand off, so there is
     /// nothing to rebase and nothing worth gating; the run's `Done` stands as it was.
     NoCommits,
-    /// Rebased onto the base — or already on top of it — and every command exited zero.
+    /// Brought onto the base — or already on it — and every command exited zero.
     Passed {
         /// True when a rebase moved commits or a merge brought the base in, false when the
         /// branch was already current. For the log; the scheduler treats both the same.
@@ -54,8 +54,8 @@ pub enum Verdict {
     /// the agent left it: green against the old base, and safe for a human to pick up.
     Conflict {
         paths: Vec<String>,
-        /// The commit the rebase was attempted onto, resolved in `workspace.repo`. Carried
-        /// because a brief that names the base by ref sends the agent to rebase onto whatever
+        /// The commit the gate tried to bring the branch onto, resolved in `workspace.repo`.
+        /// Carried because a brief that names the base by ref sends the agent to merge whatever
         /// that ref means *in its worktree* — and with `gate.base` unset that is `HEAD`, the
         /// agent's own branch, a no-op that leaves the conflict to recur.
         base_sha: String,
