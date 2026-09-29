@@ -293,17 +293,23 @@ impl GateRun {
             // request would be answered by starting a rebase.
             return stopped("check the branch against the base", false);
         }
-        let rebased = if contains_base {
-            // A rebase paused cleanly — an `exec` stop, a resolution committed by hand — leaves
-            // `HEAD` a replayed commit on the base and nothing for `status` to report, and would
-            // otherwise be handed off with the rest of the branch never replayed.
-            if self.rebase_in_progress(ws) {
+        // A rebase or merge the agent left unfinished is neither the branch it committed nor one
+        // the gate may start another on: a rebase paused cleanly leaves `HEAD` a replayed commit
+        // on the base, handed off with the rest never replayed, and one this gate started and
+        // aborted would abort the agent's too, reporting its unresolved paths as a new conflict.
+        for (what, in_progress) in
+            [("rebase", self.rebase_in_progress(ws)), ("merge", self.merge_in_progress(ws))]
+        {
+            if in_progress {
                 return Verdict::Stuck {
                     step: "check the branch against the base".into(),
-                    output: "the worktree is in the middle of a rebase that was never finished"
-                        .into(),
+                    output: format!(
+                        "the worktree is in the middle of a {what} that was never finished"
+                    ),
                 };
             }
+        }
+        let rebased = if contains_base {
             // Skipping the rebase skips its refusal of a dirty tree too, and delivery pushes
             // `HEAD` alone: a tracked edit left uncommitted would pass the gate and never ship.
             if let Some(verdict) = self.uncommitted(ws, true) {
@@ -313,13 +319,6 @@ impl GateRun {
         } else if self.merged_the_base(ws, &base_sha) {
             if self.killed() {
                 return stopped("check the branch for a merge of the base", false);
-            }
-            if self.rebase_in_progress(ws) {
-                return Verdict::Stuck {
-                    step: "check the branch for a merge of the base".into(),
-                    output: "the worktree is in the middle of a rebase that was never finished"
-                        .into(),
-                };
             }
             // A merge leaves uncommitted edits to files it does not touch where they are, and
             // delivery pushes `HEAD` alone.
@@ -1226,6 +1225,28 @@ mod tests {
         let master = sh_git(&repo, &["rev-parse", "master"]);
         assert_eq!(sh_git(&wt, &["rev-parse", "HEAD^"]), master, "replayed onto master's tip");
         assert_eq!(sh_git(&wt, &["rev-list", "--merges", "HEAD"]), "", "and no merge made");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worktree the agent left mid-merge is not the gate's to abort: aborting it would throw
+    /// away the agent's merge and report its unresolved paths as a conflict the gate raised.
+    #[test]
+    fn a_worktree_left_mid_merge_is_stuck_rather_than_aborted() {
+        let (dir, repo, wt) = repo_and_worktree("left-mid-merge");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&repo, "base.txt", "master's version\n", "master edits base");
+        assert!(git(&wt, &["merge", "-q", "master"]).is_err(), "the merge must conflict");
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        assert!(matches!(verdict, Verdict::Stuck { .. }), "{verdict:?}");
+        assert!(
+            git(&wt, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_ok(),
+            "the agent's merge must be left as it was"
+        );
+        assert!(!wt.join("gate-ran").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
