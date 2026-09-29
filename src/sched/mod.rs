@@ -79,22 +79,18 @@ fn log_tracker_failure(context: &str, e: &TrackerError) {
     }
 }
 
-/// The continuation brief for a conflict handed back to the agent (#111). It says the rebase
+/// The continuation brief for a conflict handed back to the agent (#111). It says the attempt
 /// was aborted because an agent told otherwise goes looking for a half-finished rebase that is
 /// not there; and it names the migration rule for `schema.rs` because the obvious resolution —
 /// keep both sides' v<N> — edits a released migration, which the gate's own `cargo test` would
 /// then fail on, spending a try on a rule the brief could have stated. The commands name the
 /// commit, not the ref: a ref resolves in the agent's worktree, where an unset base's `HEAD` is
-/// the agent's own branch. It offers a merge as well as a rebase because the gate accepts a
-/// branch that already contains the base without rebasing it (#122).
+/// the agent's own branch. It names a merge and only a merge because that is what the gate does
+/// next with a branch that has merged the base; a resolution made by rebasing would be replayed
+/// into the conflict again the next time the base moved (#177).
 fn conflict_brief(base: &str, base_sha: &str, paths: &[String], n: u32, max: u32) -> String {
     let mut s = format!(
-        "the handoff gate's rebase onto {base} ({base_sha}) conflicted in {} (failure {n} of \
-         {max}). The rebase was aborted, so the branch is where you left it. Another branch \
-         appended to the same place; resolve it yourself, either way: `git rebase {base_sha}` \
-         and `git rebase --continue`, or `git merge {base_sha}` and commit — keeping both \
-         sides' additions in each conflicted file. Check the result still builds, and finish \
-         again.",
+        "the handoff gate could not bring the branch onto {base} ({base_sha}): it conflicted in          {} (failure {n} of {max}). It was aborted, so the branch is where you left it. Another          branch appended to the same place; resolve it yourself with `git merge {base_sha}`,          keeping both sides' additions in each conflicted file, and commit the merge. Do not          rebase: the gate merges the base into a branch that has merged it, so a merge keeps          your resolution. Check the result still builds, and finish again.",
         paths.join(", ")
     );
     if paths.iter().any(|p| p == "src/store/schema.rs") {
@@ -830,7 +826,7 @@ impl Scheduler {
                 if gate::agent_resolvable(&paths, &self.cfg.gate.agent_resolvable) =>
             {
                 let base = base.unwrap_or("the repository HEAD");
-                let step = format!("rebase onto {base}");
+                let step = format!("bring the branch onto {base}");
                 let detail = format!("conflicts in {}", paths.join(", "));
                 self.gate_failure(issue_id, identifier, &step, &detail, |n, max| {
                     conflict_brief(base, &base_sha, &paths, n, max)
@@ -842,7 +838,7 @@ impl Scheduler {
                     issue_id,
                     identifier,
                     ?paths,
-                    "rebase conflicts; blocking for a human"
+                    "conflicts with the base; blocking for a human"
                 );
                 // Queued for whichever run a human's unblocking dispatches next: `last_error`
                 // reaches the dashboard, not the prompt, and without this the resumed session
@@ -856,7 +852,7 @@ impl Scheduler {
                 )?;
                 Outcome::Blocked {
                     why: format!(
-                        "rebase onto {base} conflicts in {} file(s): {}",
+                        "bringing the branch onto {base} conflicts in {} file(s): {}",
                         paths.len(),
                         paths.join(", ")
                     ),

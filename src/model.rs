@@ -192,11 +192,11 @@ pub enum Feedback {
     /// this crate wrote. The day the gate records its output on its own column, this grows a
     /// field; until then a second field would be a second spelling of the same string.
     Gate { output: String },
-    /// The handoff gate could not rebase the branch onto `base`: the rebase stopped on
+    /// The handoff gate could not bring the branch onto `base`: the rebase or merge stopped on
     /// conflicts in `paths` and was aborted, and the issue parked `Blocked` (#109). Carried to
     /// the run after the one that was blocked, so it is told the truth about why it exists —
     /// not that a turn budget ran out — once a human has unblocked it. `base_sha` is the commit
-    /// the gate tried, which the agent is told to rebase onto: `base` resolves in its worktree,
+    /// the gate tried, which the agent is told to merge: `base` resolves in its worktree,
     /// where an unset base's `HEAD` is its own branch.
     Conflict { base: String, base_sha: String, paths: Vec<String> },
     /// Another worker ran this issue last and stopped (#165): `from` names it, `why` says how

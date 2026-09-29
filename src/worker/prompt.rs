@@ -492,12 +492,13 @@ pub(crate) fn feedback_help(feedback: &[Feedback]) -> String {
             }
             Feedback::Conflict { base, base_sha, paths } => {
                 s.push_str(&format!(
-                    "\nThe orchestrator could not rebase your branch onto {base} ({base_sha}): \
-                 conflicts in {}. The rebase was aborted, so your branch is exactly as you left \
-                 it. Your job this run is to resolve that yourself — `git rebase {base_sha}`, \
-                 resolve each conflict (the description may say how), `git rebase --continue` — \
-                 then run the project's own gate and commit. Do not report done while the branch \
-                 still conflicts with {base}.\n",
+                    "\nThe orchestrator could not bring your branch onto {base} ({base_sha}): \
+                 conflicts in {}. It was aborted, so your branch is exactly as you left it. Your \
+                 job this run is to resolve that yourself — `git merge {base_sha}`, resolve each \
+                 conflict (the description may say how), commit the merge — then run the \
+                 project's own gate. Do not rebase: the orchestrator merges the base into a \
+                 branch that has merged it, so a merge keeps your resolution. Do not report \
+                 done while the branch still conflicts with {base}.\n",
                     paths.join(", ")
                 ));
             }

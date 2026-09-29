@@ -9,7 +9,9 @@
 //! tree, in that order, in the agent's own worktree. The rebase has to come first because a
 //! gate run against a stale base answers a question nobody asked. A branch that already
 //! contains the base's tip is on it and is not rebased: a rebase would drop a merge of the base,
-//! and with it the conflict resolution an agent made that way (#122).
+//! and with it the conflict resolution an agent made that way (#122). For the same reason a
+//! branch that merged an older base is brought up to date by merging the new one, not rebased
+//! back into the conflict its merge settled (#177).
 //!
 //! Like the worker, a gate is a process the scheduler supervises rather than a call it makes:
 //! `cargo test` in a real worktree runs for minutes, and a tick that blocked on it would stall
@@ -45,11 +47,11 @@ pub enum Verdict {
     NoCommits,
     /// Rebased onto the base — or already on top of it — and every command exited zero.
     Passed {
-        /// True when the rebase actually moved commits, false when the branch was already
-        /// current. For the log; the scheduler treats both the same.
+        /// True when a rebase moved commits or a merge brought the base in, false when the
+        /// branch was already current. For the log; the scheduler treats both the same.
         rebased: bool,
     },
-    /// The rebase stopped on conflicts. The rebase was aborted, so the branch is exactly where
+    /// The rebase or merge stopped on conflicts and was aborted, so the branch is exactly where
     /// the agent left it: green against the old base, and safe for a human to pick up.
     Conflict {
         paths: Vec<String>,
@@ -59,9 +61,9 @@ pub enum Verdict {
         /// agent's own branch, a no-op that leaves the conflict to recur.
         base_sha: String,
     },
-    /// The rebase stopped and could not be aborted: the worktree is still mid-rebase, so it is
-    /// neither the branch the agent left nor a tree any brief describes. A human's, always —
-    /// an agent resumed into it would build on gate state or trip over a second rebase.
+    /// The rebase or merge stopped and could not be aborted: the worktree is still mid-way, so
+    /// it is neither the branch the agent left nor a tree any brief describes. A human's,
+    /// always — an agent resumed into it would build on gate state or trip over a second rebase.
     Stuck { step: String, output: String },
     /// A step failed for a reason the agent can act on: a command exited non-zero, the rebase
     /// was refused (a dirty tree, most likely), or a command could not be started at all.
