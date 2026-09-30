@@ -477,8 +477,9 @@ pub(crate) fn build_prompt(
 /// rather than accepted.
 ///
 /// Each item is rendered in turn, so a conflict brief that interrupted a review hand-back comes
-/// first and the comments follow it in the same prompt (#160): the branch has to rebase before
-/// anything else on it can land, and splitting the two cost a review round on a conflict.
+/// first and the comments follow it in the same prompt (#160): the branch has to be brought
+/// onto the base before anything else on it can land, and splitting the two cost a review
+/// round on a conflict.
 pub(crate) fn feedback_help(feedback: &[Feedback]) -> String {
     let mut s = String::new();
     for fb in feedback {
