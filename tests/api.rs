@@ -806,8 +806,8 @@ async fn a_dispatched_worker_is_not_handed_the_ops_tools() {
     // way `main` does, open a real broker session, read the file a worker would be handed, and
     // connect to whatever it names. A version that only asked the ops server to refuse an
     // unknown caller would pass just as well if crewd handed the worker the ops address after
-    // all. What a worker inherits from the operator's own MCP config is outside this test, and
-    // accepted (see `api::mcp`).
+    // all. The worker's `--strict-mcp-config` is what keeps the operator's registration from
+    // loading (#191); this test covers only the file crewd writes (see `api::mcp`).
     let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
     h.tick();
 

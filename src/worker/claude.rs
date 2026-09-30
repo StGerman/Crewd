@@ -57,8 +57,9 @@
 //! * `--setting-sources project` loads the worktree's `.claude/settings.json` only; `local` is
 //!   left out because a worktree has no `settings.local.json` of its own.
 //! * `--strict-mcp-config` loads MCP servers only from `--mcp-config`, which drops user, local,
-//!   plugin and claude.ai servers alike — and the repository's `.mcp.json` too, on purpose:
-//!   #192 replaces that rust-analyzer bridge.
+//!   plugin and claude.ai servers alike. A project `.mcp.json` is dropped with them: #192
+//!   replaced that rust-analyzer bridge with the plugin in project settings, and it is not
+//!   passed through.
 //! * `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` is applied after the allowlist. Auto memory survives
 //!   both flags, and an allowlisted operator value of that name would turn it back on.
 //!

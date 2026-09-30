@@ -110,9 +110,8 @@ max_calls_per_issue = 40
 enabled = true
 bind = "127.0.0.1:8787"
 # On, for the session supervising this daemon. crewd never hands these tools to a worker (their
-# own listener, never passed to the broker), but a dispatched worker still inherits the
-# operator's MCP config — local scope included, since its worktree is this same project to
-# Claude Code — so on this machine workers can reach them. Accepted: see src/api/mcp.rs.
+# own listener, never passed to the broker), and the worker does not load the operator's MCP
+# config (#191). A same-user process can still call the loopback HTTP API; see src/api/mcp.rs.
 mcp_enabled = true
 mcp_bind = "127.0.0.1:8788"
 # Per-run transcripts (src/transcript.rs). Worth more here than against the demo tracker: this
