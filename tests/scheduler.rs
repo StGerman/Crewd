@@ -3977,6 +3977,167 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
     assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
 }
 
+/// A review round on a ready pull request whose first head is green, with the fix's push
+/// landing on a provider whose pull-request read still reports that first head for two reads
+/// (#178): the one right after the push, and the next poll's. Returns the harness with the fix
+/// pushed and the poll after that push already run.
+fn fix_pushed_behind_a_lagging_read(second: Option<CiStatus>) -> (Harness, Arc<FakeForge>) {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci_default(None);
+    forge.set_ci(&FakeForge::head_after_publish(1), CiStatus::Success);
+    if let Some(ci) = second {
+        forge.set_ci(&FakeForge::head_after_publish(2), ci);
+    }
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c,
+        verdict: Verdict::Accepted,
+        detail: "abc1234".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
+
+    forge.lag_reads_after_push(2);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").head_sha.as_deref(),
+        Some(FakeForge::head_after_publish(2).as_str()),
+        "the fix was pushed"
+    );
+    (h, forge)
+}
+
+/// #178. The push's own read and the next poll's both still name the replaced head.
+#[test]
+fn a_push_is_not_judged_on_the_previous_heads_ci() {
+    let (mut h, _forge) = fix_pushed_behind_a_lagging_read(None);
+    let pushed = FakeForge::head_after_publish(2);
+    for poll in ["the push's own", "the next"] {
+        let d = delivery_of(&h, "iss-1");
+        assert_ne!(
+            d.stage,
+            crew::store::DeliveryStage::Ready,
+            "{poll} poll read the replaced head, and its green CI says nothing of the push"
+        );
+        assert_eq!(d.ci_pending.map(|(head, _)| head), Some(pushed.clone()), "{poll} poll");
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(
+        d.ci_pending.map(|(head, _)| head),
+        Some(pushed),
+        "the read caught up, and the wait is still on the pushed head's CI"
+    );
+    assert!(d.replaced_head.is_none(), "and no later head is held to the replaced one");
+}
+
+/// Review on #197: a read lagging two pushes names a head older than the one this push
+/// replaced. Its green CI says nothing of the pushed head either.
+#[test]
+fn a_read_lagging_more_than_one_push_is_not_judged_on_that_older_head() {
+    let (mut h, forge) = fix_pushed_behind_a_lagging_read(None);
+    let pr = forge.open_prs()[0].number;
+    forge.set_ci("0lderhead", CiStatus::Success);
+    forge.serve_head_for_reads(pr, "0lderhead", 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, crew::store::DeliveryStage::Ready, "judged on a head two pushes old");
+    assert_eq!(
+        d.ci_pending.map(|(head, _)| head),
+        Some(FakeForge::head_after_publish(2)),
+        "the wait is on the pushed head"
+    );
+}
+
+#[test]
+fn ready_follows_green_ci_on_the_pushed_head() {
+    let (mut h, _forge) = fix_pushed_behind_a_lagging_read(Some(CiStatus::Success));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_ne!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Ready,
+        "the second stale read"
+    );
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+    assert!(d.ci_pending.is_none());
+}
+
+/// #178. The open after the push fails, and the retry publishes a head the remote already has,
+/// so its sync can no longer name the head that push replaced.
+#[test]
+fn a_push_retried_after_a_failed_open_is_not_judged_on_the_head_it_replaced() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci_default(None);
+    let replaced = FakeForge::head_after_publish(1);
+    let pushed = FakeForge::head_after_publish(2);
+    forge.set_ci(&replaced, CiStatus::Success);
+    forge.set_ci(&pushed, CiStatus::Success);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c,
+        verdict: Verdict::Accepted,
+        detail: "abc1234".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
+
+    forge.lag_reads_after_push(1);
+    forge.fail_next_open();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Pending, "the open failed; the push retries");
+    assert_eq!(d.replaced_head.as_deref(), Some(replaced.as_str()));
+
+    forge.republish_same_head_once();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.head_sha.as_deref(), Some(pushed.as_str()));
+    assert_ne!(
+        d.stage,
+        crew::store::DeliveryStage::Ready,
+        "the retry's read still names the replaced head, and its CI is green"
+    );
+    assert_eq!(d.ci_pending.map(|(head, _)| head), Some(pushed.clone()));
+    assert_eq!(d.replaced_head.as_deref(), Some(replaced.as_str()));
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+    assert!(d.ci_pending.is_none());
+    assert!(d.replaced_head.is_none(), "the read caught up");
+}
+
 /// Finding 5 on #47, the half the parser cannot do: `deadbee` is shaped like a commit, and only
 /// the branch can say it is not one of its. An acceptance naming it is not recorded and not
 /// posted; the comment stays open and goes round again, named as one the agent left unanswered.

@@ -225,6 +225,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
       PRIMARY KEY (issue_id, worker)
     );
     "#,
+    // v15
+    r#"
+    -- The head crewd's last push replaced, until the provider stops reporting it (#178). Its
+    -- pull-request read lags a push by seconds, so a poll reading that head would judge the
+    -- replaced head's CI and reviews as the pushed one's. NULL once any other head is seen.
+    ALTER TABLE delivery ADD COLUMN replaced_head TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -321,6 +328,7 @@ mod tests {
         "1b15b60789f8f4d2dedd3427f09829947ef902234e31abcc5b9de075e8a7502e", // v12
         "d102caf59988230bdea97ad90b36339238e95b23246d5132fe9ab356a66f449f", // v13
         "520562198a072368e0c51621f67c99d360a8e0f4201dc3f0d9b94330499bbf2e", // v14
+        "52c5243e127d8c5571d26806596277fd07c7ef125cf8e2cfed3dc95ffb9b7067", // v15
     ];
 
     #[test]
