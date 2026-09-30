@@ -44,6 +44,13 @@ this file.
   Use `parking_lot`, whose locks do not poison. Check: `clippy::disallowed_types` on
   `std::sync::Mutex`, `std::sync::RwLock` and `std::sync::Condvar` in `clippy.toml`.
   `Not yet enforced: #49`.
+- **MUST** exit at startup, naming what failed, when anything the config turns on cannot
+  start: a listener that cannot bind, a worker binary that cannot be resolved, a store another
+  live daemon holds. **MUST NOT** log it and continue. Why: a daemon running with part of itself
+  missing looks healthy to its operator (#218). A failure confined to one run stays with that
+  run and is retried; one that disables a whole worker pauses that worker (#216); the task
+  projection keeps its degrade (CLAUDE.md rule 4). Example: `Config::load` refusing a
+  half-written credentials file by name. Check: review. `Not yet enforced: #216, #217, #218`.
 - **MUST** handle an error once. Either log it and continue, or propagate it with `?`. Never
   both. Why: a double-handled error appears twice in the log and once in the caller, and the
   reader cannot tell how many failures happened. Example: `log_tracker_failure` in
