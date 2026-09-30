@@ -45,9 +45,9 @@ this file.
 - **MUST** exit at startup, naming what failed, when anything the config turns on cannot
   start: a listener that cannot bind, a worker binary that cannot be resolved, a store another
   live daemon holds. **MUST NOT** log it and continue. Why: a daemon running with part of itself
-  missing looks healthy to its operator; one ran with no ops API and one quarantined every issue
-  its Grok slot took (#216, #218). Failures while running stay per-run and are retried, and the
-  task projection keeps its degrade (CLAUDE.md rule 4). Example: `Config::load` refusing a
+  missing looks healthy to its operator (#218). A failure confined to one run stays with that
+  run and is retried; one that disables a whole worker pauses that worker (#216); the task
+  projection keeps its degrade (CLAUDE.md rule 4). Example: `Config::load` refusing a
   half-written credentials file by name. Check: review. `Not yet enforced: #218`.
 - **MUST** handle an error once. Either log it and continue, or propagate it with `?`. Never
   both. Why: a double-handled error appears twice in the log and once in the caller, and the
