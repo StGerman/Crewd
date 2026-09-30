@@ -1,9 +1,0 @@
-# Read by rust-analyzer at the workspace root, which is the only configuration the
-# `rust-analyzer-lsp` plugin (.claude/settings.json) gives it: the plugin passes no
-# initialization options. Checks build into their own target dir, so the language server's
-# clippy run never holds Cargo's lock against an agent's `cargo test` (#192).
-[cargo]
-targetDir = "target/rust-analyzer"
-
-[check]
-command = "clippy"

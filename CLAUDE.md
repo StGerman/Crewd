@@ -226,9 +226,8 @@ a *scoped, logged* way to do what it could otherwise do ambiently. When you chan
 behaviour, ask whether the change would still be correct when the agent running it is working
 on this repo.
 
-`.claude/settings.json` enables Claude Code's `rust-analyzer-lsp` plugin (#192): after each
-edit the language server's diagnostics come back in the same turn, clippy's included
-(`check.command` in [rust-analyzer.toml](rust-analyzer.toml)), and the `LSP` tool answers
+`.claude/settings.json` enables Claude Code's `rust-analyzer-lsp` plugin (#192): it feeds the
+language server's diagnostics into the conversation after edits, and the `LSP` tool answers
 definition, references and hover, so whether a guard is still reached from both call sites is
 a find-references question. The server is the pinned toolchain's `rust-analyzer` component, so
 rustup installs it; `.claude/skills/setup-rust-analyzer` covers a machine without rustup and a
@@ -237,7 +236,10 @@ rustup installs it; `.claude/skills/setup-rust-analyzer` covers a machine withou
 `hover` answer from whatever is indexed *so far*, so during the first load they come back
 empty — indistinguishable from *no callers* — and an edit made then gets no diagnostic. Ask
 again until an answer is non-empty before concluding anything from one, and never read a quiet
-edit as a compiling one.
+edit as a compiling one. The plugin passes the server no options, and a root
+`rust-analyzer.toml` cannot stand in: rust-analyzer reads its flycheck and cargo settings with
+no source root, which skips that file. So the per-edit check is `cargo check` (not clippy),
+built in `target/`, where it can hold Cargo's lock against the agent's own build for a moment.
 
 ## Skills
 

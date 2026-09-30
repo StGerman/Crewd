@@ -8,7 +8,7 @@ description: Install and verify the language server behind this repo's rust-anal
 [.claude/settings.json](../../settings.json) enables Claude Code's `rust-analyzer-lsp` plugin
 from the official marketplace (and declares that marketplace, so it loads under
 `--setting-sources project`). The plugin runs `rust-analyzer` from `PATH` and passes it no
-options; [rust-analyzer.toml](../../../rust-analyzer.toml) is the only configuration it gets.
+options, and a root `rust-analyzer.toml` does not reach its check or cargo settings (#192).
 Two pieces have to be present; the SessionStart hook
 ([.claude/hooks/rust-analyzer-check.sh](../../hooks/rust-analyzer-check.sh)) names whichever
 are missing.
