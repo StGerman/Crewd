@@ -400,11 +400,11 @@ snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v
 than by discipline — and the `POST`s can express nothing the dashboard's `r`, `u` and `b`
 keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
-because the `POST` routes control agent execution. Deliberately *not* validated in
-`Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
-must not be what stops it. `api::bind` parses it once, at startup and before anything else is
-opened, and a failure there, a taken port included, exits crewd naming the address (#218): a
-daemon scheduling with no ops API looks healthy and cannot be queried or unquarantined. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
+because the `POST` routes control agent execution. The address is validated once, at startup,
+rather than in `Config::preflight`, which runs before every dispatch: `api::bind` parses and
+binds it before anything else is opened, only when the API is on, and any failure there, a
+taken port included, exits crewd naming the address (#218). A daemon scheduling with no ops API
+looks healthy and cannot be queried or unquarantined. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
 which is what keeps a hung client off the tick: the scheduler answers into a channel whose
 receiver may already be gone and never waits to find out. The HTTP is hand-rolled (~200 lines,
 no keep-alive, one response type) for the same reason the rest of this crate is small; the
