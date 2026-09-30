@@ -47,6 +47,7 @@ use crew::worker::fake::{FakeWorker, Script};
 use crew::worker::grok::GrokWorker;
 use crew::worker::resolve::resolve_bin;
 use crew::workspace::{FetchLock, GitWorktreeWorkspace};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
@@ -397,6 +398,12 @@ async fn main() -> anyhow::Result<()> {
     // progress animates. This drives rendering only; dispatch still happens on the tick.
     let mut repaint = tokio::time::interval(std::time::Duration::from_millis(250));
 
+    // Created once, before the loop: a listener built per pass exists only while `select!` is
+    // parked, so an interrupt that lands during a tick was dropped (#215). SIGTERM takes the same
+    // path so `kill` and a supervisor's stop reach `sched.shutdown()` rather than orphan workers.
+    let mut sigint = signal(SignalKind::interrupt()).context("listening for SIGINT")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
+
     let mut ticks = 0u64;
     loop {
         tokio::select! {
@@ -467,8 +474,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("interrupt received; shutting down");
+            _ = sigint.recv() => {
+                tracing::info!(signal = "SIGINT", "interrupt received; shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!(signal = "SIGTERM", "interrupt received; shutting down");
                 break;
             }
         }
