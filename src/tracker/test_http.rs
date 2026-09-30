@@ -97,3 +97,24 @@ pub(crate) fn status_body(code: u16, body: Value) -> Result<HttpResponse, HttpTr
         body: body.to_string().into_bytes(),
     })
 }
+
+/// Shared with the forge it scripts, so the test can keep pushing answers after handing it over.
+impl Http for std::sync::Arc<FakeHttp> {
+    fn get(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+    ) -> Result<HttpResponse, HttpTransportError> {
+        (**self).get(url, headers)
+    }
+
+    fn send_json(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpTransportError> {
+        (**self).send_json(method, url, headers, body)
+    }
+}
