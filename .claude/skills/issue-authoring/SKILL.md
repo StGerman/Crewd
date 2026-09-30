@@ -72,4 +72,7 @@ One line under What, naming which of the four boundaries in
 
 `**Boundary:** <name>, because <reason>`.
 
+A core change also names the row in [docs/invariants.md](../../../docs/invariants.md) it adds
+or protects, or says why it needs none.
+
 When none of the four fits, the line is `**Boundary:** none, because <reason>`.

@@ -87,10 +87,11 @@ whatever its milestone.
 ## Scope check
 
 Before placing an issue, confirm its `**Boundary:**` line is present and matches
-[ADR 1](../../../docs/adr/0001-extension-boundaries.md). An issue that needs a core change
-only because no hook or command exists yet keeps that boundary; the missing hook or command
-becomes its own issue, linked from the description. An issue that fits none of the four goes
-to Backlog, whatever its urgency sounds like.
+[ADR 1](../../../docs/adr/0001-extension-boundaries.md), and that a core change names the row in
+docs/invariants.md it adds or protects, or says why it needs none. An issue that needs a core
+change only because no hook or command exists yet keeps that boundary; the missing hook or
+command becomes its own issue, linked from the description. An issue that fits none of the four
+goes to Backlog, whatever its urgency sounds like.
 
 ## Placing an issue
 
@@ -134,7 +135,7 @@ order — each PR is based on the one before — so its issues can share a miles
 `agent` stays the dispatch rule above. Area and `bug` are the Areas table in the
 `issue-authoring` skill. The author may have set them. Keep each or replace it.
 
-#181, #84, #153 and #182 carry no area. The report says why for any newer issue that
+#84, #153 and #182 carry no area. The report says why for any newer issue that
 Areas leaves unlabeled.
 
 Done when the confirmation table names one area, or names the issue unlabeled and why.
