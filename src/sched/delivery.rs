@@ -418,11 +418,13 @@ impl Scheduler {
         let number = pr.number;
 
         // The provider's pull-request read lags a push by seconds, for as many polls as it
-        // lags: while it still names the head crewd's push replaced, that head's green CI and
-        // settled reviews say nothing about the pushed one (#178). CI is pending on the pushed
-        // head until the read catches up, so a provider that never does ends at the CI timeout.
-        if let (Some(replaced), Some(pushed)) = (&d.replaced_head, &d.head_sha) {
-            if pr.head_sha == *replaced {
+        // lags: while it names any head but the one crewd pushed, that head's green CI and
+        // settled reviews say nothing about the pushed one (#178). Any head, not only the one
+        // this push replaced: a read that lags two pushes names an older one still. CI is
+        // pending on the pushed head until the read catches up, so a provider that never does
+        // ends at the CI timeout.
+        if let (Some(_), Some(pushed)) = (&d.replaced_head, &d.head_sha) {
+            if pr.head_sha != *pushed {
                 tracing::debug!(issue_id, pr = number, pushed = %pushed, reported = %pr.head_sha, "pull request does not report the pushed head yet");
                 let behind = PullRequest { head_sha: pushed.clone(), ..pr };
                 return self.await_ci(issue_id, &d, &behind, &[]);

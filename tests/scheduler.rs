@@ -4000,6 +4000,26 @@ fn a_push_is_not_judged_on_the_previous_heads_ci() {
     assert!(d.replaced_head.is_none(), "and no later head is held to the replaced one");
 }
 
+/// Review on #197: a read lagging two pushes names a head older than the one this push
+/// replaced. Its green CI says nothing of the pushed head either.
+#[test]
+fn a_read_lagging_more_than_one_push_is_not_judged_on_that_older_head() {
+    let (mut h, forge) = fix_pushed_behind_a_lagging_read(None);
+    let pr = forge.open_prs()[0].number;
+    forge.set_ci("0lderhead", CiStatus::Success);
+    forge.serve_head_for_reads(pr, "0lderhead", 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, crew::store::DeliveryStage::Ready, "judged on a head two pushes old");
+    assert_eq!(
+        d.ci_pending.map(|(head, _)| head),
+        Some(FakeForge::head_after_publish(2)),
+        "the wait is on the pushed head"
+    );
+}
+
 #[test]
 fn ready_follows_green_ci_on_the_pushed_head() {
     let (mut h, _forge) = fix_pushed_behind_a_lagging_read(Some(CiStatus::Success));

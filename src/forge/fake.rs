@@ -280,6 +280,12 @@ impl FakeForge {
         self.inner.lock().unwrap().lag_reads = n;
     }
 
+    /// The next `n` reads of pull request `number` report `sha` as its head, whatever was
+    /// pushed: a read that lags more than one push names a head older than the one replaced.
+    pub fn serve_head_for_reads(&self, number: u64, sha: &str, n: u32) {
+        self.inner.lock().unwrap().stale.insert(number, (sha.to_string(), n));
+    }
+
     /// The next `open_pull_request` fails once `publish` has already moved the head, so the
     /// retry pushes a head the remote already has (#178).
     pub fn fail_next_open(&self) {
