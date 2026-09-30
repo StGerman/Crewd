@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: Triage this repo's GitHub Issues into the milestone/`agent`-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising a new issue, planning the next milestone after one closes, or filing an issue yourself — an agent-filed issue lands in the inbox and is never labelled `agent` by its author.
+description: Triage this repo's GitHub Issues into the milestone and agent states the daemon dispatches from. Use when running the weekly triage, clearing the inbox, placing an issue, or planning the next milestone. Filing an issue is the issue-authoring skill.
 ---
 
 # Issue triage
@@ -57,10 +57,6 @@ on their explicit say-so, and only to an issue that is:
   an "Open" section in the body) goes to the operator first, and the answer is written into the
   description (see below) before the issue is made dispatchable.
 
-When you file an issue yourself (found a bug mid-task, split out follow-up work), leave it in
-the Inbox with no milestone and no `agent` label, and say in the body what triggered it.
-Placing it is triage's job, not the author's.
-
 ## Decisions go into the description
 
 A dispatched agent's prompt is built from the issue **body** alone. Comments never reach it
@@ -74,7 +70,8 @@ description the moment it is made, not left in a comment or in this conversation
 - Strike through (`~~...~~`) each acceptance criterion or paragraph a decision supersedes,
   pointing to its replacement, and write replacement criteria in the Decisions section. Two
   live, conflicting criteria lists leave the agent to guess which one holds.
-- Scope cut out of an issue becomes a new Inbox issue, linked from the Decisions section.
+- Scope cut out of an issue becomes a new Inbox issue, filed with the `issue-authoring`
+  skill and linked from the Decisions section.
 - Edit with `gh issue view <n> --json body --jq .body > <file>`, change the file, then
   `gh issue edit <n> --body-file <file>`, so the rest of the body survives byte for byte.
 
@@ -89,22 +86,12 @@ whatever its milestone.
 
 ## Scope check
 
-Before placing an issue, name the boundary its work lands on
-([ADR 1](../../../docs/adr/0001-extension-boundaries.md)):
-
-| Boundary | Fits when |
-|---|---|
-| **trait implementation** | a new backend behind `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Forge`, `Gate`, `Store` or `Projector` |
-| **external command** | an operator tool that needs only the ops API: a `crewctl-<name>` program on `PATH` |
-| **hook** | a reaction to a lifecycle event that decides nothing: notifications, metrics |
-| **core change** | it closes or protects an invariant, or needs the scheduler's authority: a claim, a budget, a bound, a write on an agent's behalf |
-
-Write the boundary into the description. A one-line `**Boundary:** <name>, because <reason>`
-under the opening section is enough; for a core change, name the invariant row it adds or
-protects. An issue that needs a core change only because no hook or command exists yet
-still gets its boundary from the rule; the missing hook or command becomes its own issue,
-linked from the description. An issue that fits none of the four goes to Backlog, whatever its
-urgency sounds like.
+Before placing an issue, confirm its `**Boundary:**` line is present and matches
+[ADR 1](../../../docs/adr/0001-extension-boundaries.md), and that a core change names the row in
+docs/invariants.md it adds or protects, or says why it needs none. An issue that needs a core
+change only because no hook or command exists yet keeps that boundary; the missing hook or
+command becomes its own issue, linked from the description. An issue that fits none of the four
+goes to Backlog, whatever its urgency sounds like.
 
 ## Placing an issue
 
@@ -123,6 +110,9 @@ Apply this rule top-down; the first match wins.
 
 "Current milestone" is the open milestone with the lowest `M<n>`.
 
+Revisit the area against [Labels](#labels). Record the choice in the confirmation table
+with the milestone.
+
 ## Priority is the milestone
 
 There are no priority labels. Milestones are worked one at a time in `M<n>` order, and
@@ -140,6 +130,16 @@ outcome. Large work is split into small stacked PRs, each its own issue, stacked
 each adds to the outcome rather than by when it was written. The stack itself carries that
 order — each PR is based on the one before — so its issues can share a milestone.
 
+## Labels
+
+`agent` stays the dispatch rule above. Area and `bug` are the Areas table in the
+`issue-authoring` skill. The author may have set them. Keep each or replace it.
+
+#84, #153 and #182 carry no area. The report says why for any newer issue that
+Areas leaves with no area.
+
+Done when the confirmation table names one area, or says the issue has no area and why.
+
 ## Weekly triage
 
 Run through these in order. Triage is done when every step's criterion holds.
@@ -150,7 +150,13 @@ Run through these in order. Triage is done when every step's criterion holds.
    ```
    Read each issue in full (`gh issue view <n> --comments`) and place it with the rule above.
    Done when the inbox list is empty.
-2. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any
+2. **One area each.** Revisit every open issue's area per [Labels](#labels). The names in
+   the query are the Areas table in `issue-authoring`.
+   ```bash
+   gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker|onboarding)$"))]} | select(.a|length != 1) | .n'
+   ```
+   Done when that list is only the issues Labels names, plus any newer one the report explains.
+3. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any
    that is not. Then check each has a linked PR or recent progress:
    ```bash
    gh issue list --state open --label agent --json number,title,milestone,assignees,updatedAt
@@ -159,9 +165,9 @@ Run through these in order. Triage is done when every step's criterion holds.
    An `agent` issue open more than 7 days with no PR is either under-specified (tighten it)
    or blocked (remove `agent`, say why). Done when each one has a PR, a fresh update, or a
    comment explaining the hold.
-3. **Resolved but open.** An issue whose fix has merged (check the invariant table and recent
+4. **Resolved but open.** An issue whose fix has merged (check the invariant table and recent
    PRs) is closed with a comment naming the PR. Done when no merged fix is left open.
-4. **Report.** Summarise what moved: issues placed per milestone, labels added or removed,
+5. **Report.** Summarise what moved: issues placed per milestone, labels added or removed,
    issues closed, and anything that needs the operator's decision.
 
 ## Planning the next milestone
@@ -181,6 +187,7 @@ When a milestone closes:
 Moving issues, labelling and closing are writes to a shared tracker under the operator's
 credential. Present the full set of proposed changes as one table — issue, from-state,
 to-state, labels, reason — and apply it only after the operator confirms. When confirmed,
-apply with `gh issue edit <n> --milestone "<title>" --add-label agent` and `gh issue close
-<n> --reason "not planned" --comment "<why>"`, and batch the calls: the GitHub API budget is
-shared with the running daemon.
+apply each row's milestone and label changes in one call, `gh issue edit <n> --milestone
+"<title>" --add-label <added> --remove-label <removed>`, where the labels are `agent`, the area
+and `bug` as the table changed them, and close with `gh issue close <n> --reason "not planned"
+--comment "<why>"`. Batch the calls: the GitHub API budget is shared with the running daemon.

@@ -222,11 +222,10 @@ budgets: a continuation opens a fresh run, so the per-run cap alone bounds nothi
 The backlog is GitHub Issues on this repository; an open issue labelled `agent` is work a real
 agent will pick up, and the `issue-triage` skill decides which carry it.
 
-**Filing an issue.** Write the body from
-[.github/ISSUE_TEMPLATE/work.md](.github/ISSUE_TEMPLATE/work.md). The title is one sentence
-naming the outcome we want. The issue body is the durable work specification; tracker comments
-do not reach the prompt, so a decision, a scope cut and an acceptance criterion go there.
-HTML comments in the body are stripped before dispatch. File it with no milestone and no `agent` label.
+**Filing an issue** is the `issue-authoring` skill. The issue body is the work specification
+a dispatched agent receives: tracker comments do not reach that prompt, and HTML comments
+are stripped before dispatch, so a decision, a scope cut and an acceptance criterion go in
+the body.
 
 `crew.github.toml` turns on every real seam: the GitHub tracker, the `claude` worker, the tool
 broker, transcripts, the handoff gate (naming the commit-gate commands) and delivery. `crew.toml`,
