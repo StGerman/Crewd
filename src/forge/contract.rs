@@ -137,10 +137,11 @@ fn a_sync_reports_the_head_its_own_branch_last_published(b: &dyn PublisherBacken
     assert_eq!(p.sync(&at_c, &never, "origin").unwrap(), Synced::Absent, "{}", b.name());
 }
 
-/// #227: after the gate rebases a delivered branch, the remote still holds crewd's own push.
-/// `FakeForge::sync` already reported that head as `Current`, because it never confuses a
-/// branch with another branch's publish. The real `sync` merged the pre-rebase commits back in
-/// (`Advanced`) until it treated a fetched head the lease already names as its own.
+/// #227: after the gate rebases a delivered branch, the remote still holds the head publish
+/// recorded. `FakeForge::sync` already reported that head as `Current`, because it never
+/// confuses a branch with another branch's publish. The real `sync` merged the pre-rebase
+/// commits back in (`Advanced`) until a fetched head equal to the lease — no movement since the
+/// last sync or publish — was left alone.
 fn a_rewritten_branch_syncs_as_the_head_it_already_published(b: &dyn PublisherBackend) {
     let p = b.publisher();
     let (at, branch) = b.branch_with_work("MT-rewrite");

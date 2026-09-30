@@ -587,8 +587,9 @@ The lease is a ref crewd owns, `refs/crew/lease/<branch>`, written by `Publisher
 `refs/remotes/<remote>/<branch>`, which any fetch in `workspace.repo` moves onto commits the
 worktree never had, so the push replaced an operator's merge instead of refusing. `sync` runs
 before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch.
-When the fetched head is the one the lease already names, the remote has not moved and a
-divergence is crewd's own rewrite — the gate rebasing onto a base that moved — so the worktree
+When the fetched head is the one the lease already names, the remote has not moved since the
+last sync or publish. A divergence is a local rewrite of commits the worktree already held —
+the gate rebasing onto a base that moved — so the worktree
 is left alone and the push replaces that head (#227). Any other head is fast-forwarded, or
 merged when the worktree has commits of its own. It never
 rebases, which would rewrite commits a reviewer saw and drop the operator's merge. A conflict is

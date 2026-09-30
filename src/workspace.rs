@@ -1047,17 +1047,18 @@ impl Publisher for GitWorktreeWorkspace {
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
         let is_ancestor =
             |a: &str, b: &str| Self::git(worktree, &["merge-base", "--is-ancestor", a, b]).is_ok();
-        // Folding this head back in after the gate rebases onto a moved base merges crewd's own
-        // pre-rebase commits into their rewritten copies. Where the two sides touched the same
-        // lines that merge conflicts, and delivery reports it as someone else's push (#227, on
-        // #191). The lease names the last head this worktree took in or itself pushed, so a
-        // fetched head that is still that one has not moved; the divergence is the rewrite, and
-        // the push replaces it. A head the lease does not name is still merged (#163).
+        // Folding an unchanged remote head back in after the gate rebases onto a moved base
+        // merges commits the worktree already held — its own, or someone else's that an earlier
+        // sync took in — into their rewritten copies. Where the two sides touched the same lines
+        // that merge conflicts, and delivery reports it as someone else's push (#227, on #191).
+        // The lease is that last incorporated head. Equality with the fetched head means the
+        // remote has not moved since the last sync or publish, so the divergence is the rewrite
+        // and the push replaces it. A head the lease does not name is still merged (#163).
         let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &lease_ref])
             .unwrap_or_default();
-        let own_push = lease == remote_head;
+        let remote_unchanged = lease == remote_head;
 
-        let synced = if is_ancestor(&remote_head, "HEAD") || own_push {
+        let synced = if is_ancestor(&remote_head, "HEAD") || remote_unchanged {
             Synced::Current { remote_head: remote_head.clone() }
         } else {
             let fast_forward = is_ancestor("HEAD", &remote_head);
