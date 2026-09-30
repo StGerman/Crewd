@@ -6,9 +6,10 @@
 //! refuses a daemon started inside a worktree.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 const BASE: &str = r#"
 [tracker]
@@ -158,6 +159,71 @@ fn a_transcript_root_that_cannot_be_created_stops_startup_naming_it() {
     // Up to the OS's own wording, which differs between macOS and Linux for this errno.
     let err = stderr(&out);
     insta::assert_snapshot!(err.split("\n\nCaused by").next().unwrap_or(&err));
+}
+
+#[test]
+fn a_running_daemons_startup_holds_the_store_lock_a_second_crewd_refuses() {
+    let scratch = Scratch::new(BASE);
+    let db = scratch.dir.join("crew.db");
+    let holder_err = scratch.dir.join("holder.err");
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_crewd"))
+        .args(["--config", "crew.toml", "--max-ticks", "1000"])
+        .current_dir(&scratch.dir)
+        .env("CREW_DB", &db)
+        .env("CREW_TASKS_ROOT", scratch.dir.join("tasks"))
+        .env("RUST_LOG", "crew=error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&holder_err).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut holder = KillOnDrop(&mut holder);
+    let pid = holder.child().id();
+
+    // The pid line is written only after `flock` succeeds. A second start before that can take
+    // the lock itself and make this assertion race.
+    wait_until_held(&db, pid, &holder_err);
+    let out = scratch.command(&[]).env("CREW_DB", &db).output().unwrap();
+    let refused = stderr(&out);
+    let canonical = db.parent().unwrap().canonicalize().unwrap().join("crew.db");
+    let expected = format!("store {} is held by pid {pid}", canonical.display());
+    assert!(
+        !out.status.success() && refused.contains(&expected),
+        "startup did not refuse the second daemon with the holder's pid:\n{refused}\nholder:\n{}",
+        std::fs::read_to_string(&holder_err).unwrap_or_default()
+    );
+
+    drop(holder);
+}
+
+fn wait_until_held(db: &Path, holder: u32, holder_err: &Path) {
+    let lock = db.with_file_name("crew.db.lock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(&lock).unwrap_or_default().trim() == holder.to_string() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "holder {holder} never recorded its pid in {}; holder stderr:\n{}",
+        lock.display(),
+        std::fs::read_to_string(holder_err).unwrap_or_default()
+    );
+}
+
+struct KillOnDrop<'a>(&'a mut Child);
+
+impl KillOnDrop<'_> {
+    fn child(&mut self) -> &mut Child {
+        self.0
+    }
+}
+
+impl Drop for KillOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]

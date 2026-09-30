@@ -6,10 +6,13 @@
 //! again. This module is the premise that makes the recovery rule true.
 //!
 //! The lock is an exclusive `flock` on `<store>.lock`, beside the database, held until this
-//! process exits. The kernel releases it when the process dies, including under `SIGKILL`, so
-//! a lock whose holder is gone does not block the next start. The database file itself is the
-//! wrong target: SQLite locks it with `fcntl`, and on macOS `flock` is implemented as `fcntl`,
-//! so a lock on the database would be dropped the next time SQLite closed a connection to it.
+//! process exits. The store path is canonicalized first: a symlink and a `./crew.db` spelling
+//! of one file would otherwise be two locks, and the second daemon would recover the first
+//! one's claims. The kernel releases the lock when the process dies, including under `SIGKILL`,
+//! so a lock whose holder is gone does not block the next start. The database file itself is
+//! the wrong target: SQLite locks it with `fcntl`, and on macOS `flock` is implemented as
+//! `fcntl`, so a lock on the database would be dropped the next time SQLite closed a connection
+//! to it.
 //!
 //! The held object is the open inode, and the descriptor is close-on-exec. A worker child must
 //! not inherit a handle that would keep the lock after this process is gone, and replacing the
@@ -54,8 +57,12 @@ pub enum StoreLockError {
 
 impl StoreLock {
     /// Take the exclusive hold for `store`, or fail naming that path and the pid that has it.
+    ///
+    /// `store` is canonicalized first, so two spellings of one database contend for one lock.
+    /// The error names that canonical path.
     pub fn acquire(store: &Path) -> Result<Self, StoreLockError> {
-        let path = lock_path(store)?;
+        let store = canonical_store(store)?;
+        let path = lock_file(&store)?;
         // Truncate only after the flock is held. Truncating here would erase the holder's pid
         // in the window before this process learns it lost.
         let file = OpenOptions::new()
@@ -66,9 +73,9 @@ impl StoreLock {
             .open(&path)
             .map_err(|source| StoreLockError::Io { store: store.to_path_buf(), source })?;
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(guard) => held(store, guard),
-            Err((file, err)) if contended(err) => lost(store, file),
-            Err((_, err)) => Err(io_lock(store, err)),
+            Ok(guard) => held(&store, guard),
+            Err((file, err)) if contended(err) => lost(&store, file),
+            Err((_, err)) => Err(io_lock(&store, err)),
         }
     }
 }
@@ -108,7 +115,34 @@ fn io_lock(store: &Path, err: Errno) -> StoreLockError {
     }
 }
 
+fn canonical_store(store: &Path) -> Result<PathBuf, StoreLockError> {
+    match std::fs::symlink_metadata(store) {
+        Ok(_) => std::fs::canonicalize(store)
+            .map_err(|source| StoreLockError::Io { store: store.to_path_buf(), source }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            let parent =
+                store.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let name = store.file_name().ok_or_else(|| StoreLockError::Io {
+                store: store.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "store path has no file name",
+                ),
+            })?;
+            let parent = std::fs::canonicalize(parent)
+                .map_err(|source| StoreLockError::Io { store: store.to_path_buf(), source })?;
+            Ok(parent.join(name))
+        }
+        Err(source) => Err(StoreLockError::Io { store: store.to_path_buf(), source }),
+    }
+}
+
+#[cfg(test)]
 fn lock_path(store: &Path) -> Result<PathBuf, StoreLockError> {
+    lock_file(&canonical_store(store)?)
+}
+
+fn lock_file(store: &Path) -> Result<PathBuf, StoreLockError> {
     let Some(name) = store.file_name() else {
         return Err(StoreLockError::Io {
             store: store.to_path_buf(),
@@ -183,7 +217,8 @@ mod tests {
 
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "a second daemon on {db:?} started: {err}");
-        let expected = format!("store {} is held by pid {}", db.display(), std::process::id());
+        let expected =
+            format!("store {} is held by pid {}", named(&db).display(), std::process::id());
         assert!(err.contains(&expected), "stderr: {err}");
 
         drop(_held);
@@ -233,6 +268,51 @@ mod tests {
 
         drop(_next);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlink_and_a_dotted_path_to_one_store_share_its_lock() {
+        if std::env::var(PROBE).as_deref() == Ok("spellings") {
+            probe_refuse(Path::new(&std::env::var(DB).unwrap()));
+        }
+
+        let dir = temp_dir("spellings");
+        let db = dir.join("crew.db");
+        // The symlink's target has to exist for canonicalization to follow it. The dotted
+        // spelling does not; both still name this file.
+        std::fs::write(&db, b"").unwrap();
+        std::os::unix::fs::symlink(&db, dir.join("alias.db")).unwrap();
+        let _held = StoreLock::acquire(&db).unwrap();
+        let expected =
+            format!("store {} is held by pid {}", named(&db).display(), std::process::id());
+
+        for spelling in [dir.join("alias.db"), dir.join(".").join("crew.db")] {
+            let out = reexec(
+                "store::lock::tests::a_symlink_and_a_dotted_path_to_one_store_share_its_lock",
+                "spellings",
+                &spelling,
+            )
+            .output()
+            .unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{spelling:?} started a second hold: {err}");
+            assert!(err.contains(&expected), "{spelling:?} stderr: {err}");
+        }
+
+        drop(_held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn named(store: &Path) -> std::path::PathBuf {
+        std::fs::canonicalize(store).unwrap_or_else(|_| {
+            store
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .canonicalize()
+                .unwrap()
+                .join(store.file_name().unwrap())
+        })
     }
 
     fn probe_refuse(db: &Path) -> ! {

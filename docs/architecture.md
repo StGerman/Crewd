@@ -55,9 +55,10 @@ claim stranded by the last process must not stay stranded behind a config typo. 
 is recovery that silently does not happen, which is the exact failure it exists to fix. It is
 callable directly (`Scheduler::recover`) and idempotent, so a caller that wants it eagerly can
 have it. It releases every unmatched claim, so it is safe only while one process has the store.
-`main` takes that premise before the first tick: an exclusive OS lock beside the database, held
-until the process dies and released by the kernel on a hard kill (#217). A second daemon on the
-same store exits at startup, naming the store and the pid that holds it.
+`main` takes that premise before the first tick: an exclusive OS lock beside the canonical path
+of the database, held until the process dies and released by the kernel on a hard kill (#217).
+A symlink and a `./crew.db` spelling of one file share that lock. A second daemon on the same
+store exits at startup, naming the store and the pid that holds it.
 
 ## Subsystems
 

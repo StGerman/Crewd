@@ -211,8 +211,10 @@ marked `running` with nothing running is refused by `claim()` forever, is invisi
 `detect_stalls`, and has no retry row to bring it back. `Scheduler::recover` releases those
 claims at startup and reconciles their worktrees, so the worst a surviving database can do is
 still cost a re-poll. It is safe only while one process
-has the store: `main` holds an exclusive OS lock on `<store>.lock` for the life of the process,
-and a second daemon exits at startup naming the store and the pid that holds it (#217). The
+has the store: `main` holds an exclusive OS lock on the canonical store's `<store>.lock` for the
+life of the process, and a second daemon exits at startup naming the store and the pid that
+holds it (#217). A second spelling of the same file, a symlink or `./crew.db`, takes that same
+lock. The
 kernel releases that lock when the process dies, including a hard kill, and the next start
 proceeds.
 
