@@ -986,7 +986,11 @@ impl Scheduler {
         match self.tracker.by_ids(&[issue_id.to_string()]) {
             Ok(found) => {
                 let Some(issue) = found.into_iter().find(|i| i.id == issue_id) else {
-                    tracing::debug!(issue_id, "tracker omitted the issue; pull request waits");
+                    // Visible rather than debug: a Jira issue reassigned away stays omitted, and
+                    // its delivery then waits with nothing else saying why.
+                    tracing::warn!(issue_id, "tracker omitted the issue; its pull request waits");
+                    self.last_error =
+                        Some(format!("delivery {issue_id}: the tracker does not return the issue"));
                     return None;
                 };
                 self.seen.insert(issue.id.clone(), issue.clone());
