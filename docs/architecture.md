@@ -228,9 +228,13 @@ spawned with no broker tools. `Outcome`
 beyond done/failed — `Continue`, `Blocked` — has no structural signal from the CLI to key off,
 so the worker's prompt asks the agent to end its final message with `CREW_OUTCOME:
 continue: <reason>` or `CREW_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
-and it is a soft convention by design — an agent that forgets it just reads as `Done`.
+and it is a soft convention by design — an agent that forgets it just reads as `Done`. The
+marker is read from the *last* `result` in the stream, which is read to its end: a resumed
+session whose previous run was killed with a background task running emits an empty `result`
+before the turn it was resumed for, and judging that one read an agent asking for a decision as
+`Done` (#214).
 
-Token totals come from the terminal `result` event and nowhere else (`Progress::tokens`, an
+Token totals come from the last `result` event and nowhere else (`Progress::tokens`, an
 `Option`). The first live dispatch (#7) summed the `usage` block of every streamed `assistant`
 event instead and recorded ten million input tokens and four hundred output tokens over 83
 turns: the CLI emits one `assistant` event per content block, each carrying the whole turn's

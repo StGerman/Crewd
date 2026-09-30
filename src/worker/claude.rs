@@ -442,12 +442,6 @@ pub(crate) fn last_assistant_text(transcript: &str) -> Option<String> {
     })
 }
 
-/// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the
-/// transcript, updates shared progress as events arrive, drains stderr on a second thread so a
-/// chatty child cannot deadlock on a full pipe, then reaps the process. The verdict — the
-/// stream's, the budget's, or a crash — is published only after `wait` returns: a verdict
-/// published on `result` lets the scheduler reuse the worktree while the child is still in it
-/// (#169).
 /// The worker's settings the reader applies to the stream, as one argument.
 #[derive(Clone, Copy)]
 struct ReaderLimits {
@@ -455,6 +449,12 @@ struct ReaderLimits {
     rate_limit_warn_utilization: f64,
 }
 
+/// Runs on its own thread for the life of one attempt. Reads stdout to its end, copies every
+/// line to the transcript, updates shared progress as events arrive, drains stderr on a second
+/// thread so a chatty child cannot deadlock on a full pipe, then reaps the process. The verdict
+/// — the last `result`'s (#214), the budget's, or a crash — is published only after `wait`
+/// returns: a verdict published on `result` lets the scheduler reuse the worktree while the
+/// child is still in it (#169).
 fn run_reader(
     mut child: Child,
     stdout: ChildStdout,
@@ -473,8 +473,10 @@ fn run_reader(
     // The CLI's own classification of a failed request, which it puts on the synthetic
     // `assistant` event and not on `result` — the only place an unknown `--model` is named.
     let mut api_error: Option<String> = None;
-    // The `result` verdict, held until the child is reaped, like the budget's `Continue`.
-    // `harvest_finished` treats a published outcome as the run being over (#169).
+    // The last `result`'s verdict, held until the child is reaped, like the budget's `Continue`.
+    // `harvest_finished` treats a published outcome as the run being over (#169). Not the
+    // first: a resumed session can emit an empty `result` before the turn it was resumed for
+    // (#214), so the stream is read to its end and each `result` replaces the one before.
     let mut terminal: Option<Outcome> = None;
     // Set at the budget, applied only after `wait`. Publishing `Continue` earlier lets the
     // scheduler reuse the worktree while this process is still in it.
@@ -561,7 +563,6 @@ fn run_reader(
                 );
                 drop(g);
                 terminal = Some(outcome);
-                break;
             }
             _ => {} // system/etc: nothing this module needs
         }
@@ -1366,6 +1367,35 @@ mod tests {
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         assert!(ws.join("exited").exists(), "the verdict came while the child was still running");
         assert_eq!(h.progress().tokens.map(|t| (t.input, t.output)), Some((14, 4)));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// #214: a resumed session can emit an empty `result` before the turn it was resumed for.
+    /// Judged on that one, the run read as `Done` with no turns while the agent was asking for a
+    /// decision, and the rest of its stream never reached the transcript.
+    #[test]
+    fn a_run_that_emits_two_results_is_judged_on_the_last() {
+        let ws = tmp_workspace("two-results");
+        let t = crate::transcript::Transcripts::new(&ws.join("transcripts"), 1 << 20, 10).unwrap();
+        let log = t.open("run-1").unwrap();
+        let path = log.path().to_path_buf();
+
+        let w = ClaudeWorker::new(fixture("two_results.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn {
+            transcript: Some(log),
+            ..Spawn::new(&issue(), &ws, 0, &fresh_session())
+        });
+
+        assert_eq!(
+            wait_for_finish(&h),
+            Outcome::Blocked { why: "two criteria need an operator decision".into() }
+        );
+        let p = h.progress();
+        assert_eq!(p.turns, 1);
+        assert_eq!(p.tokens.map(|t| t.output), Some(5), "totals come from the last result");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches(r#""type":"result""#).count(), 2, "{text}");
+
         std::fs::remove_dir_all(&ws).ok();
     }
 
