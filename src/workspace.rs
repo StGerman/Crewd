@@ -753,6 +753,10 @@ impl GitWorktreeWorkspace {
     }
 
     /// Lowercase ASCII words of `title`, joined by `-`, cut at a word boundary.
+    ///
+    /// A word longer than [`Self::SLUG_MAX`] is skipped, not sliced: a partial token is the
+    /// unreadable name the limit exists to avoid, and skipping it lets a later word still name
+    /// the branch (#205). Once the slug holds a word, the next word that does not fit ends it.
     fn title_slug(title: &str) -> String {
         let mut slug = String::new();
         let mut word = String::new();
@@ -761,24 +765,24 @@ impl GitWorktreeWorkspace {
                 word.push(c.to_ascii_lowercase());
                 continue;
             }
-            if !Self::push_slug_word(&mut slug, &word) {
+            if !Self::push_slug_word(&mut slug, &word) && !slug.is_empty() {
                 return slug;
             }
             word.clear();
         }
-        let _ = Self::push_slug_word(&mut slug, &word);
+        if !Self::push_slug_word(&mut slug, &word) && !slug.is_empty() {
+            return slug;
+        }
         slug
     }
 
-    /// Append `word` if it fits. `false` means the slug is finished: a later word would pass
-    /// [`Self::SLUG_MAX`], or this word was itself cut there because it had no boundary.
+    /// Append `word` when the result still fits in [`Self::SLUG_MAX`].
+    ///
+    /// `false` means nothing was written. The word is never sliced: a cut in the middle of a
+    /// token is the unreadable branch name the limit exists to avoid (#205).
     fn push_slug_word(slug: &mut String, word: &str) -> bool {
         if word.is_empty() {
             return true;
-        }
-        if slug.is_empty() && word.len() > Self::SLUG_MAX {
-            slug.push_str(&word[..Self::SLUG_MAX]);
-            return false;
         }
         let sep = usize::from(!slug.is_empty());
         if slug.len() + sep + word.len() > Self::SLUG_MAX {
@@ -1066,16 +1070,20 @@ impl Workspace for GitWorktreeWorkspace {
         // this type, or any other stray write to the workspace root — as an already-prepared
         // worktree, when nothing ever registered it with git.
         //
-        // The branch is the one the checkout is on, not one recomputed from the title: an
-        // issue already in flight is on the name it was created under, and reporting a new
-        // spelling here would make the scheduler store a branch the worktree is not on.
+        // The branch this issue owns, not whatever the worktree was switched onto. Git lets
+        // this checkout move to another issue's retained ref once that issue's worktree is
+        // gone; recording the checkout would store both issues against one branch, which
+        // delivery then pushes (#205). An owned name the checkout is already on is left
+        // there, so an in-flight legacy spelling is not overwritten with a new one.
         let wip = self.existing_wip(issue_id);
         if Self::is_worktree_checkout(&path) {
+            let owned = self.resolve_branch(issue_id, identifier, title, stored_branch);
+            if Self::checked_out_branch(&path).is_some_and(|current| current != owned) {
+                Self::git(&path, &["switch", "--quiet", &owned])?;
+            }
+            Self::record_branch(&self.repo, issue_id, &owned)?;
             let head = Self::git(&path, &["rev-parse", "HEAD"]).ok();
-            let branch = Self::checked_out_branch(&path)
-                .unwrap_or_else(|| self.resolve_branch(issue_id, identifier, title, stored_branch));
-            Self::record_branch(&self.repo, issue_id, &branch)?;
-            return Ok(Prepared { path, created_now: false, branch: Some(branch), wip, head });
+            return Ok(Prepared { path, created_now: false, branch: Some(owned), wip, head });
         }
 
         let branch = self.resolve_branch(issue_id, identifier, title, stored_branch);
@@ -1118,10 +1126,15 @@ impl Workspace for GitWorktreeWorkspace {
         }
 
         // Read before `worktree remove` deletes the checkout. The branch to delete is the one
-        // the worktree is on — a legacy name, or a slug of a title `remove` is not handed —
-        // and recomputing it would delete a ref this run never created.
+        // this issue owns — the record, else the name resolve would check out, which is how a
+        // legacy ref is still found when `remove` is not handed the title. The checkout is
+        // that branch only while the agent left it there. Deleting a checkout switched onto
+        // another issue's retained ref removes their commits, and `branch -d` succeeds once
+        // those commits are already in HEAD (#205).
         let checked_out =
             if Self::is_worktree_checkout(&path) { Self::checked_out_branch(&path) } else { None };
+        let owned = Self::recorded_branch(&self.repo, issue_id)
+            .unwrap_or_else(|| self.resolve_branch(issue_id, identifier, "", None));
 
         // Worktrees registered *beneath* this one — an orchestrator that ran inside this
         // checkout before `new` refused that, or anything else that nested a worktree here by
@@ -1161,8 +1174,8 @@ impl Workspace for GitWorktreeWorkspace {
         // Best-effort either way: a branch that was already deleted, or never created because
         // `prepare` failed before reaching it, must not turn a successful worktree removal into
         // an error — it just means `branch_deleted` reads `false`, same as "kept".
-        let branch =
-            checked_out.unwrap_or_else(|| self.resolve_branch(issue_id, identifier, "", None));
+        let mismatched = checked_out.as_ref().is_some_and(|current| current != &owned);
+        let branch = if mismatched { owned } else { checked_out.unwrap_or(owned) };
         let branch_deleted = match self.known_base() {
             Some(base) => {
                 Self::git(&self.repo, &["merge-base", "--is-ancestor", &branch, &base]).is_ok()
@@ -2288,6 +2301,77 @@ mod tests {
         let from_store =
             ws.prepare_for("id-1", "#178", "Yet another title", Some(&branch)).unwrap();
         assert_eq!(from_store.branch.as_deref(), Some(branch.as_str()));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_title_whose_first_word_exceeds_the_slug_is_cut_at_a_word_boundary() {
+        // A token longer than the limit has no boundary inside it. Slicing it would put the
+        // partial word #205 rejects into the branch name; skipping it leaves a later word, or
+        // no slug at all.
+        let long = "A".repeat(50);
+        assert_eq!(GitWorktreeWorkspace::title_slug(&long), "");
+        assert_eq!(GitWorktreeWorkspace::pretty_branch("#178", &long), "crew/178");
+        let later = format!("{long} keeps the later words");
+        assert_eq!(GitWorktreeWorkspace::title_slug(&later), "keeps-the-later-words");
+        assert_eq!(
+            GitWorktreeWorkspace::title_slug(
+                "A pull request is judged on the head crewd just pushed"
+            ),
+            "a-pull-request-is-judged-on-the-head"
+        );
+    }
+
+    #[test]
+    fn a_warm_worktree_checked_out_on_another_issues_branch_is_not_adopted_or_deleted() {
+        // Once an issue's worktree is gone, git lets another worktree check out the branch
+        // that was kept. Adopting that checkout stores both issues against one ref, and
+        // `branch -d` on remove then deletes it whenever the commits are already in HEAD.
+        let root = tmp_root("wt-foreign-branch");
+        let repo = tmp_repo("wt-foreign-branch");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let other = ws.prepare_for("id-a", "#178", "Judge the pushed head", None).unwrap();
+        let other_branch = other.branch.clone().unwrap();
+        commit_in(&other.path, "other.txt", "the other issue");
+        git_out(&repo, &["merge", "--ff-only", &other_branch]).unwrap();
+        git_out(&repo, &["worktree", "remove", "--force", other.path.to_str().unwrap()]).unwrap();
+        assert!(branch_exists(&repo, &other_branch), "the retained branch outlives its worktree");
+
+        let mine = ws.prepare_for("id-b", "#179", "A different change", None).unwrap();
+        let my_branch = mine.branch.clone().unwrap();
+        commit_in(&mine.path, "mine.txt", "this issue");
+        git_out(&mine.path, &["switch", "--quiet", &other_branch]).unwrap();
+
+        let removed = ws.remove("id-b", "#179").unwrap();
+        assert!(
+            branch_exists(&repo, &other_branch),
+            "remove must not delete the other issue's branch"
+        );
+        assert!(branch_exists(&repo, &my_branch), "this issue's own commits still outlive cleanup");
+        assert!(!removed.branch_deleted);
+
+        let again = ws.prepare_for("id-b", "#179", "A different change", Some(&my_branch)).unwrap();
+        git_out(&again.path, &["switch", "--quiet", &other_branch]).unwrap();
+        let continued =
+            ws.prepare_for("id-b", "#179", "A different change", Some(&my_branch)).unwrap();
+        assert_eq!(continued.branch.as_deref(), Some(my_branch.as_str()));
+        let head =
+            git_out(&continued.path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap();
+        assert_eq!(head, my_branch);
+        assert!(branch_exists(&repo, &other_branch));
+        let record = GitWorktreeWorkspace::branch_record_ref("id-b");
+        assert_eq!(
+            git_out(&repo, &["symbolic-ref", "--quiet", &record]).unwrap(),
+            format!("refs/heads/{my_branch}")
+        );
+        let other_record = GitWorktreeWorkspace::branch_record_ref("id-a");
+        assert_eq!(
+            git_out(&repo, &["symbolic-ref", "--quiet", &other_record]).unwrap(),
+            format!("refs/heads/{other_branch}")
+        );
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();

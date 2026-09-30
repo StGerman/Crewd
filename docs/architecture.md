@@ -115,13 +115,15 @@ collects the worktrees registered beneath the path before `worktree remove --for
 their directories, prunes the stale registrations (first — `-d` refuses a branch a registered
 worktree still pins), then gives each nested branch the same `-d` the parent's own gets. A
 nested branch carrying commits is kept and named in a `warn` log line, with what to run once
-its parent is merged; the merged check is not weakened for litter. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and
-`Workspace::branch_for` — pure naming, like `path_for` — answers the same question for the
-snapshot. Naming rather than probing is what lets a *finished* run still report its branch,
-which is when a reviewer wants it; asking git per row per tick would put a subprocess on the
-snapshot path. `Row.branch` is `None` until an issue has been dispatched at least once, because
-before that the name is a prediction and pointing an operator at a ref nobody wrote is worse
-than saying nothing.
+its parent is merged; the merged check is not weakened for litter. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and the scheduler
+stores it on `issue_state.branch`, which is what the snapshot publishes as `Row.branch`.
+`Workspace::branch_for` is the naming `prepare` uses and does look at git — the owner ref, a
+legacy branch, a collision — so a title edit does not mint a second name (#205). The snapshot
+does not call it. A finished run reports the stored branch, which is why that name is still
+there to read after the worktree is gone, and why a tick does not spawn git per row.
+`Row.branch` is `None` until an issue has been dispatched at least once, because before that
+no run has written a ref and pointing an operator at a name nobody created is worse than
+saying nothing.
 
 `Tracker` gets its third implementation in [src/tracker/github.rs](../src/tracker/github.rs):
 `GithubTracker<H: Http>`, generic over the `Http` seam in [src/http.rs](../src/http.rs)
