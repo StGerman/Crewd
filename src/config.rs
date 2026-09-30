@@ -209,7 +209,8 @@ pub struct DeliveryConfig {
     pub reviewers: Vec<String>,
     /// Logins whose review *summary* is read for findings as well as their inline comments
     /// (#126): any of their reviews on the current head whose body says more than
-    /// "Findings: None" is handed to an agent whole. A review in the `CHANGES_REQUESTED` state
+    /// "Findings: None", Copilot's template (#201) and an approval's overview sentence (#234) is
+    /// handed to an agent whole. A review in the `CHANGES_REQUESTED` state
     /// is read the same way whoever wrote it, so this names only the reviewers whose
     /// `COMMENTED` summaries count too. Defaults to the Copilot reviewer, which puts findings
     /// there that it leaves on no line.
