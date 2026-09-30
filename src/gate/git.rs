@@ -1317,6 +1317,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `git merge --abort` refuses when a file the merge staged has an unstaged change, and
+    /// leaves `MERGE_HEAD` behind. The diff the gate runs just before the abort is what makes
+    /// that change, and only once `MERGE_HEAD` exists, so the probes before the merge still see
+    /// a clean tree. Drop the in-progress check and this reports a conflict instead, claiming
+    /// the branch was restored.
+    #[test]
+    fn a_merge_abort_that_fails_is_stuck_and_keeps_merge_head() {
+        let (dir, repo, wt) = repo_and_worktree("merge-abort-fails");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        commit(&repo, "first.txt", "first\n", "master moves once");
+        sh_git(&wt, &["merge", "-q", "--no-edit", "master"]);
+        commit(&wt, "first.txt", "agent's first\n", "agent edits first");
+        commit(&repo, "first.txt", "master's first\n", "master edits first");
+        commit(&repo, "second.txt", "second\n", "master adds a file the merge will take cleanly");
+        let before = sh_git(&wt, &["rev-parse", "HEAD"]);
+
+        let merge_head =
+            PathBuf::from(sh_git(&wt, &["rev-parse", "--absolute-git-dir"])).join("MERGE_HEAD");
+        let second = wt.join("second.txt");
+        // Git runs this path through a shell. The fixture directory carries the thread id,
+        // whose parentheses break that, so the hook lives beside it under a plain name.
+        let hook = std::env::temp_dir().join(format!("crew-fsmonitor-{}", std::process::id()));
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nif test -f '{}'; then\n  printf 'second-dirty\\n' > '{}'\nfi\necho 0\n",
+                merge_head.display(),
+                second.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        sh_git(&repo, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+        let _ = std::fs::remove_file(&hook);
+
+        match verdict {
+            Verdict::Stuck { step, output } => {
+                assert_eq!(step, "merge master");
+                assert!(
+                    output.contains("git merge --abort") && output.contains("left it in progress"),
+                    "{output}"
+                );
+            }
+            other => panic!("expected Stuck, got {other:?}"),
+        }
+        assert!(merge_head.exists(), "the unfinished merge must still be there");
+        assert_eq!(sh_git(&wt, &["rev-parse", "HEAD"]), before, "the branch must not move");
+        assert!(!wt.join("gate-ran").exists(), "a stuck merge is not gated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths() {
         let (dir, repo, wt) = repo_and_worktree("conflict");
