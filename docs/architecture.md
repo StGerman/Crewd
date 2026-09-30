@@ -324,6 +324,11 @@ the turn budget is not spent twice over on the same re-orientation. The name is 
 store before the process exists, for the same reason the claim is — the child cannot be what
 records it. A run that takes no turns drops the name, which is how a session the CLI no longer
 holds degrades to a cold start instead of failing every retry identically into quarantine.
+That cold start, and a resume whose context was compacted, are told to read
+`$(git rev-parse --git-dir)/crew/checkpoint.md` before anything else and every prompt tells the
+agent to update it after each commit. The git directory is untracked and dies with the worktree.
+The scheduler never reads the file (#186).
+
 A resume leaves the issue body out, as already held, unless it changed: `launch` swaps the
 body's hash into `issue_state.session_body` (v12), and a resume whose hash differs sends the
 body again under a "changed since your last session" heading, because the description is where

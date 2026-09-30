@@ -10,6 +10,10 @@
 //! one, and stays. Everything else is copied through — a markdown crate would re-emit the
 //! description — except the blank-line run that touches a removed comment. A body with no
 //! comment must reach the agent unchanged.
+//!
+//! Both prompts also name a checkpoint in the worktree's git directory (#186). A lost
+//! session id and a compacted resume otherwise start the issue over; the scheduler never
+//! reads the file, so a missing one only costs that advice.
 
 use super::{RateLimitSignal, TokenUsage, ToolEndpoint};
 use crate::model::{Feedback, Issue, ReviewVerdict, Verdict, looks_like_commit};
@@ -378,6 +382,33 @@ fn inline_span_end(input: &str, i: usize) -> Option<usize> {
     None
 }
 
+/// Relative to `git rev-parse --git-dir` (#186).
+///
+/// The git directory is not in the index. For a linked worktree it is not inside the worktree
+/// either, so `git add -A` cannot pick the file up, and removing the worktree removes it.
+const CHECKPOINT_REL: &str = "crew/checkpoint.md";
+
+/// Tells the agent where its checkpoint lives and to keep it current (#186).
+///
+/// `lead` opens a continuation: the file is the first thing to read, because a compacted
+/// session no longer holds the exploration. A new session says the same thing only when the
+/// file exists — that prompt is also the cold retry after a lost session id, and the first
+/// dispatch, where there is nothing to read.
+fn checkpoint_help(lead: bool) -> String {
+    let path = format!("`$(git rev-parse --git-dir)/{CHECKPOINT_REL}`");
+    let open = if lead {
+        format!("Before anything else, read {path} if it exists, and do not repeat what it covers.")
+    } else {
+        format!("If {path} exists, read it before anything else and do not repeat what it covers.")
+    };
+    format!(
+        "{open} Update it after each commit. It holds the acceptance criteria with the \
+         status of each, the last commit that passed the commit-gate commands, and the next \
+         action. The path is the worktree's git directory, which git does not track, so the \
+         file cannot be committed.\n"
+    )
+}
+
 /// The prompt for an attempt that resumes an existing conversation.
 ///
 /// It omits the issue body when the session already holds the current one, and most of the
@@ -386,6 +417,7 @@ fn inline_span_end(input: &str, i: usize) -> Option<usize> {
 /// operator writes decisions, and a session told only to continue acts on the old text. What
 /// the prompt adds is what the agent cannot see from inside: why the previous session ended,
 /// which is a rebase conflict when the gate blocked it and an unfinished session otherwise.
+/// The checkpoint comes before that (#186): a compacted resume would otherwise re-explore.
 pub(crate) fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
@@ -410,14 +442,18 @@ pub(crate) fn build_continuation_prompt(
     };
     let mut p = format!(
         "Continue working on {}. {why} The working directory is the same worktree, with \
-         whatever you committed still in it. Pick up where you left off.\n\n\
-         The same rules apply: commit as you go, and when the work is fully complete, simply \
+         whatever you committed still in it.\n\n",
+        issue.identifier
+    );
+    p.push_str(&checkpoint_help(true));
+    p.push('\n');
+    p.push_str(
+        "The same rules apply: commit as you go, and when the work is fully complete, simply \
          stop. If you need another turn, end your final message with a line reading \
          exactly:\n\
          CREW_OUTCOME: continue: <one-sentence reason>\n\n\
          If you are stuck and need a human to unblock you, end with:\n\
          CREW_OUTCOME: blocked: <one-sentence reason>\n",
-        issue.identifier
     );
     if body_changed {
         p.push_str(
@@ -444,6 +480,10 @@ pub(crate) fn build_prompt(
     if let Some(url) = &issue.url {
         p.push_str(&format!("Tracker URL: {url}\n\n"));
     }
+    // Ahead of the description: a retry whose session id was lost is this prompt, and
+    // reading the body first is the re-exploration the checkpoint exists to skip (#186).
+    p.push_str(&checkpoint_help(false));
+    p.push('\n');
     if let Some(body) = &issue.body {
         p.push_str("Description:\n");
         p.push_str(&prompt_body(body));
@@ -650,6 +690,66 @@ mod tests {
             build_prompt(&issue, None, &[], &[]),
             build_continuation_prompt(&issue, None, &[], &[], true),
         ]
+    }
+
+    #[test]
+    fn a_continued_run_is_told_to_read_the_checkpoint_before_anything_else() {
+        let prompt = build_continuation_prompt(&issue("Do the work."), None, &[], &[], false);
+        insta::assert_snapshot!(prompt);
+    }
+
+    /// The agent writes the checkpoint itself. The path the prompt names has to stay out of
+    /// `git status`, including in a linked worktree whose `.git` is a file (#186).
+    #[test]
+    fn the_checkpoint_path_is_outside_the_tracked_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "crew-ckpt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git must be on PATH");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "test"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&repo, &["worktree", "add", "-q", "-b", "crew/mt-1", wt.to_str().unwrap()]);
+
+        std::fs::write(wt.join("visible.txt"), b"in the tracked tree").unwrap();
+        let dirty = git(&wt, &["status", "--porcelain"]);
+        assert!(dirty.contains("visible.txt"), "a worktree file must show up, got {dirty:?}");
+        std::fs::remove_file(wt.join("visible.txt")).unwrap();
+
+        let git_dir = std::path::PathBuf::from(git(&wt, &["rev-parse", "--git-dir"]));
+        let git_dir = if git_dir.is_absolute() { git_dir } else { wt.join(git_dir) };
+        let checkpoint = git_dir.join(CHECKPOINT_REL);
+        std::fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
+        std::fs::write(&checkpoint, "acceptance: open\nlast green commit: none\nnext: start\n")
+            .unwrap();
+
+        let status = git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+        assert!(status.is_empty(), "checkpoint must not change git status, got {status:?}");
+        let wt = wt.canonicalize().unwrap();
+        let checkpoint = checkpoint.canonicalize().unwrap();
+        assert!(!checkpoint.starts_with(&wt), "{} is inside the worktree", checkpoint.display());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

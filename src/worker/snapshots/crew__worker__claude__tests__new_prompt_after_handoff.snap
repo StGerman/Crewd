@@ -1,8 +1,10 @@
 ---
 source: src/worker/claude.rs
-expression: "build_prompt(&issue(), None, Some(&fb), &[])"
+expression: "build_prompt(&issue(), None, &fb, &[])"
 ---
 You are working on issue MT-1: t
+
+If `$(git rev-parse --git-dir)/crew/checkpoint.md` exists, read it before anything else and do not repeat what it covers. Update it after each commit. It holds the acceptance criteria with the status of each, the last commit that passed the commit-gate commands, and the next action. The path is the worktree's git directory, which git does not track, so the file cannot be committed.
 
 Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
 

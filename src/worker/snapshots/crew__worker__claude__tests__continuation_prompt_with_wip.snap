@@ -1,8 +1,10 @@
 ---
 source: src/worker/claude.rs
-expression: "build_continuation_prompt(&issue(), None, None, &wip)"
+expression: "build_continuation_prompt(&issue(), None, &[], &wip, false)"
 ---
-Continue working on MT-1. Your previous session on this issue ended before the work was finished — either you asked for another turn, or the orchestrator's per-session turn budget stopped you. The working directory is the same worktree, with whatever you committed still in it. Pick up where you left off.
+Continue working on MT-1. Your previous session on this issue ended before the work was finished — either you asked for another turn, or the orchestrator's per-session turn budget stopped you. The working directory is the same worktree, with whatever you committed still in it.
+
+Before anything else, read `$(git rev-parse --git-dir)/crew/checkpoint.md` if it exists, and do not repeat what it covers. Update it after each commit. It holds the acceptance criteria with the status of each, the last commit that passed the commit-gate commands, and the next action. The path is the worktree's git directory, which git does not track, so the file cannot be committed.
 
 The same rules apply: commit as you go, and when the work is fully complete, simply stop. If you need another turn, end your final message with a line reading exactly:
 CREW_OUTCOME: continue: <one-sentence reason>
