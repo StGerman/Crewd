@@ -1,14 +1,13 @@
 ---
 name: issue-authoring
-description: File a GitHub issue on this repo from the work template. Use when creating an issue or splitting follow-up work into one.
+description: File a GitHub issue on this repo. Use when creating an issue or splitting follow-up work into one.
 ---
 
 # Issue authoring
 
-The issue body is what a dispatched agent receives. Tracker comments do not reach that
-prompt. Write the issue from
+Write the issue from
 [.github/ISSUE_TEMPLATE/work.md](../../../.github/ISSUE_TEMPLATE/work.md). The
-`issue-triage` skill places it and is the only place the `agent` label is added.
+`issue-triage` skill places it.
 
 ## Steps
 
@@ -16,39 +15,40 @@ prompt. Write the issue from
    ```bash
    gh issue list --state open --search "<words>"
    ```
-   Done when an open issue already states this outcome, or none does.
+   Done when one open issue states this outcome, or the searches show that none does.
 
-2. **Write the body** in a file, from the template sections, without the HTML comments.
+2. **Write the body** in a file, from the template's sections.
    - The title is one sentence naming the outcome. The first line of Why restates it.
    - What states the work. Boundary is one line from [Boundary](#boundary). Out of scope
      is `none` when nothing is fenced off.
    - Acceptance criteria are guard tests named as sentences
-     (`a_thing_holds_under_the_condition`). Each must fail on the base commit. A
+     (`a_thing_holds_under_the_condition`). Each fails on the base commit. A
      behavior-preserving change names the existing tests that stay green. More than three
-     criteria means two issues.
-   - Delete Open when nothing is undecided. Triggered by names what someone was doing,
-     and the date.
-   - Leave the Decisions section out. Triage appends one.
-   Done when every kept section is filled and the file contains no HTML comment.
+     criteria is two issues.
+   - Keep Open only while a decision is still open. Triggered by names what someone was
+     doing, and the date.
+   - Triage appends the Decisions section. Leave it out of this file.
+   Done when Why, What, and Triggered by each contain that content, Out of scope is
+   filled, Open is absent or one open decision, and no HTML comment remains.
 
-3. **Choose labels** from [Areas](#areas). Leave the milestone unset, and leave `agent`
-   off. Set one area when the change has a single home, and `bug` when shipped behavior
-   is false. An issue that names more than one area, or none, gets no area label.
-   Done when the labels you will pass are at most `bug` plus one area.
+3. **Choose labels** from [Areas](#areas). Leave the milestone unset. Leave `agent` for
+   triage.
+   Done when what you will pass is at most `bug` plus one area, with the milestone unset
+   and `agent` absent.
 
-4. **Create and check.** Pass `--label` once per label, and omit it when there is neither
-   an area nor `bug`.
+4. **Create and check.** Pass `--label` once for each label Areas selected.
    ```bash
    gh issue create --title "<outcome>" --body-file <file> --label <area>
    gh issue view <n> --json title,milestone,labels,body
    ```
-   `gh issue create` prints the URL and does not accept `--json`. The view is the check:
-   no milestone, no `agent`, the sections present, and the labels from step 3.
-   Done when that view matches.
+   The create command prints the URL. The view is the check.
+   Done when the view shows no milestone, no `agent`, the sections from step 2, and the
+   labels from step 3.
 
 ## Areas
 
-One area, where the change lands.
+Set one area when the change lands in a single row. A change that spans rows, and a change
+that lands in none, carries no area label.
 
 | Area | Lands in |
 |---|---|
@@ -60,24 +60,15 @@ One area, where the change lands.
 | `guidelines` | Lints, CI, and `docs/coding-guidelines.md` |
 | `tracker` | The GitHub or Jira adapter: poll, the dispatch rule, transitions |
 
-A pull request stays `delivery` when delivery also writes the issue. The broker stays
-`worker`. The store stays `scheduler`.
+A pull request stays `delivery` when delivery also writes the issue.
 
-`bug` means shipped behavior is false. The milestone is the priority, and triage sets the
-milestone.
+Set `bug` when shipped behavior is false. Triage sets the milestone.
 
 ## Boundary
 
-Name where the work lands
-([ADR 1](../../../docs/adr/0001-extension-boundaries.md)):
+One line under What, naming which of the four boundaries in
+[ADR 1](../../../docs/adr/0001-extension-boundaries.md) the work belongs to:
 
-| Boundary | Fits when |
-|---|---|
-| **trait implementation** | a new backend behind `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Forge`, `Gate`, `Store` or `Projector` |
-| **external command** | an operator tool that needs only the ops API: a `crewctl-<name>` program on `PATH` |
-| **hook** | a reaction to a lifecycle event that decides nothing: notifications, metrics |
-| **core change** | it closes or protects an invariant, or needs the scheduler's authority: a claim, a budget, a bound, a write on an agent's behalf |
+`**Boundary:** <name>, because <reason>`.
 
-One line under What: `**Boundary:** <name>, because <reason>`. A core change names the
-invariant row in `docs/invariants.md` it adds or protects, or says why it needs none. An
-issue that fits none of the four is still filed; triage sends it to Backlog.
+When none of the four fits, the line is `**Boundary:** none, because <reason>`.

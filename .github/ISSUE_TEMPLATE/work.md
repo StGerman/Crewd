@@ -8,10 +8,9 @@ assignees: ""
 
 <!--
 Title: one sentence naming the outcome. Restate it as the first line of Why.
-The issue-authoring skill is the procedure. No milestone and no `agent` label.
-The issue-triage skill places it, and appends a Decisions section when it settles something; do not write one.
-HTML comments are stripped before dispatch.
-More than 3 acceptance criteria usually means two issues.
+Leave the milestone unset. Leave `agent` for triage. One area, and `bug` when shipped behavior is false, may be set; triage revisits them.
+Triage appends a Decisions section when it settles something.
+HTML comments are stripped before dispatch. More than 3 acceptance criteria means two issues.
 -->
 
 ## Why

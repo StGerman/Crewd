@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: Triage this repo's GitHub Issues into the milestone and agent-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising an issue, or planning the next milestone after one closes. Filing an issue is the issue-authoring skill.
+description: Triage this repo's GitHub Issues into the milestone and agent states the daemon dispatches from. Use when running the weekly triage, clearing the inbox, placing an issue, or planning the next milestone. Filing an issue is the issue-authoring skill.
 ---
 
 # Issue triage
@@ -57,9 +57,6 @@ on their explicit say-so, and only to an issue that is:
   an "Open" section in the body) goes to the operator first, and the answer is written into the
   description (see below) before the issue is made dispatchable.
 
-Filing an issue is the `issue-authoring` skill. Revisit the labels it set. `agent` is
-added only by the rule above.
-
 ## Decisions go into the description
 
 A dispatched agent's prompt is built from the issue **body** alone. Comments never reach it
@@ -73,7 +70,8 @@ description the moment it is made, not left in a comment or in this conversation
 - Strike through (`~~...~~`) each acceptance criterion or paragraph a decision supersedes,
   pointing to its replacement, and write replacement criteria in the Decisions section. Two
   live, conflicting criteria lists leave the agent to guess which one holds.
-- Scope cut out of an issue becomes a new Inbox issue, linked from the Decisions section.
+- Scope cut out of an issue becomes a new Inbox issue, filed with the `issue-authoring`
+  skill and linked from the Decisions section.
 - Edit with `gh issue view <n> --json body --jq .body > <file>`, change the file, then
   `gh issue edit <n> --body-file <file>`, so the rest of the body survives byte for byte.
 
@@ -88,11 +86,11 @@ whatever its milestone.
 
 ## Scope check
 
-Before placing an issue, confirm the boundary line from the `issue-authoring` skill is
-present and still right. An issue that needs a core change only because no hook or command
-exists yet keeps that boundary; the missing hook or command becomes its own issue, linked
-from the description. An issue that fits none of the four goes to Backlog, whatever its
-urgency sounds like.
+Before placing an issue, confirm its `**Boundary:**` line is present and matches
+[ADR 1](../../../docs/adr/0001-extension-boundaries.md). An issue that needs a core change
+only because no hook or command exists yet keeps that boundary; the missing hook or command
+becomes its own issue, linked from the description. An issue that fits none of the four goes
+to Backlog, whatever its urgency sounds like.
 
 ## Placing an issue
 
@@ -111,10 +109,8 @@ Apply this rule top-down; the first match wins.
 
 "Current milestone" is the open milestone with the lowest `M<n>`.
 
-Revisit the area already on the issue against the Areas table in the `issue-authoring`
-skill. Keep it or replace it. An issue that names more than one of those trees, or none,
-stays without an area, and the confirmation table says why. Record the choice there with
-the milestone.
+Revisit the area against [Labels](#labels). Record the choice in the confirmation table
+with the milestone.
 
 ## Priority is the milestone
 
@@ -135,12 +131,11 @@ order — each PR is based on the one before — so its issues can share a miles
 
 ## Labels
 
-`agent` is set only by the dispatch rule above. Area and `bug` are defined in the
-`issue-authoring` skill. The author may have set them. Keep each or replace it. The
-milestone stays the priority.
+`agent` stays the dispatch rule above. Area and `bug` are the Areas table in the
+`issue-authoring` skill. The author may have set them. Keep each or replace it.
 
-#181, #84, #153 and #182 have no area: each one names more than one tree, or none. A new
-issue in that shape stays unlabeled, and the report says why.
+#181, #84, #153 and #182 carry no area. The report says why for any newer issue that
+Areas leaves unlabeled.
 
 Done when the confirmation table names one area, or names the issue unlabeled and why.
 
@@ -154,15 +149,12 @@ Run through these in order. Triage is done when every step's criterion holds.
    ```
    Read each issue in full (`gh issue view <n> --comments`) and place it with the rule above.
    Done when the inbox list is empty.
-2. **One area each.** Revisit the area on every open issue, including one set at filing, and
-   keep it or replace it. The names are the Areas table in the `issue-authoring` skill:
-   `delivery`, `scheduler`, `worker`, `ops`, `workspace`, `guidelines`, `tracker`. An issue
-   that names more than one of those trees, or none, stays unlabeled (#181, #84, #153,
-   #182, and any newer one the report names).
+2. **One area each.** Revisit every open issue's area per [Labels](#labels). The names in
+   the query are the Areas table in `issue-authoring`.
    ```bash
    gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker)$"))]} | select(.a|length != 1) | .n'
    ```
-   Done when that list is only the explained exceptions.
+   Done when that list is only the issues Labels names, plus any newer one the report explains.
 3. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any
    that is not. Then check each has a linked PR or recent progress:
    ```bash

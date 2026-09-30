@@ -73,6 +73,6 @@ instead of restating it; say what to do, not what to avoid.
    file to change, the proposed title. Then stop and wait.
 
 7. **File on the operator's say-so**, one issue per candidate, with the `issue-authoring`
-   skill. `## Why` opens with the turns this cost and the run. `**Boundary:**` names the
-   ADR 1 boundary, or `none, a docs/CI change`. `## Triggered by` names the run id, the PR
-   and the date.
+   skill. `## Why` opens with the turns this cost and the run. When no ADR 1 boundary fits,
+   the line is `**Boundary:** none, because a docs/CI change`. `## Triggered by` names the
+   run id, the PR and the date.

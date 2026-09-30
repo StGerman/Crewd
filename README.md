@@ -163,7 +163,7 @@ keyboard, and the documentation is split to match:
 The commit gate is `cargo test`, `cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --check`. CI runs all three on every push and pull request.
 
-Open an issue with the `issue-authoring` skill, from the work template. Triage adds `agent`
+Open an issue with the `issue-authoring` skill. Triage adds `agent`
 when the daemon should pick it up. The issue needs enough context to act on — the invariant
 table in `docs/invariants.md` is the standard the codebase holds itself to, and an issue that
 names which invariant is at stake is one an agent can finish.
