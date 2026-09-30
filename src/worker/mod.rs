@@ -252,6 +252,18 @@ impl<'a> Spawn<'a> {
     }
 }
 
+/// What a failed `Command::spawn` is. `NotFound` is the binary missing (#216), which pauses
+/// that worker until the daemon restarts. Anything else — permission, a full process table —
+/// is this run's failure: treating it as a missing binary would pause the worker for the life
+/// of the process over an error that is not one.
+pub(crate) fn spawn_failure_class(err: &std::io::Error) -> crate::model::ErrorClass {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        crate::model::ErrorClass::AgentNotFound
+    } else {
+        crate::model::ErrorClass::AgentCrash
+    }
+}
+
 pub trait Worker: Send + Sync {
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle>;
 

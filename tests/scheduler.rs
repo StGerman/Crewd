@@ -1225,6 +1225,7 @@ fn a_missing_worker_binary_pauses_that_worker_and_quarantines_nothing() {
         assert_eq!(st.consecutive_fail, 2, "{id} must keep the identical-failure streak it had");
         assert!(!st.is_quarantined(), "{id} must not be quarantined for a missing binary");
         assert_eq!(st.phase, Phase::Released, "{id} must be dispatchable again, not parked");
+        assert_eq!(st.session_id, None, "{id} drops the session the CLI never created");
         assert_eq!(h.worker.sessions_for(id).len(), 1, "{id} is not dispatched again");
     }
     assert!(
@@ -1269,12 +1270,14 @@ fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
 
     assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "claude is paused and takes nothing more");
     assert_eq!(grok.sessions_for("iss-1").len(), 1, "grok takes the issue claude could not start");
-    let fed = grok.feedback_for("iss-1");
-    let [Feedback::Handoff { from, why, .. }] = fed[0].as_slice() else {
-        panic!("the handoff carries a brief: {fed:?}");
-    };
-    assert_eq!(from, "claude");
-    assert!(why.contains(MISSING_BIN), "{why}");
+    // A first spawn names a session the CLI never created, so there is no conversation to
+    // hand over and nothing was queued for the run that never started.
+    assert!(matches!(&grok.sessions_for("iss-1")[0], Session::New(_)));
+    assert!(
+        grok.feedback_for("iss-1")[0].is_empty(),
+        "a first spawn queued nothing and named no conversation to hand off: {:?}",
+        grok.feedback_for("iss-1")
+    );
     let missing = h.sched.snapshot().unwrap().missing_binaries;
     assert_eq!(missing.len(), 1, "{missing:?}");
     assert_eq!((missing[0].worker.as_str(), missing[0].binary.as_str()), ("claude", MISSING_BIN));
@@ -1286,6 +1289,105 @@ fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
     assert_eq!(grok.sessions_for("iss-2").len(), 1, "grok keeps dispatching");
     assert!(h.worker.sessions_for("iss-2").is_empty());
     assert_eq!(h.sched.snapshot().unwrap().missing_binaries.len(), 1);
+}
+
+/// A session the CLI already created stays across the missing-binary restart, and the brief
+/// the failed spawn never read reaches the worker that takes the issue over (#216).
+#[test]
+fn a_resumed_session_survives_a_missing_binary_and_its_brief_reaches_the_next_worker() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_bin(MISSING_BIN);
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "suite failed".into() }),
+    );
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let session = h
+        .sched
+        .store()
+        .get("iss-1")
+        .unwrap()
+        .unwrap()
+        .session_id
+        .expect("the run started a session");
+    let first = h.worker.sessions_for("iss-1")[0].id().to_string();
+    assert_eq!(session, first);
+
+    h.worker.set_default(agent_not_found());
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert!(
+        matches!(h.worker.sessions_for("iss-1").last(), Some(Session::Resume(id)) if id == &session)
+    );
+
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "claude is paused");
+    let fed = grok.feedback_for("iss-1");
+    assert_eq!(fed.len(), 1, "{fed:?}");
+    let [Feedback::Handoff { from, why, .. }, Feedback::Gate { output }] = fed[0].as_slice() else {
+        panic!("handoff plus the brief the failed spawn never read: {fed:?}");
+    };
+    assert_eq!(from, "claude");
+    assert!(why.contains(MISSING_BIN), "{why}");
+    assert!(output.contains("suite failed"), "{output}");
+    let parked = h.sched.store().take_parked_session("iss-1", "claude").unwrap();
+    assert_eq!(parked.map(|(id, _)| id).as_deref(), Some(session.as_str()));
+}
+
+/// Feedback `launch` took for a spawn that never started is handed to the worker that takes
+/// the issue over: a gate brief and a delivery hand-back, with no conversation to resume (#216).
+#[test]
+fn a_spawn_that_never_started_returns_the_feedback_it_took() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_bin(MISSING_BIN);
+    h.worker.set_default(agent_not_found());
+    grok.set_default(Script::succeeds_in(60_000));
+
+    let clock = Arc::clone(&h.clock);
+    h.sched
+        .store()
+        .ensure(clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1"))
+        .unwrap();
+    let gate = Feedback::Gate { output: "conflict in CLAUDE.md".into() };
+    h.sched
+        .store()
+        .set_pending_feedback(clock.as_ref(), "iss-1", &serde_json::to_string(&gate).unwrap())
+        .unwrap();
+    h.sched.store().begin_delivery(clock.as_ref(), "iss-1", None).unwrap();
+    let review = Feedback::Review {
+        pr_url: "https://example/pr/1".into(),
+        comments: vec![],
+        unanswered_before: vec![],
+    };
+    h.sched
+        .store()
+        .requeue_delivery_feedback(
+            clock.as_ref(),
+            "iss-1",
+            &serde_json::to_string(&review).unwrap(),
+        )
+        .unwrap();
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "claude is paused");
+    assert!(matches!(&grok.sessions_for("iss-1")[0], Session::New(_)));
+    let fed = grok.feedback_for("iss-1");
+    assert_eq!(fed.len(), 1, "{fed:?}");
+    let [Feedback::Gate { output }, Feedback::Review { pr_url, .. }] = fed[0].as_slice() else {
+        panic!("the brief and the hand-back the failed spawn never read: {fed:?}");
+    };
+    assert!(output.contains("conflict in CLAUDE.md"), "{output}");
+    assert_eq!(pr_url, "https://example/pr/1");
 }
 
 /// A session id means nothing to another provider, so a continuation goes back to the worker

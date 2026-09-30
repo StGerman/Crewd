@@ -128,7 +128,16 @@ struct Running {
     verdicts: Vec<ReviewVerdict>,
     /// The delivery hand-back this run was dispatched to answer, kept so a gate that sends the
     /// run back can queue it again rather than delivery charging a second round for it (#160).
+    /// Also what a spawn that never started puts back: `launch` had already taken it (#216).
     handed_back: Option<Feedback>,
+    /// Issue-level feedback `launch` took for this run — a queued conflict or gate brief, or
+    /// the retry reason when that was the prompt's only item. Put back if the process never
+    /// started, because nothing read it (#216).
+    queued_feedback: Option<Feedback>,
+    /// This run named a new session the CLI has never created. A spawn that fails before the
+    /// process exists must drop that id: the next attempt would `--resume` a conversation that
+    /// does not exist. A resumed session is one the CLI already has, and stays (#216).
+    fresh_session: bool,
     /// This run's authority to write to the tracker, held for exactly as long as the run is in
     /// the `running` map. Never read — dropping it is the point. Every path that ends a run
     /// removes the entry, so every path revokes the token and deletes the config file without
@@ -483,9 +492,10 @@ impl Scheduler {
                 }
             }
 
-            // A binary that cannot be spawned is the worker's failure, not this issue's: the
+            // A binary that cannot be found is the worker's failure, not this issue's: the
             // same release as a rate limit, and a pause that lasts until restart (#216).
-            // `model_not_found` is deliberately not this path — the model is per run.
+            // Only `ErrorKind::NotFound` is classified this way; a permission or resource
+            // error stays on the ordinary path below. `model_not_found` does too.
             if matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }) {
                 self.pause_for_missing_binary(&issue_id, &r)?;
                 continue;
@@ -572,6 +582,10 @@ impl Scheduler {
     /// The worker's binary could not be spawned. The claim is released uncharged
     /// (`Store::release_for_rate_limit`), and dispatch to this worker stays paused for the
     /// rest of the process: the path is not looked up again on a later tick (#216).
+    ///
+    /// `launch` has already taken this run's feedback and named its session. Nothing read
+    /// either: the feedback goes back, and a session minted for this spawn is dropped. A
+    /// session the run was resuming is one the CLI already has, and stays.
     fn pause_for_missing_binary(&mut self, issue_id: &str, r: &Running) -> anyhow::Result<()> {
         let p = r.handle.progress();
         self.store.finish_run(
@@ -582,6 +596,26 @@ impl Scheduler {
             p.tokens,
         )?;
         self.store.add_turns(issue_id, p.turns)?;
+        // A sync brief is absent here: the next `sync_before_run` writes it again.
+        if let Some(fb) = &r.queued_feedback {
+            self.store.set_pending_feedback(
+                self.clock.as_ref(),
+                issue_id,
+                &serde_json::to_string(fb)?,
+            )?;
+        }
+        if let Some(fb) = &r.handed_back {
+            self.store.requeue_delivery_feedback(
+                self.clock.as_ref(),
+                issue_id,
+                &serde_json::to_string(fb)?,
+            )?;
+        }
+        if r.fresh_session {
+            // Minted for this spawn. The CLI never created the conversation, and a later
+            // `--resume` of it fails with no turns and charges a retry that did not need to happen.
+            self.store.set_session(self.clock.as_ref(), issue_id, None)?;
+        }
         self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
 
         let binary = self
@@ -1692,6 +1726,15 @@ impl Scheduler {
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
             .and_then(|j| parse(j, "delivery"));
+        // Kept on the run, not only copied into the prompt: a spawn that never starts has to
+        // put these back, and the retry reason is only in the prompt when nothing else was.
+        let queued_feedback = match &queued {
+            Some(fb) => Some(fb.clone()),
+            None if synced.is_none() && delivery.is_none() => {
+                brief.map(|b| Feedback::Gate { output: b.to_string() })
+            }
+            None => None,
+        };
         let mut feedback: Vec<Feedback> =
             synced.into_iter().chain(queued).chain(delivery.clone()).collect();
         if feedback.is_empty()
@@ -1757,6 +1800,8 @@ impl Scheduler {
                 last_progress_at: now,
                 verdicts: Vec::new(),
                 handed_back: delivery,
+                queued_feedback,
+                fresh_session: matches!(session, crate::worker::Session::New(_)),
                 _broker: broker_session,
             },
         );

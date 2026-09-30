@@ -299,7 +299,13 @@ failure quarantines a ticket nothing is wrong with. `harvest_finished` releases 
 tick and the binary is not re-resolved; a restart is what #218's startup check is for.
 `Snapshot::missing_binaries` names the worker and the path, beside
 `rate_limit_pauses`, so `status` reads "grok paused: binary not found (/path/to/grok)" rather
-than an idle worker. `model_not_found` stays on the ordinary per-run path.
+than an idle worker. `model_not_found` stays on the ordinary per-run path. Only
+`ErrorKind::NotFound` is classified `agent_not_found`: a permission or resource error on spawn
+stays on that ordinary path, because a pause that lasts until restart is for a binary that is
+gone. A `Session::New` written before the failed spawn is cleared — the CLI never created the
+conversation — and a session the run was resuming is kept. Feedback `launch` had already taken
+is put back for the next run. A sync brief is left for the next `sync_before_run`, which
+writes it again.
 
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it

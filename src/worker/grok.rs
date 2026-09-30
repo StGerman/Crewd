@@ -280,7 +280,7 @@ impl Worker for GrokWorker {
                     );
                 }
                 return finished(Outcome::Failed {
-                    class: ErrorClass::AgentNotFound,
+                    class: super::spawn_failure_class(&e),
                     msg: format!("spawning {}: {e}", self.bin.display()),
                 });
             }
@@ -1117,6 +1117,28 @@ mod tests {
         let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         assert_eq!(h.progress().tokens.map(|t| (t.input, t.output)), Some((1, 1)));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// The missing-binary pause lasts until restart (#216). A binary that is present but cannot
+    /// be executed must stay a per-run failure, or one `EACCES` takes the worker out for the
+    /// life of the process.
+    #[test]
+    fn a_binary_that_exists_but_cannot_be_executed_is_not_a_missing_binary() {
+        let ws = tmp_workspace("not-exec");
+        let bin = ws.join("grok");
+        std::fs::write(&bin, b"#!/bin/sh\necho hi\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let w = GrokWorker::new(&bin, vec![], 0);
+        let outcome = wait_for_finish(&w.spawn(Spawn::new(&issue(), &ws, 0, &fresh())));
+        assert!(
+            matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }),
+            "got {outcome:?}"
+        );
+
         std::fs::remove_dir_all(&ws).ok();
     }
 }
