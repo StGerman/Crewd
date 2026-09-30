@@ -1,10 +1,13 @@
 ---
-source: src/worker/claude.rs
-expression: "build_prompt(&issue(), None, &[], &wip)"
+source: src/worker/prompt.rs
+expression: "build_prompt(&issue, None, &[], &[])"
 ---
 You are working on issue MT-1: t
 
 Keep a checkpoint at the path `git rev-parse --git-path crew/checkpoint.md` prints in this worktree. If it already exists, read it before anything else and do not repeat what it covers. Update it after each commit with the acceptance criteria and the status of each, the last commit that passed the commit-gate commands, and the next action. Git does not track that path, so the file cannot be committed.
+
+Description:
+Do the work.
 
 Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
 
@@ -13,13 +16,3 @@ CREW_OUTCOME: continue: <one-sentence reason>
 
 If you are stuck and need a human to unblock you, end your final message with:
 CREW_OUTCOME: blocked: <one-sentence reason>
-
-Earlier runs on this issue were stopped with uncommitted work, and the orchestrator saved it to the refs below, oldest first — each a commit on top of the branch head it was taken from, not on your branch. Decide whether each is still useful. To apply one: `git cherry-pick --no-commit <ref>`. Once you have applied or discarded it, delete it with `git update-ref -d <ref>` so the next run is not told about it again.
-
-`refs/crew/wip/iss-1-abc/000001-0123456789ab`:
- half.txt | 1 +
- 1 file changed, 1 insertion(+)
-
-`refs/crew/wip/iss-1-abc/000002-ba9876543210`:
- src/lib.rs | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)

@@ -4,7 +4,7 @@ expression: "build_continuation_prompt(&issue(), None, &fb, &[], false)"
 ---
 Continue working on MT-1. Since your previous session on this issue, another agent held it; who, and why it stopped, is below. The working directory is the same worktree, with whatever you committed still in it.
 
-Before anything else, read `$(git rev-parse --git-dir)/crew/checkpoint.md` if it exists, and do not repeat what it covers. Update it after each commit. It holds the acceptance criteria with the status of each, the last commit that passed the commit-gate commands, and the next action. The path is the worktree's git directory, which git does not track, so the file cannot be committed.
+Keep a checkpoint at the path `git rev-parse --git-path crew/checkpoint.md` prints in this worktree. If it already exists, read it before anything else and do not repeat what it covers. Update it after each commit with the acceptance criteria and the status of each, the last commit that passed the commit-gate commands, and the next action. Git does not track that path, so the file cannot be committed.
 
 The same rules apply: commit as you go, and when the work is fully complete, simply stop. If you need another turn, end your final message with a line reading exactly:
 CREW_OUTCOME: continue: <one-sentence reason>

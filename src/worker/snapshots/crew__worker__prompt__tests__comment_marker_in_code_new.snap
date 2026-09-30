@@ -4,7 +4,7 @@ expression: new
 ---
 You are working on issue MT-1: t
 
-If `$(git rev-parse --git-dir)/crew/checkpoint.md` exists, read it before anything else and do not repeat what it covers. Update it after each commit. It holds the acceptance criteria with the status of each, the last commit that passed the commit-gate commands, and the next action. The path is the worktree's git directory, which git does not track, so the file cannot be committed.
+Keep a checkpoint at the path `git rev-parse --git-path crew/checkpoint.md` prints in this worktree. If it already exists, read it before anything else and do not repeat what it covers. Update it after each commit with the acceptance criteria and the status of each, the last commit that passed the commit-gate commands, and the next action. Git does not track that path, so the file cannot be committed.
 
 Description:
 Before.

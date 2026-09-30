@@ -1359,6 +1359,36 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 
+    /// The agent writes its checkpoint where `git rev-parse --git-path` points in a prepared
+    /// worktree (#186). That path must stay out of `git status` and outside the worktree, or
+    /// `git add -A` would commit it.
+    #[test]
+    fn the_checkpoint_path_is_outside_the_tracked_tree() {
+        let root = tmp_root("wt-checkpoint");
+        let repo = tmp_repo("wt-checkpoint");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let wt = ws.prepare("id-1", "MT-1").unwrap().path;
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&wt).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let rel = git(&["rev-parse", "--git-path", crate::worker::prompt::CHECKPOINT_GIT_PATH]);
+        let checkpoint = wt.join(rel);
+        std::fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
+        std::fs::write(&checkpoint, "acceptance: open\nlast green commit: none\nnext: start\n")
+            .unwrap();
+
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert!(status.is_empty(), "the checkpoint must not change git status, got {status:?}");
+        let checkpoint = checkpoint.canonicalize().unwrap();
+        assert!(!checkpoint.starts_with(wt.canonicalize().unwrap()), "{}", checkpoint.display());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
     #[test]
     fn two_issues_sharing_an_identifier_get_two_distinct_worktrees() {
         let root = tmp_root("wt-two-issues");
