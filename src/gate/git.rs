@@ -263,6 +263,24 @@ impl GateRun {
             }
         };
 
+        // Ahead of counting commits (review on #195): a branch still at the base can be mid-merge
+        // too, and `base..HEAD` is empty then, so the count would call it `NoCommits`.
+        // A rebase or merge the agent left unfinished is neither the branch it committed nor one
+        // the gate may start another on: a rebase paused cleanly leaves `HEAD` a replayed commit
+        // on the base, handed off with the rest never replayed, and one this gate started and
+        // aborted would abort the agent's too, reporting its unresolved paths as a new conflict.
+        for (what, in_progress) in
+            [("rebase", self.rebase_in_progress(ws)), ("merge", self.merge_in_progress(ws))]
+        {
+            if in_progress {
+                return Verdict::Stuck {
+                    step: "check the branch against the base".into(),
+                    output: format!(
+                        "the worktree is in the middle of a {what} that was never finished"
+                    ),
+                };
+            }
+        }
         let ahead = self
             .git(ws, &["rev-list", "--count", &format!("{base_sha}..HEAD")])
             .ok()
@@ -292,22 +310,6 @@ impl GateRun {
             // A probe killed mid-flight reads as "not an ancestor"; without this the stop
             // request would be answered by starting a rebase.
             return stopped("check the branch against the base", false);
-        }
-        // A rebase or merge the agent left unfinished is neither the branch it committed nor one
-        // the gate may start another on: a rebase paused cleanly leaves `HEAD` a replayed commit
-        // on the base, handed off with the rest never replayed, and one this gate started and
-        // aborted would abort the agent's too, reporting its unresolved paths as a new conflict.
-        for (what, in_progress) in
-            [("rebase", self.rebase_in_progress(ws)), ("merge", self.merge_in_progress(ws))]
-        {
-            if in_progress {
-                return Verdict::Stuck {
-                    step: "check the branch against the base".into(),
-                    output: format!(
-                        "the worktree is in the middle of a {what} that was never finished"
-                    ),
-                };
-            }
         }
         let base_updated = if contains_base {
             // Skipping the rebase skips its refusal of a dirty tree too, and delivery pushes
@@ -1280,6 +1282,25 @@ mod tests {
             git(&wt, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_ok(),
             "the agent's merge must be left as it was"
         );
+        assert!(!wt.join("gate-ran").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review on #195: a branch with no commits of its own can still be mid-merge, and then
+    /// `base..HEAD` is empty. It is stuck, not `NoCommits`.
+    #[test]
+    fn a_worktree_mid_merge_with_no_commits_of_its_own_is_stuck() {
+        let (dir, repo, wt) = repo_and_worktree("mid-merge-no-commits");
+        sh_git(&wt, &["switch", "-q", "-c", "side"]);
+        commit(&wt, "side.txt", "side\n", "a side commit");
+        sh_git(&wt, &["switch", "-q", "-"]);
+        sh_git(&wt, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        assert!(matches!(verdict, Verdict::Stuck { .. }), "{verdict:?}");
         assert!(!wt.join("gate-ran").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
