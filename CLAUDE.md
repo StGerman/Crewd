@@ -227,8 +227,10 @@ agent will pick up, and the `issue-triage` skill decides which carry it.
 naming the outcome we want. The issue body is the durable work specification; tracker comments
 do not reach the prompt, so a decision, a scope cut and an acceptance criterion go there.
 HTML comments in the body are stripped before dispatch. File it with no milestone and no
-labels. The issue-triage skill places it and chooses its one area label: `delivery`,
-`scheduler`, `worker`, `ops`, `workspace`, `guidelines`, or `tracker`.
+`agent` label. One area label may be set then — `delivery`, `scheduler`, `worker`, `ops`,
+`workspace`, `guidelines`, or `tracker` — and `bug` when shipped behavior is false. The
+issue-triage skill revisits those labels, and leaves an issue unlabeled when it names more
+than one of those areas or none.
 
 `crew.github.toml` turns on every real seam: the GitHub tracker, the `claude` worker, the tool
 broker, transcripts, the handoff gate (naming the commit-gate commands) and delivery. `crew.toml`,

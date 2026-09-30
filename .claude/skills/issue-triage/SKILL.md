@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: Triage this repo's GitHub Issues into the milestone/`agent`-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising a new issue, planning the next milestone after one closes, or filing an issue yourself — an agent-filed issue lands in the inbox with no milestone and no labels.
+description: Triage this repo's GitHub Issues into the milestone/`agent`-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising a new issue, planning the next milestone after one closes, or filing an issue yourself — an agent-filed issue lands in the inbox with no milestone and no `agent` label; other labels may be set, and triage revisits them.
 ---
 
 # Issue triage
@@ -58,8 +58,9 @@ on their explicit say-so, and only to an issue that is:
   description (see below) before the issue is made dispatchable.
 
 When you file an issue yourself (found a bug mid-task, split out follow-up work), leave it in
-the Inbox with no milestone and no labels, and say in the body what triggered it.
-Placing it, including its one area label, is triage's job, not the author's.
+the Inbox with no milestone and no `agent` label. Set one area label when the change has a
+single home, and `bug` when shipped behavior is false. Say in the body what triggered it.
+Triage revisits every label on the issue. `agent` is added only by the rule above.
 
 ## Decisions go into the description
 
@@ -123,8 +124,9 @@ Apply this rule top-down; the first match wins.
 
 "Current milestone" is the open milestone with the lowest `M<n>`.
 
-Set the issue's one area label, from [Labels](#labels), in the same confirmation table as the
-milestone.
+Revisit the area already on the issue. Keep it or replace it from [Labels](#labels). An issue
+that names more than one of those trees, or none, stays without an area, and the table says
+why. Record the choice in the same confirmation table as the milestone.
 
 ## Priority is the milestone
 
@@ -149,6 +151,8 @@ An issue carries three independent marks: `agent` or not, `bug` or not, and one 
 
 `agent` is set only by the dispatch rule above. `bug` means shipped behavior is false.
 The milestone stays the priority either way.
+
+The author may set the area, and `bug`, at filing. Triage keeps each or replaces it.
 
 The area is where the change lands. Exactly one:
 
@@ -180,9 +184,10 @@ Run through these in order. Triage is done when every step's criterion holds.
    ```
    Read each issue in full (`gh issue view <n> --comments`) and place it with the rule above.
    Done when the inbox list is empty.
-2. **One area each.** Every open issue carries exactly one of `delivery`, `scheduler`,
-   `worker`, `ops`, `workspace`, `guidelines`, `tracker`, aside from #181, #84, #153, #182
-   and any newer issue the report names as unlabeled.
+2. **One area each.** Revisit the area on every open issue, including one set at filing, and
+   keep it or replace it. Exactly one of `delivery`, `scheduler`, `worker`, `ops`,
+   `workspace`, `guidelines`, `tracker`, aside from an issue that names more than one of
+   those trees or none (#181, #84, #153, #182, and any newer one the report names).
    ```bash
    gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker)$"))]} | select(.a|length != 1) | .n'
    ```
