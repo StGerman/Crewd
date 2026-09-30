@@ -532,6 +532,13 @@ fn run_reader(
                 if let Some(t) = last_event {
                     g.progress.last_event = Some(t);
                 }
+                // A turn after a `result` makes that `result` provisional (#214). If this turn
+                // ends in a crash or a budget cut instead of another `result`, the earlier
+                // verdict, totals and review verdicts must not stand in for it.
+                if terminal.take().is_some() {
+                    g.progress.tokens = None;
+                    g.verdicts.clear();
+                }
                 drop(g);
 
                 if max_turns_per_session > 0 && turns >= max_turns_per_session {
@@ -1393,8 +1400,47 @@ mod tests {
         let p = h.progress();
         assert_eq!(p.turns, 1);
         assert_eq!(p.tokens.map(|t| t.output), Some(5), "totals come from the last result");
+        let v = h.verdicts();
+        assert_eq!(v.len(), 1, "only the last result's verdicts: {v:?}");
+        assert_eq!((v[0].comment_id.as_str(), v[0].verdict), ("222", Verdict::Rejected));
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches(r#""type":"result""#).count(), 2, "{text}");
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// A turn after an early `result` that dies without its own is a crash, not the early
+    /// `result`'s `Done`: that would hand unfinished work to the gate (#214).
+    #[test]
+    fn a_turn_after_an_early_result_that_ends_without_one_reads_as_a_crash() {
+        let ws = tmp_workspace("result-then-crash");
+        let w = ClaudeWorker::new(fixture("result_then_crash.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+
+        let outcome = wait_for_finish(&h);
+        assert!(
+            matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(h.progress().tokens, None);
+        assert!(h.verdicts().is_empty(), "the early result's verdicts must not survive");
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// The same turn cut by the session budget reads as the budget's `Continue`, and its total
+    /// is unknown rather than the early `result`'s zero (#214).
+    #[test]
+    fn a_budget_cut_after_an_early_result_reports_no_token_total() {
+        let ws = tmp_workspace("result-then-budget");
+        let w = ClaudeWorker::new(fixture("result_then_budget.sh"), vec!["PATH".into()], 1);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+
+        assert_eq!(
+            wait_for_finish(&h),
+            Outcome::Continue { why: "session turn budget reached".into() }
+        );
+        assert_eq!(h.progress().tokens, None);
 
         std::fs::remove_dir_all(&ws).ok();
     }

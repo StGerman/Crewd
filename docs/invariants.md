@@ -25,7 +25,7 @@ reading — check that the named test is still meaningful, not just still green.
 |---|---|---|
 | Backoff cannot overflow or collapse | cap the *exponent* (`EXP_CAP = 16`), not just the product | `backoff_never_overflows_or_collapses_at_any_attempt_count` |
 | No 1s continuation respawn loop | explicit `Outcome` verdict + escalating delay + `max_turns_per_issue` | `continuation_backs_off_instead_of_respawning_every_second` |
-| A run's verdict is its last `result`, not its first | the Claude reader reads the stream to its end and each `result` replaces the one before, so an empty `result` a resumed session emits first cannot stand in for the turn it was resumed for (#214) | `a_run_that_emits_two_results_is_judged_on_the_last` |
+| A run's verdict is its last `result`, not its first | the Claude reader reads the stream to its end and each `result` replaces the one before, so an empty `result` a resumed session emits first cannot stand in for the turn it was resumed for; a turn after a `result` clears it, so that turn's crash or budget cut is what the run reports (#214) | `a_run_that_emits_two_results_is_judged_on_the_last`, `a_turn_after_an_early_result_that_ends_without_one_reads_as_a_crash`, `a_budget_cut_after_an_early_result_reports_no_token_total` |
 | A finished issue is not re-dispatched | `parked_state`, cleared only when the ticket actually moves | `a_finished_issue_is_not_re_dispatched_while_its_state_is_unchanged` |
 | Permanent failures stop | `ErrorClass::retryable()` → immediate quarantine | `a_permanent_failure_quarantines_immediately_rather_than_retrying_forever` |
 | One tracker blip cannot kill a run | `refresh_miss_grace`, reset on reappearance | `one_invisible_refresh_is_survivable_but_two_are_not` |
