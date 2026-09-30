@@ -29,8 +29,8 @@ fn d_mcp_bind() -> String {
 ///
 /// Deliberately absent from `crewd`'s `Config::preflight`: preflight gates *dispatch*, so validating
 /// the bind address there would let a typo in a field the scheduler does not use stop the
-/// scheduler. The address is parsed once, by `crewd`'s `api::bind`, where a failure costs the
-/// API and nothing else.
+/// scheduler. The address is parsed once, by `crewd`'s `api::bind` at startup, and only when the
+/// API is on; a failure there stops startup naming the address (#218).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     #[serde(default)]

@@ -60,8 +60,7 @@
 //! `api.mcp_enabled`, or `--mcp <addr>` for one run; loopback unless `api.allow_public` says
 //! otherwise, through the same [`resolve_bind`](super::resolve_bind) the HTTP API uses, because
 //! the two surfaces carry the same two write actions and one flag should govern both. A bind
-//! failure costs this server alone — `main` logs it and schedules on — matching how
-//! [`super::bind`] already fails.
+//! failure stops crewd at startup naming the address, as [`super::bind`]'s does (#218).
 //!
 //! `allow_public` is what makes the transport's own bounds load-bearing here, and it is the
 //! reason they exist: the broker's listener is always loopback and serves a handful of workers,

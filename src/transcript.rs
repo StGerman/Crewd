@@ -24,9 +24,9 @@
 //!   that runs for months otherwise fills the disk with the thing that was supposed to make it
 //!   debuggable.
 //!
-//! Best-effort throughout, the same contract [`crate::project`] has: every failure here is
-//! logged and swallowed. A transcript that cannot be opened costs a post-mortem, never a
-//! dispatch.
+//! Best-effort per run: a transcript that cannot be opened or written is logged and swallowed,
+//! and costs a post-mortem, never a dispatch. A root that [`Transcripts::new`] cannot create is
+//! the exception, and stops crewd at startup (#218).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
