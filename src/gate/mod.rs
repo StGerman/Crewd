@@ -74,14 +74,17 @@ pub enum Verdict {
         output: String,
         /// Whether the branch is sitting on the base by the time this failed.
         ///
-        /// False for every step that runs before the rebase — resolving the base, counting
-        /// commits — and for a rebase that was refused and therefore aborted. True once the
-        /// branch is on the base — rebased, or already containing its tip — which covers a
-        /// command failing *on the base* and a dirty tree refused on a branch that skipped the
-        /// rebase because it already contained the base. The scheduler needs the distinction because it tells the agent where its work
-        /// now sits: saying "the branch has been rebased, fix this on top of it" when nothing
-        /// was rebased describes a tree the agent will not find, and an agent that cannot
-        /// reconcile the instruction with what it sees tends to report `Done` again unchanged.
+        /// False for every step that runs before the branch is brought onto the base —
+        /// resolving it, counting commits — and for a rebase or merge that was refused or
+        /// aborted, which puts the branch back where the agent left it. True once the branch
+        /// is on the base: rebased onto it, merged onto it, or already containing its tip.
+        /// That covers a command failing after a merge as well as after a rebase, and a dirty
+        /// tree refused on a branch that already contained the base. A dirty tree refused
+        /// before the merge that would get it there is false. The scheduler needs the
+        /// distinction because it tells the agent where its work now sits: saying the branch
+        /// is on the base when the rebase or merge never landed describes a tree the agent
+        /// will not find, and an agent that cannot reconcile the instruction with what it
+        /// sees tends to report `Done` again unchanged.
         ///
         /// Distinct from [`Verdict::Passed`]'s `base_updated`, which answers a different
         /// question — whether a rebase or merge *moved* anything. A branch already on the base

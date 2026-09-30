@@ -124,7 +124,7 @@ reading — check that the named test is still meaningful, not just still green.
 | A gate command that can never start is refused at startup | `preflight` rejects a blank program name as well as an empty argv, so a typo costs one error instead of every run of the issue | `a_gate_that_could_never_escalate_or_never_start_is_rejected` |
 | The gate's own git subprocesses are killable | every `git` the gate runs goes through `spawn_tracked`, so `pgid` is set for the rebase and not only for a configured command; the rebase re-checks `killed` before it spawns, since a probe killed just before it reads as an ordinary failure | `killing_a_gate_during_the_rebase_step_stops_the_git_subprocess_instead_of_leaving_it_running`, `a_gate_stopped_before_its_rebase_starts_does_not_rebase` |
 | A gate that cannot start reports rather than panics | a supervising thread the OS refuses becomes `Verdict::Failed`, which is what `Gate::start` promises; a panic here would strand the claim until the next startup | `a_gate_whose_supervising_thread_cannot_be_spawned_reports_failed_instead_of_panicking` |
-| A brief describes the tree the agent will find | `Verdict::Failed` carries `on_base`, false for every step before the rebase and for a rebase that was aborted | `a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased` |
+| A brief describes the tree the agent will find | `Verdict::Failed` carries `on_base`, false for every step before the branch is brought onto the base and for a rebase or merge that was refused or aborted, true once it is on the base by a rebase, a merge, or already containing the tip | `a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased` |
 
 ## Delivery
 
