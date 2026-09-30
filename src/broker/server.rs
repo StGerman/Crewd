@@ -36,8 +36,8 @@
 //! would then answer at the same address, which is exactly the address every dispatched worker
 //! is handed. Keeping them on separate ports is what makes "crewd never hands a worker the ops
 //! tools" a property of the wiring rather than of a prefix check. It does not make them
-//! unreachable: a worker inherits the operator's MCP config, and that is accepted (see
-//! [`crate::api::mcp`]).
+//! unreachable: a same-user process can still call the loopback HTTP API (#135). The worker
+//! does not load the operator's MCP config (#191); see [`crate::api::mcp`].
 //!
 //! ## What the real client does
 //!

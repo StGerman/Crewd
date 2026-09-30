@@ -56,7 +56,7 @@ cargo run -p crewctl -- status             # what a running daemon is doing, rea
 cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
 cargo run -- --mcp 127.0.0.1:8788          # the ops API's routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
-                                           # ...and how that agent gets them; workers inherit it too
+                                           # ...and how that agent gets them; workers do not (#191)
 cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
@@ -280,7 +280,9 @@ Decisions already taken that are expensive to rediscover. The first two are impl
   (`DEFAULT_ENV_ALLOWLIST`) — not inherit-and-scrub. A denylist is fragile, and one missed
   variable leaks a tracker credential into a coding agent. Notably absent by default: any
   tracker credential and any API key — an operator on API-key auth adds `ANTHROPIC_API_KEY`
-  deliberately, it is not there by default.
+  deliberately, it is not there by default. `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` is written
+  after that copy, so an allowlisted value of the same name cannot turn auto memory back on
+  (#191).
 - The worker execs the `claude` binary directly (`Command::new`, never a shell). **No `bash
   -lc`.** A login shell re-imports from the operator's dotfiles exactly the secrets that were
   just scrubbed.

@@ -368,11 +368,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // The same surface as tools, on its own listener, bound at startup like the HTTP API's. It
-    // is served by the broker's transport
-    // but is deliberately *not* the broker — nothing here passes it to `Broker`, and the
-    // `--mcp-config` crewd gives a worker is written by `Broker::open` alone, so crewd never
-    // hands a dispatched agent this address (`a_dispatched_worker_is_not_handed_the_ops_tools`).
-    // A worker can still inherit it from the operator's own MCP config; see `api::mcp`.
+    // is served by the broker's transport but is deliberately *not* the broker — nothing here
+    // passes it to `Broker`, and the `--mcp-config` crewd gives a worker is written by
+    // `Broker::open` alone, so crewd never hands a dispatched agent this address
+    // (`a_dispatched_worker_is_not_handed_the_ops_tools`). `--strict-mcp-config` keeps the
+    // operator's own registration from loading too (#191); the loopback HTTP API remains
+    // (#135). See `api::mcp`.
     if let Some(listener) = mcp_listener {
         let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
         let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));

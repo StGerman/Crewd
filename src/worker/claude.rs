@@ -24,10 +24,8 @@
 //!   not have.
 //! * **`--bare` requires `ANTHROPIC_API_KEY`.** An operator authenticated via OAuth (the
 //!   default interactive login, and what this project's own dev machine uses) has no such key,
-//!   and `--bare` fails outright without one. This worker does not pass `--bare`, so it
-//!   inherits whatever hooks, plugins and MCP servers the operator's own `claude` config
-//!   already has — worth knowing before dispatching against a machine with heavy global hook
-//!   configuration, and worth revisiting once a dedicated API key exists for headless dispatch.
+//!   and `--bare` fails outright without one. This worker does not pass `--bare`; the agent's
+//!   configuration below says what it passes instead.
 //! * **`--session-id <uuid>` names a conversation and `--resume <id>` continues it**, both
 //!   working with the prompt on stdin and with `-p`. That is what lets a continuation pick up
 //!   where the last one stopped instead of re-reading the issue from scratch. Three details
@@ -51,8 +49,21 @@
 //! as an argument after it made the CLI try to open the prompt text as a file.) The prompt goes
 //! on stdin regardless, so nothing needs to follow it.
 //!
-//! `--strict-mcp-config` is deliberately *not* passed: it would suppress the operator's own MCP
-//! servers. The broker is added to what the operator configured, not substituted for it.
+//! ## The agent's configuration
+//!
+//! A dispatched agent's Claude Code configuration comes from the repository and the broker,
+//! and nothing from the operator's account (#191):
+//!
+//! * `--setting-sources project` loads the worktree's `.claude/settings.json` only; `local` is
+//!   left out because a worktree has no `settings.local.json` of its own.
+//! * `--strict-mcp-config` loads MCP servers only from `--mcp-config`, which drops user, local,
+//!   plugin and claude.ai servers alike. A project `.mcp.json` is dropped with them: #192
+//!   replaced that rust-analyzer bridge with the plugin in project settings, and it is not
+//!   passed through.
+//! * `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` is applied after the allowlist. Auto memory survives
+//!   both flags, and an allowlisted operator value of that name would turn it back on.
+//!
+//! None of this closes the keychain hole (#135).
 //!
 //! ## The outcome convention
 //!
@@ -152,6 +163,8 @@ pub struct ClaudeWorker {
     max_turns_per_session: u32,
     rate_limit_warn_utilization: f64,
     model: ModelChoice,
+    #[cfg(test)]
+    parent_env: Option<Vec<(String, String)>>,
 }
 
 impl ClaudeWorker {
@@ -166,6 +179,8 @@ impl ClaudeWorker {
             max_turns_per_session,
             rate_limit_warn_utilization: crate::config::d_rate_limit_warn_utilization(),
             model: ModelChoice::default(),
+            #[cfg(test)]
+            parent_env: None,
         }
     }
 
@@ -181,6 +196,37 @@ impl ClaudeWorker {
         self.model = model;
         self
     }
+
+    /// When set, [`Worker::spawn`] reads this instead of the process environment, so a test
+    /// can supply a conflicting value without a process-global write (#191).
+    #[cfg(test)]
+    fn with_parent_env(mut self, parent: &[(&str, &str)]) -> Self {
+        self.parent_env =
+            Some(parent.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect());
+        self
+    }
+
+    fn parent_value(&self, key: &str) -> Option<String> {
+        #[cfg(test)]
+        if let Some(parent) = &self.parent_env {
+            return parent.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        }
+        std::env::var(key).ok()
+    }
+}
+
+/// Allowlisted parent variables, then auto memory forced off.
+///
+/// `Command` keeps the last value written for a key. The forced `1` has to come after the
+/// allowlist copy: an operator value of `CLAUDE_CODE_DISABLE_AUTO_MEMORY` on the allowlist
+/// would otherwise turn auto memory back on (#191).
+fn apply_child_env(
+    cmd: &mut Command,
+    allowlist: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) {
+    cmd.envs(allowlist.iter().filter_map(|k| lookup(k).map(|v| (k.clone(), v))));
+    cmd.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
 }
 
 #[derive(Default)]
@@ -295,22 +341,20 @@ impl Worker for ClaudeWorker {
         };
 
         let mut cmd = Command::new(&self.bin);
-        cmd.current_dir(workspace)
-            .env_clear()
-            .envs(
-                self.env_allowlist
-                    .iter()
-                    .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v))),
-            )
-            .args([
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--permission-mode",
-                "bypassPermissions",
-            ])
-            .args([flag, session.id()]);
+        cmd.current_dir(workspace).env_clear();
+        apply_child_env(&mut cmd, &self.env_allowlist, |k| self.parent_value(k));
+        cmd.args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "bypassPermissions",
+            "--setting-sources",
+            "project",
+            "--strict-mcp-config",
+        ])
+        .args([flag, session.id()]);
 
         // Passed on `--resume` as well, so a continuation runs on the model its run row records
         // whether or not the CLI would have carried the session's model over on its own.
@@ -667,8 +711,8 @@ mod tests {
 
     use super::*;
     use crate::model::{Feedback, Issue, Verdict, looks_like_commit};
-    use crate::worker::TokenUsage;
     use crate::worker::prompt::REVIEW_MARKER;
+    use crate::worker::{TokenUsage, ToolEndpoint};
     use crate::workspace::WipSnapshot;
 
     fn fixture(name: &str) -> PathBuf {
@@ -1272,6 +1316,48 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "--model" || a == "--effort"),
             "an operator who sets neither must get exactly the old command line: {argv:?}"
+        );
+    }
+
+    /// Project settings and the broker's `--mcp-config`, nothing from the operator's account (#191).
+    #[test]
+    fn the_worker_argv_loads_only_project_settings_and_the_broker() {
+        let w = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
+        let broker = ToolEndpoint {
+            server: "crew".into(),
+            config_path: "/broker/run.json".into(),
+            tools: vec!["comment".into()],
+        };
+        let ws = tmp_workspace("setting-sources");
+        let session = Session::New("s-new".into());
+        let h = w.spawn(Spawn { tools: Some(&broker), ..Spawn::new(&issue(), &ws, 0, &session) });
+        wait_for_finish(&h);
+        let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
+        std::fs::remove_dir_all(&ws).ok();
+        insta::assert_snapshot!("worker_argv_with_broker", dump);
+    }
+
+    /// The parent value is `0`, and the name is on the allowlist. `Command` keeps the last
+    /// write, so moving the forced `1` ahead of that copy would hand the child `0` (#191).
+    #[test]
+    fn auto_memory_is_off_in_the_child_even_when_the_allowlist_passes_it_through() {
+        let ws = tmp_workspace("auto-memory");
+        let w = ClaudeWorker::new(
+            fixture("dump_env.sh"),
+            vec!["PATH".into(), "CLAUDE_CODE_DISABLE_AUTO_MEMORY".into()],
+            0,
+        )
+        .with_parent_env(&[("PATH", "/usr/bin"), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")]);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+        wait_for_finish(&h);
+        let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
+        std::fs::remove_dir_all(&ws).ok();
+        let set: Vec<&str> =
+            dump.lines().filter(|l| l.starts_with("CLAUDE_CODE_DISABLE_AUTO_MEMORY=")).collect();
+        assert_eq!(set, ["CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"]);
+        assert!(
+            dump.lines().any(|l| l == "PATH=/usr/bin"),
+            "the allowlist copy must still reach the child: {dump}"
         );
     }
 

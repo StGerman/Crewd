@@ -52,9 +52,8 @@ enabled = false
 bind = "127.0.0.1:8787"
 # The ops API's routes as MCP tools, for the *agent* supervising this daemon (src/api/mcp.rs);
 # `--mcp 127.0.0.1:8788` flips it for one run. Its own port on purpose — never the broker's.
-# crewd never hands it to a worker, but a worker inherits the operator's MCP config (local
-# scope included, for a worktree of the same project), so registering it there exposes it to
-# workers too; src/api/mcp.rs says why that is accepted.
+# crewd never hands it to a worker, and the worker does not load the operator's MCP config
+# (#191). A same-user process can still call the loopback HTTP API; src/api/mcp.rs.
 mcp_enabled = false
 mcp_bind = "127.0.0.1:8788"
 
