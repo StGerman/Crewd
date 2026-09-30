@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # SessionStart probe for the rust-analyzer-lsp plugin's language server.
 #
-# .claude/settings.json enables the plugin, which runs `rust-analyzer` from PATH. Under rustup
-# that is a proxy for the pinned toolchain's component (rust-toolchain.toml), and when it cannot
-# resolve one the server exits 1 and the plugin reports only "crashed", with no hint of which
-# piece is missing. This reports that up front. It never installs and never fails the session —
-# a missing server degrades navigation to grep and diagnostics to `cargo check`, it does not
-# stop work.
+# `command -v rust-analyzer` succeeds on the rustup proxy even when the pinned toolchain has no
+# rust-analyzer component, and the plugin then starts and reports only "crashed" (#192). Invoking
+# the proxy (`rust-analyzer --version`) is the check that sees that, and under rustup that
+# invocation installs the toolchain and the components rust-toolchain.toml lists when they are
+# absent. A server that is still missing does not fail the session: navigation stays grep, and
+# an edit's check stays `cargo check`.
 set -uo pipefail
 
 missing=()

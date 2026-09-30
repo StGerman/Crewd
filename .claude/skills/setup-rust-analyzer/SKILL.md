@@ -58,9 +58,11 @@ Plugins load at session start; the running session keeps whatever it started wit
 ## Known traps
 
 - **First-load emptiness.** `references`/`definition`/`hover` answer from whatever is indexed
-  so far and return empty during the initial load, and an edit made then brings back no
-  diagnostic. Empty is indistinguishable from "no callers" — ask again until an answer is
-  non-empty before concluding anything.
+  so far and return empty during the initial load. Empty is indistinguishable from "no
+  callers" — ask again until an answer is non-empty before concluding anything.
+- **Diagnostics in a dispatched transcript.** A warm server can publish a diagnostic over LSP
+  while the `claude -p` turn after the edit still contains none (#228). Reinstalling the
+  server does not close that; `cargo check` stays the compile result until it does.
 - **Xcode license.** On macOS, an install that dies at the linker is usually
   `xcode-select -p` pointing at Xcode.app rather than CommandLineTools. See Troubleshooting
   in [CLAUDE.md](../../../CLAUDE.md).
