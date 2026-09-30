@@ -6,7 +6,12 @@
 # includes the Homebrew `rust` this dev machine runs today, so locally the pin is inert until
 # someone installs rustup. Worth knowing before concluding a CI/local disagreement is
 # impossible: on CI the pin is real, here it is aspirational.
+#
+# `rust-analyzer` and `rust-src` are here for the `rust-analyzer-lsp` plugin (#192), which runs
+# `rust-analyzer` from PATH: under rustup that is a proxy, and a proxy for a component the
+# pinned toolchain lacks exits 1, so the plugin's server crashes at start. Listing them makes
+# rustup install them with the toolchain; CI downloads them too, which is seconds.
 [toolchain]
 channel = "1.97.1"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]
 profile = "minimal"
