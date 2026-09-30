@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: Triage this repo's GitHub Issues into the milestone/`agent`-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising a new issue, planning the next milestone after one closes, or filing an issue yourself — an agent-filed issue lands in the inbox and is never labelled `agent` by its author.
+description: Triage this repo's GitHub Issues into the milestone/`agent`-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising a new issue, planning the next milestone after one closes, or filing an issue yourself — an agent-filed issue lands in the inbox with no milestone and no labels.
 ---
 
 # Issue triage
@@ -58,8 +58,8 @@ on their explicit say-so, and only to an issue that is:
   description (see below) before the issue is made dispatchable.
 
 When you file an issue yourself (found a bug mid-task, split out follow-up work), leave it in
-the Inbox with no milestone and no `agent` label, and say in the body what triggered it.
-Placing it is triage's job, not the author's.
+the Inbox with no milestone and no labels, and say in the body what triggered it.
+Placing it, including its one area label, is triage's job, not the author's.
 
 ## Decisions go into the description
 
@@ -123,6 +123,9 @@ Apply this rule top-down; the first match wins.
 
 "Current milestone" is the open milestone with the lowest `M<n>`.
 
+Set the issue's one area label, from [Labels](#labels), in the same confirmation table as the
+milestone.
+
 ## Priority is the milestone
 
 There are no priority labels. Milestones are worked one at a time in `M<n>` order, and
@@ -140,6 +143,33 @@ outcome. Large work is split into small stacked PRs, each its own issue, stacked
 each adds to the outcome rather than by when it was written. The stack itself carries that
 order — each PR is based on the one before — so its issues can share a milestone.
 
+## Labels
+
+An issue carries three independent marks: `agent` or not, `bug` or not, and one area.
+
+`agent` is set only by the dispatch rule above. `bug` means shipped behavior is false.
+The milestone stays the priority either way.
+
+The area is where the change lands. Exactly one:
+
+| Area | Lands in |
+|---|---|
+| `delivery` | The handoff: the gate, the forge, rebase, the pull request, review sent back |
+| `scheduler` | Dispatch, claims, the store, startup and shutdown, config, `crewd init`, a release |
+| `worker` | The session: spawn, prompt, resume, budgets, the model, confinement, the broker |
+| `ops` | `crewctl`, the ops API, the TUI, logs, traces, readiness |
+| `workspace` | Worktrees and branch preparation |
+| `guidelines` | Lints, CI, and `docs/coding-guidelines.md` |
+| `tracker` | The GitHub or Jira adapter: poll, the dispatch rule, transitions |
+
+A pull request stays `delivery` when delivery also writes the issue. The broker stays
+`worker`. The store stays `scheduler`.
+
+#181, #84, #153 and #182 have no area: each one names more than one tree, or none. A new
+issue in that shape stays unlabeled, and the report says why.
+
+Done when the confirmation table names one area, or names the issue unlabeled and why.
+
 ## Weekly triage
 
 Run through these in order. Triage is done when every step's criterion holds.
@@ -150,7 +180,14 @@ Run through these in order. Triage is done when every step's criterion holds.
    ```
    Read each issue in full (`gh issue view <n> --comments`) and place it with the rule above.
    Done when the inbox list is empty.
-2. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any
+2. **One area each.** Every open issue carries exactly one of `delivery`, `scheduler`,
+   `worker`, `ops`, `workspace`, `guidelines`, `tracker`, aside from #181, #84, #153, #182
+   and any newer issue the report names as unlabeled.
+   ```bash
+   gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker)$"))]} | select(.a|length != 1) | .n'
+   ```
+   Done when that list is only the explained exceptions.
+3. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any
    that is not. Then check each has a linked PR or recent progress:
    ```bash
    gh issue list --state open --label agent --json number,title,milestone,assignees,updatedAt
@@ -159,9 +196,9 @@ Run through these in order. Triage is done when every step's criterion holds.
    An `agent` issue open more than 7 days with no PR is either under-specified (tighten it)
    or blocked (remove `agent`, say why). Done when each one has a PR, a fresh update, or a
    comment explaining the hold.
-3. **Resolved but open.** An issue whose fix has merged (check the invariant table and recent
+4. **Resolved but open.** An issue whose fix has merged (check the invariant table and recent
    PRs) is closed with a comment naming the PR. Done when no merged fix is left open.
-4. **Report.** Summarise what moved: issues placed per milestone, labels added or removed,
+5. **Report.** Summarise what moved: issues placed per milestone, labels added or removed,
    issues closed, and anything that needs the operator's decision.
 
 ## Planning the next milestone

@@ -8,7 +8,7 @@ assignees: ""
 
 <!--
 Title: one sentence naming the outcome. Restate it as the first line of Why.
-File with no milestone and no `agent` label. The issue-triage skill places it,
+File with no milestone and no labels. The issue-triage skill places it,
 and appends a Decisions section when it settles something; do not write one.
 Comments are stripped before dispatch.
 More than 3 acceptance criteria usually means two issues.
