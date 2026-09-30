@@ -76,8 +76,13 @@ to an existing branch that does carry commits rather than `-B`-resetting it.
 A new branch starts from
 the base the gate will rebase onto — `<delivery.remote>/<base>` fetched under the gate's lock and
 credential, else the local base — not from `repo`'s HEAD, the operator's checkout, which can be
-any branch at any age; a failed fetch fails `prepare` as a retryable workspace error, and so does a lock still held
-after a bounded wait, because `prepare` runs on the tick that would time the holder out (#170).
+any branch at any age. A failed fetch fails `prepare` as a retryable workspace error, and so
+does a lock still held after a bounded wait, or a fetch that has not finished within its own —
+it is killed, rather than left to hold the tick (#170).
+
+An existing branch is attached where it is when it holds commits the base does not. The checkout
+is that measure only when no base is configured: a checkout that already contains the branch
+would otherwise send `prepare` down `-B` and move the branch onto a base that lacks it.
 
 What the agent had *not* committed when its run was stopped is snapshotted by `remove` to a new ref under `refs/crew/wip/<issue key>/`
 — keyed on the issue id, not the renameable identifier, one ref per snapshot so a second stop
