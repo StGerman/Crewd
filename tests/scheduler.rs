@@ -1210,6 +1210,54 @@ fn a_paused_workers_issue_continues_on_the_other_with_a_brief_of_where_the_run_s
     assert_eq!(row.worker.as_deref(), Some("grok"), "the pin moves to the worker that ran");
 }
 
+/// A workspace whose base fetch never succeeds: a blackholed remote, each `prepare` a
+/// bounded fetch that runs out.
+struct DeadRemote(DirWorkspace, std::sync::atomic::AtomicU32);
+
+impl Workspace for DeadRemote {
+    fn prepare(&self, _: &str, _: &str) -> Result<Prepared, WorkspaceError> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(WorkspaceError::BaseFetch {
+            remote: "origin".into(),
+            base: "master".into(),
+            reason: "fetch did not finish within 60s".into(),
+        })
+    }
+    fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
+        self.0.remove(issue_id, identifier)
+    }
+    fn path_for(&self, issue_id: &str, identifier: &str) -> PathBuf {
+        self.0.path_for(issue_id, identifier)
+    }
+    fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String> {
+        self.0.branch_for(issue_id, identifier)
+    }
+}
+
+/// Review on #194: a failed `prepare` consumes no slot, so dispatch went on to the next issue
+/// and fetched again; against an unreachable remote one tick waited a minute per queued issue.
+/// The first base-fetch failure ends the tick's dispatch, and the next tick tries once more.
+#[test]
+fn a_base_that_cannot_be_fetched_stops_the_ticks_dispatch_after_one_try() {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("crew-sched-dead-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let ws = Arc::new(DeadRemote(DirWorkspace::new(&root).unwrap(), 0.into()));
+    let issues = vec![
+        issue(1, "In Progress", Some(1)),
+        issue(2, "In Progress", Some(1)),
+        issue(3, "In Progress", Some(1)),
+    ];
+    let mut h = harness_over(issues, root, Store::open_in_memory().unwrap(), ws.clone(), |_| {});
+
+    h.sched.tick().unwrap();
+    assert_eq!(ws.1.load(std::sync::atomic::Ordering::SeqCst), 1, "one fetch, not one per issue");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(ws.1.load(std::sync::atomic::Ordering::SeqCst), 2, "the next tick tries once more");
+}
+
 /// A workspace whose head a test moves, standing in for a worker's commits.
 struct MovableHead(DirWorkspace, std::sync::Mutex<String>);
 

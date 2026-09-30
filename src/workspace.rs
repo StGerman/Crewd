@@ -620,23 +620,32 @@ impl GitWorktreeWorkspace {
         })?;
         let (tx_out, rx_out) = std::sync::mpsc::channel();
         let (tx_err, rx_err) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            let _ = tx_out.send(buf);
-        });
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            let _ = tx_err.send(buf);
-        });
+        // `Builder::spawn`, not `thread::spawn`: an OS that refuses a thread is an error this
+        // call returns, not a panic on the tick's thread (review on #194). The process group is
+        // still armed for `kill_group`, so an early return here takes `git` down with it.
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf);
+                let _ = tx_out.send(buf);
+            })
+            .map_err(&io)?;
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stderr.read_to_end(&mut buf);
+                let _ = tx_err.send(buf);
+            })
+            .map_err(&io)?;
 
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
         let (alarm_tx, alarm_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            let _ = cancel_rx.recv_timeout(limit);
-            let _ = alarm_tx.send(());
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = cancel_rx.recv_timeout(limit);
+                let _ = alarm_tx.send(());
+            })
+            .map_err(&io)?;
 
         let mut killed = false;
         let status = loop {

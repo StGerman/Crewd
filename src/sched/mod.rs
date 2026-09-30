@@ -199,6 +199,11 @@ pub struct Scheduler {
     /// that run still charges no attempt, the same as the one that set the pause in the first
     /// place (#37).
     rate_limit_pauses: HashMap<String, RateLimitPause>,
+    /// Set when a `prepare` in this tick's dispatch could not fetch the base, and read by both
+    /// dispatch loops to stop there: every later `prepare` would wait out the same bounded
+    /// fetch against the same remote, a minute each, and a tick has to end (review on #194).
+    /// Cleared at the start of each tick's dispatch, so the next tick tries again.
+    base_unreachable: bool,
     ticks: u64,
     last_error: Option<String>,
 }
@@ -244,6 +249,7 @@ impl Scheduler {
             recovered: false,
             last_parked_sweep: None,
             rate_limit_pauses: HashMap::new(),
+            base_unreachable: false,
             ticks: 0,
             last_error: None,
         }
@@ -329,6 +335,7 @@ impl Scheduler {
             return Ok(());
         }
 
+        self.base_unreachable = false;
         self.dispatch_due_retries()?;
         self.dispatch_new()?;
         self.publish()?;
@@ -1241,6 +1248,9 @@ impl Scheduler {
         let mut reserved = self.reservations()?;
 
         for (i, entry) in pending.iter().enumerate() {
+            if self.base_unreachable {
+                break;
+            }
             let Some(issue) = by_id.get(&entry.issue_id) else {
                 // One omission is not proof the ticket is gone (`refresh_miss_grace` exists for
                 // exactly that), so a reservation still waiting keeps its slot and its retry;
@@ -1367,6 +1377,9 @@ impl Scheduler {
 
         let reserved = self.reservations()?;
         for issue in sorted {
+            if self.base_unreachable {
+                break;
+            }
             // No worker with room for anyone: nothing further down the queue can go either.
             if self.pick_worker(None, &reserved).is_none() {
                 break;
@@ -1459,6 +1472,9 @@ impl Scheduler {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(issue_id = %issue.id, error = %e, "workspace preparation failed");
+                if matches!(e, crate::workspace::WorkspaceError::BaseFetch { .. }) {
+                    self.base_unreachable = true;
+                }
                 let class = match e {
                     crate::workspace::WorkspaceError::OutsideRoot { .. } => {
                         ErrorClass::WorkspaceOutsideRoot
