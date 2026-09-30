@@ -8,6 +8,7 @@ pub mod claude;
 pub mod fake;
 pub mod grok;
 pub(crate) mod prompt;
+pub mod resolve;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -205,9 +206,9 @@ pub struct Spawn<'a> {
     pub workspace: &'a Path,
     pub attempt: u32,
     pub session: &'a Session,
-    /// `None` when the broker is unavailable. That is a degrade, not an error: the run proceeds
-    /// without tracker tools rather than failing, so a broker that cannot bind costs the agent a
-    /// capability and nothing else.
+    /// `None` when the broker is off or this run's session could not be opened. That is a
+    /// degrade, not an error: the run proceeds without tracker tools rather than failing, so a
+    /// session that cannot open costs the agent a capability and nothing else.
     pub tools: Option<&'a ToolEndpoint>,
     /// Owned rather than borrowed because the implementation that matters hands it to a reader
     /// thread that outlives the call; `None` means transcripts are off or the file could not be

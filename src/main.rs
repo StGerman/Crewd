@@ -45,6 +45,7 @@ use crew::worker::Worker;
 use crew::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
 use crew::worker::fake::{FakeWorker, Script};
 use crew::worker::grok::GrokWorker;
+use crew::worker::resolve::resolve_bin;
 use crew::workspace::{FetchLock, GitWorktreeWorkspace};
 use tokio::sync::{mpsc, watch};
 
@@ -117,6 +118,30 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
+
+    // Everything the config turns on is checked before anything is opened or created, and any
+    // one that cannot start stops startup by name: a daemon up with part of itself missing looks
+    // healthy to its operator (#218). Only the task projection below keeps its degrade.
+    for w in cfg.workers() {
+        if let Some(bin) = worker_bin(&w, w.kind()?) {
+            resolve_bin(&bin, std::env::var_os("PATH").as_deref()).with_context(|| {
+                format!("worker {:?} cannot start: its bin {bin:?} does not resolve", w.name())
+            })?;
+        }
+    }
+    // `--api` and `--mcp` override `[api]` rather than being a second source of truth.
+    let mut api_cfg = cfg.api.clone();
+    if let Some(addr) = args.api.clone() {
+        api_cfg.enabled = true;
+        api_cfg.bind = addr;
+    }
+    if let Some(addr) = args.mcp.clone() {
+        api_cfg.mcp_enabled = true;
+        api_cfg.mcp_bind = addr;
+    }
+    let api_listener = if api_cfg.enabled { Some(crew::api::bind(&api_cfg).await?) } else { None };
+    let mcp_listener =
+        if api_cfg.mcp_enabled { Some(crew::api::mcp::bind(&api_cfg)?) } else { None };
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
@@ -248,28 +273,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Best-effort, like the projector: a root that cannot be created costs post-mortems, not
-    // dispatch. Defaults beside the worktrees rather than inside one — see `TranscriptsConfig`.
+    // A root that cannot be created stops startup (#218): runs leaving no record is a daemon
+    // missing what its config turned on. Defaults beside the worktrees rather than inside one —
+    // see `TranscriptsConfig`.
     let transcripts = if cfg.transcripts.enabled {
         let root = cfg.transcripts.root_in(&ws_root);
-        match Transcripts::new(&root, cfg.transcripts.max_bytes_per_run, cfg.transcripts.keep_runs)
-        {
-            Ok(t) => {
-                tracing::info!(root = %root.display(), keep = cfg.transcripts.keep_runs, "recording run transcripts");
-                Some(t)
-            }
-            Err(e) => {
-                tracing::warn!(root = %root.display(), error = %e, "transcript root unavailable; runs will leave no record on disk");
-                None
-            }
-        }
+        let t =
+            Transcripts::new(&root, cfg.transcripts.max_bytes_per_run, cfg.transcripts.keep_runs)
+                .with_context(|| format!("creating the transcript root {}", root.display()))?;
+        tracing::info!(root = %root.display(), keep = cfg.transcripts.keep_runs, "recording run transcripts");
+        Some(t)
     } else {
         tracing::info!("transcripts disabled by config; runs will leave no record on disk");
         None
     };
 
     let broker = if cfg.broker.enabled {
-        start_broker(&cfg, writes, clock.clone())
+        Some(start_broker(&cfg, writes, clock.clone())?)
     } else {
         tracing::info!("broker disabled by config; agents run without tracker tools");
         None
@@ -294,20 +314,8 @@ async fn main() -> anyhow::Result<()> {
 
     let interval_ms = cfg.polling.interval_ms;
 
-    // Read before the config moves into the scheduler; `--api` is an override of it, not a
-    // second source of truth.
-    let mut api_cfg = cfg.api.clone();
-    if let Some(addr) = args.api.clone() {
-        api_cfg.enabled = true;
-        api_cfg.bind = addr;
-    }
-    if let Some(addr) = args.mcp.clone() {
-        api_cfg.mcp_enabled = true;
-        api_cfg.mcp_bind = addr;
-    }
-
     // The handoff gate runs in the run's worktree against `repo`'s base, so it is built over
-    // the same repository the worktrees come from. Not a degrade like the broker: with no gate
+    // the same repository the worktrees come from. With no gate
     // a `Done` is handed to a human exactly as the agent left it, which is issue #21.
     let gate: Option<Arc<dyn Gate>> = if cfg.gate.enabled {
         let repo = repo.canonicalize().with_context(|| format!("resolving {}", repo.display()))?;
@@ -363,35 +371,21 @@ async fn main() -> anyhow::Result<()> {
     // reports a concurrency limit this process never had.
     let _ = snap_tx.send(sched.snapshot()?);
 
-    // Best-effort by contract: the API failing to start costs the API. Dispatch is not the
-    // scheduler's opinion of whether a port was free.
-    if api_cfg.enabled {
-        match crew::api::bind(&api_cfg).await {
-            Ok(listener) => {
-                tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
-            }
-            Err(e) => tracing::error!(error = %e, "ops API not started; scheduling continues"),
-        }
+    if let Some(listener) = api_listener {
+        tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
     }
 
-    // The same surface as tools, on its own listener. Same contract as the HTTP API above: a
-    // bind failure costs this server, never a dispatch. It is served by the broker's transport
+    // The same surface as tools, on its own listener, bound at startup like the HTTP API's. It
+    // is served by the broker's transport
     // but is deliberately *not* the broker — nothing here passes it to `Broker`, and the
     // `--mcp-config` crewd gives a worker is written by `Broker::open` alone, so crewd never
     // hands a dispatched agent this address (`a_dispatched_worker_is_not_handed_the_ops_tools`).
     // A worker can still inherit it from the operator's own MCP config; see `api::mcp`.
-    if api_cfg.mcp_enabled {
-        match crew::api::mcp::bind(&api_cfg) {
-            Ok(listener) => {
-                let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-                let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));
-                broker::server::serve(ops, listener);
-                tracing::info!(%addr, path = crew::api::mcp::PATH, "ops MCP server listening");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "ops MCP server not started; scheduling continues")
-            }
-        }
+    if let Some(listener) = mcp_listener {
+        let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));
+        broker::server::serve(ops, listener);
+        tracing::info!(%addr, path = crew::api::mcp::PATH, "ops MCP server listening");
     }
 
     let ui = args.tui.then(|| {
@@ -563,28 +557,15 @@ fn build_jira(
 
 /// Bind the broker's loopback listener and start serving.
 ///
-/// Every failure here returns `None` rather than propagating: a broker that cannot start is an
-/// agent without tracker tools, which is a degrade the whole design allows for. Failing startup
-/// over it would turn an optional capability into a required one.
+/// Every failure here stops startup: with `broker.enabled` on, agents running without tracker
+/// tools is a daemon with part of itself missing (#218).
 fn start_broker(
     cfg: &Config,
     writes: Arc<dyn TrackerWrites>,
     clock: Arc<dyn Clock>,
-) -> Option<Arc<Broker>> {
-    let listener = match broker::server::bind() {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(error = %e, "broker could not bind; agents run without tracker tools");
-            return None;
-        }
-    };
-    let addr = match listener.local_addr() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(error = %e, "broker listener has no address; running without tools");
-            return None;
-        }
-    };
+) -> anyhow::Result<Arc<Broker>> {
+    let listener = broker::server::bind().context("binding the tool broker")?;
+    let addr = listener.local_addr().context("reading the tool broker's address")?;
 
     // Per-process, so two orchestrators on one host cannot collide or read each other's tokens.
     let config_dir = std::env::temp_dir().join(format!("crew-mcp-{}", std::process::id()));
@@ -593,16 +574,24 @@ fn start_broker(
         max_calls_per_issue: cfg.broker.max_calls_per_issue,
     };
 
-    let broker = match Broker::new(writes, clock, limits, cfg.known_states(), addr, &config_dir) {
-        Ok(b) => Arc::new(b),
-        Err(e) => {
-            tracing::warn!(error = %e, "broker setup failed; agents run without tracker tools");
-            return None;
-        }
-    };
+    let broker = Arc::new(
+        Broker::new(writes, clock, limits, cfg.known_states(), addr, &config_dir)
+            .context("setting up the tool broker")?,
+    );
     broker::server::serve(Arc::clone(&broker), listener);
     tracing::info!(%addr, states = ?cfg.known_states(), "tool broker listening");
-    Some(broker)
+    Ok(broker)
+}
+
+/// The binary a real worker execs, `None` for the fake. One source for the startup check and
+/// the spawn, so the check cannot pass on a name the worker never runs.
+fn worker_bin(w: &WorkerConfig, kind: WorkerKind) -> Option<String> {
+    let default = match kind {
+        WorkerKind::Claude => "claude",
+        WorkerKind::Grok => "grok",
+        WorkerKind::Fake => return None,
+    };
+    Some(w.bin.clone().unwrap_or_else(|| default.to_string()))
 }
 
 /// Give the demo tracker a spread of behaviours so the dashboard shows every state worth
@@ -618,7 +607,7 @@ fn build_worker(
 ) -> Arc<dyn Worker> {
     match kind {
         WorkerKind::Claude => {
-            let bin = w.bin.clone().unwrap_or_else(|| "claude".to_string());
+            let bin = worker_bin(w, kind).unwrap_or_default();
             // An operator-supplied list replaces the default outright rather than extending it,
             // so what reaches the child is exactly what the config says.
             let env_allowlist = w
@@ -632,7 +621,7 @@ fn build_worker(
             )
         }
         WorkerKind::Grok => {
-            let bin = w.bin.clone().unwrap_or_else(|| "grok".to_string());
+            let bin = worker_bin(w, kind).unwrap_or_default();
             // The same list Claude gets. Nothing is added: Grok's login lives in the keychain
             // the way Claude's does, and a tracker credential is still not a worker's to hold.
             let env_allowlist = w
