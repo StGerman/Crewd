@@ -79,6 +79,17 @@ blocked agent repeats its `CREW_OUTCOME`/`CREW_REVIEW` lines, because crewd read
 final message only. Its timeout stays under `agent.stall_timeout_ms`. Grok and other branches
 never run it; the gate still decides.
 
+**Before reporting done,** check `git diff <base>...HEAD` against the Failure paths section of
+[docs/coding-guidelines.md](docs/coding-guidelines.md) and against
+[docs/invariants.md](docs/invariants.md). `<base>` is the branch the pull request merges into
+(`master` on this repo). Fix each finding, or answer it with the line and why the rule does not
+apply.
+
+- A Claude Code session runs the `crew-reviewer` subagent
+  ([.claude/agents/crew-reviewer.md](.claude/agents/crew-reviewer.md)) and passes it that diff.
+- A session that cannot run a subagent reads those two texts and checks the diff itself. Grok
+  is started with `--no-subagents` ([src/worker/grok.rs](src/worker/grok.rs)).
+
 The loop while editing, measured on this tree (an agent runs the command the docs name, so this
 table *is* the loop):
 

@@ -16,8 +16,10 @@ needs a reason in the PR description when it is skipped.
 
 Enforcement is deterministic wherever a tool can do it. A rule with a lint or a CI step behind it
 cannot be skipped or drifted from; a rule that only review can check is marked
-`Check: review`, and the reviewing agent verifies it against this file. Repetitive work that a
-lint demands is acceptable here; a rule that depends on judgment is the thing to avoid.
+`Check: review`, and the reviewing agent verifies it against this file. `Check: review
+(crew-reviewer)` is that check for the Failure paths section, verified against the diff before
+the agent reports done. Repetitive work that a lint demands is acceptable here; a rule that
+depends on judgment is the thing to avoid.
 
 Rules describe the target state. A rule that the code does not yet meet carries
 `Not yet enforced: #NN`. The linked issue tracks the fix, and new code follows the rule from now.
@@ -319,3 +321,55 @@ why they were rejected so far.
   than giving the observer a new source. Why: `Row.branch` was added for the status client
   instead of letting the client ask `git`, and the same choice applies next time.
   Check: the same grep as above, plus review.
+
+## Failure paths
+
+The classes review keeps finding after the commit gate has passed. CLAUDE.md says when the
+diff is checked against this section and against [invariants.md](invariants.md). Each rule
+cites the pull request whose review found the class.
+
+- **MUST** make the writes that establish one fact durable together. Why: a kill between them
+  leaves the first applied and the second gone, and the next start treats that as the truth
+  ([#168](https://github.com/StGerman/crewd/pull/168)). Example: `apply` in
+  [src/store/schema.rs](../src/store/schema.rs), which commits a migration and its
+  `user_version` bump in one transaction. Check: review (crew-reviewer).
+- **MUST** reap a child before publishing its outcome. Why: a published outcome is the signal
+  that the run is over and its workspace is free, and the process can still be running after
+  its last line ([#166](https://github.com/StGerman/crewd/pull/166)). Example: the `terminal`
+  outcome held until `wait` in `run_reader`, in [src/worker/claude.rs](../src/worker/claude.rs)
+  and [src/worker/grok.rs](../src/worker/grok.rs). Check: review (crew-reviewer).
+- **MUST** count a truncation marker toward the byte cap it marks. Why: a marker added on top
+  of the cap makes the result longer than the bound it claims
+  ([#175](https://github.com/StGerman/crewd/pull/175)). Example: `tail` in
+  [src/sched/workers.rs](../src/sched/workers.rs). Check: review (crew-reviewer).
+- **MUST** return from a wait when the run has been stopped. Why: a wait with no stop check
+  keeps working after the scheduler has treated the run as stopped
+  ([#161](https://github.com/StGerman/crewd/pull/161),
+  [#123](https://github.com/StGerman/crewd/pull/123)). Example: `GitGate::hold_fetch_lock` in
+  [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
+- **MUST** check for uncommitted tracked changes and for a rebase or merge in progress before
+  rebasing, merging, or removing a worktree. Why: an operation that looks only at `HEAD` drops
+  that work or misreads the branch ([#123](https://github.com/StGerman/crewd/pull/123)).
+  Example: `uncommitted`, `rebase_in_progress` and `merge_in_progress` on `GitGate` in
+  [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
+- **MUST** fail the whole call when a page errors or the response ends before the protocol
+  marks it complete, rather than returning the pages already gathered. Why: that prefix is
+  indistinguishable from the whole result ([#185](https://github.com/StGerman/crewd/pull/185)).
+  Example: `fetch_open_labelled` in [src/tracker/github.rs](../src/tracker/github.rs) and
+  `paginate` in [src/forge/github.rs](../src/forge/github.rs), which propagate a page error
+  instead of a short list. Check: review (crew-reviewer).
+- **MUST** make a git read that needs the repository's credential use the credential the push
+  uses. Why: a host whose only access is that credential cannot read through another remote
+  ([#161](https://github.com/StGerman/crewd/pull/161),
+  [#174](https://github.com/StGerman/crewd/pull/174)). Example: `GitGate::fetch_with_credential`
+  in [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
+- **MUST** make a fake answer what its real adapter answers, on every case both are run
+  against. Why: a test that only drives the fake passes code that fails against the real
+  backend ([#174](https://github.com/StGerman/crewd/pull/174)). Example: a case in
+  [src/forge/contract.rs](../src/forge/contract.rs) runs against `FakeForge` and `GithubForge`,
+  and a divergence is fixed in the fake. Check: review (crew-reviewer).
+- **MUST** change a stated guarantee everywhere it is stated, in the same change. Why: a
+  sentence rewritten in one place and left in the others promises two different things
+  ([#129](https://github.com/StGerman/crewd/pull/129)). Example: the invariant table lives in
+  [invariants.md](invariants.md), and CLAUDE.md points at that file. Check: review
+  (crew-reviewer).
