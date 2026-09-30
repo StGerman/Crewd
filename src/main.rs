@@ -627,7 +627,8 @@ fn build_worker(
                 .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
             Arc::new(
                 ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
-                    .with_model(w.model_choice()),
+                    .with_model(w.model_choice())
+                    .with_rate_limit_warn_utilization(cfg.agent.rate_limit_warn_utilization),
             )
         }
         WorkerKind::Grok => {
