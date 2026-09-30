@@ -348,10 +348,13 @@ cites the pull request whose review found the class.
   [#123](https://github.com/StGerman/crewd/pull/123)). Example: `GitGate::hold_fetch_lock` in
   [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
 - **MUST** check for uncommitted tracked changes and for a rebase or merge in progress before
-  rebasing, merging, or removing a worktree. Why: an operation that looks only at `HEAD` drops
-  that work or misreads the branch ([#123](https://github.com/StGerman/crewd/pull/123)).
-  Example: `uncommitted`, `rebase_in_progress` and `merge_in_progress` on `GitGate` in
-  [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
+  rebasing or merging a worktree, and snapshot a worktree checkout's uncommitted work before
+  removing it. Why: a handoff that looks only at `HEAD` drops that work or misreads the branch,
+  and removal keeps the uncommitted work by the snapshot it takes first
+  ([#123](https://github.com/StGerman/crewd/pull/123)). Example: `uncommitted`,
+  `rebase_in_progress` and `merge_in_progress` on `GitGate` in
+  [src/gate/git.rs](../src/gate/git.rs); `GitWorktreeWorkspace::snapshot`, called from `remove`
+  in [src/workspace.rs](../src/workspace.rs). Check: review (crew-reviewer).
 - **MUST** fail the whole call when a page errors or the response ends before the protocol
   marks it complete, rather than returning the pages already gathered. Why: that prefix is
   indistinguishable from the whole result ([#185](https://github.com/StGerman/crewd/pull/185)).
