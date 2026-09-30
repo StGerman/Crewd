@@ -685,8 +685,8 @@ mod tests {
 
     use super::*;
     use crate::model::{Feedback, Issue, Verdict, looks_like_commit};
-    use crate::worker::{TokenUsage, ToolEndpoint};
     use crate::worker::prompt::REVIEW_MARKER;
+    use crate::worker::{TokenUsage, ToolEndpoint};
     use crate::workspace::WipSnapshot;
 
     fn fixture(name: &str) -> PathBuf {

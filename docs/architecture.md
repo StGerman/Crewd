@@ -215,8 +215,9 @@ that silently never worked: there is no `--max-turns` flag, so the per-session t
 self-enforced — the reader thread counts `assistant` events and sends `SIGTERM` once the count
 reaches `max_turns_per_session`, reporting `Outcome::Continue` itself; and `--bare` needs
 `ANTHROPIC_API_KEY`, which an OAuth-authenticated operator (this dev machine included) does not
-have, so it is not passed by default — the worker inherits whatever hooks and MCP servers the
-operator's own `claude` config has until a dedicated API key changes that trade-off. The model is
+have, so it is not passed. Instead `--setting-sources project` and `--strict-mcp-config` keep
+the operator's user- and local-scope settings, plugins and MCP servers out, and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` keeps out their auto memory (#191). The model is
 not inherited that way: `worker.model` and `worker.effort` become `--model` and `--effort` on
 every attempt, a resumed one included, and each run row records what it was given (#36). Both
 unset passes neither flag, which is the old behaviour exactly; `crew.github.toml` pins them.
@@ -487,15 +488,13 @@ worker is handed), answers only at `/ops`, and is never passed to `Broker`, whos
 the only `--mcp-config` crewd gives a worker. `a_dispatched_worker_is_not_handed_the_ops_tools`
 reads that file from a real session and connects to what it names.
 
-What wiring cannot control is the operator's own `claude` config. The worker runs without
-`--strict-mcp-config` on purpose, so it inherits the operator's MCP servers — and **local scope
-does not keep this one out**: a worker's cwd is a worktree of the same repository, which Claude
-Code treats as the same project. On 2026-09-26 a dispatched run's `init` event listed `crew_ops`
-connected while it was registered only at local scope. The operator accepted this (2026-09-25,
-"option 2"): workers run as the same user and are trusted as that user, and the ops tools add
-nothing such a process cannot already do by sending a request to the loopback HTTP API the same
-routes live on. The way to actually withhold them is `--strict-mcp-config` with the worker's
-servers passed explicitly; it was not taken.
+The operator's own `claude` config no longer reaches a worker either. A dispatched run on
+2026-09-26 listed `crew_ops` connected while it was registered only at local scope, because a
+worker's cwd is a worktree of the same repository and Claude Code treats it as the same project.
+Since #191 the worker passes `--setting-sources project --strict-mcp-config`, so it loads MCP
+servers only from the broker's `--mcp-config`, and user, local, plugin and claude.ai servers —
+this one among them — never start. What remains is the loopback HTTP API serving the same
+routes, which a same-user process can still call; only OS confinement (#135) closes that.
 
 
 **`crewd init`** ([src/init/](../src/init/)) registers the operator's own GitHub App through the

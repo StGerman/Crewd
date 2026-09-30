@@ -44,16 +44,12 @@
 //!   The path `/ops` is accepted and every other path is refused, so a worker's `/mcp/<token>`
 //!   URL pointed here by mistake answers no tools.
 //!
-//! What the crate cannot control is the operator's own `claude` configuration. The worker
-//! deliberately runs without `--strict-mcp-config`, so it inherits the operator's MCP servers
-//! (see [`crate::worker::claude`]'s module doc for why) — and local scope does not keep this one
-//! out, because a worker's worktree is the same project to Claude Code: a dispatched run on
-//! 2026-09-26 listed `crew_ops` connected while it was registered only at local scope. The
-//! operator accepted that (2026-09-25): workers run as the same user and are trusted as that
-//! user, and these tools add nothing a same-user process cannot already do against the
-//! loopback HTTP API that serves the same routes. Withholding them for real would take
-//! `--strict-mcp-config` with the worker's servers passed explicitly. Off by default for the same
-//! reason the HTTP API is: a daemon must not grow a control plane by being upgraded.
+//! A worker never loads this server from the operator's `claude` configuration either: it runs
+//! with `--strict-mcp-config`, so only the broker's `--mcp-config` starts (#191). Before that, a
+//! dispatched run on 2026-09-26 listed `crew_ops` connected while it was registered only at
+//! local scope, because a worktree is the same project to Claude Code. A same-user process can
+//! still call the loopback HTTP API serving the same routes; only OS confinement (#135) closes
+//! that. Off by default for the same reason the HTTP API is: a daemon must not grow a control plane by being upgraded.
 //!
 //! ## Exposure
 //!

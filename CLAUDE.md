@@ -56,7 +56,7 @@ cargo run -p crewctl -- status             # what a running daemon is doing, rea
 cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
 cargo run -- --mcp 127.0.0.1:8788          # the ops API's routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
-                                           # ...and how that agent gets them; workers inherit it too
+                                           # ...and how that agent gets them; workers do not (#191)
 cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
