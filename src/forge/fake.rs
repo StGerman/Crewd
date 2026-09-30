@@ -114,6 +114,10 @@ struct Inner {
     lag_reads: u32,
     /// Per pull request: the head a `publish` replaced, and the stale reads left to serve it.
     stale: HashMap<u64, (String, u32)>,
+    /// The next `open_pull_request` calls that fail, after `publish` has already moved the head.
+    fail_open: u32,
+    /// The next `publish` keeps the branch's current head instead of minting a new one.
+    republish_same: bool,
 }
 
 pub struct FakeForge {
@@ -276,6 +280,18 @@ impl FakeForge {
         self.inner.lock().unwrap().lag_reads = n;
     }
 
+    /// The next `open_pull_request` fails once `publish` has already moved the head, so the
+    /// retry pushes a head the remote already has (#178).
+    pub fn fail_next_open(&self) {
+        self.inner.lock().unwrap().fail_open = 1;
+    }
+
+    /// The next `publish` reports the branch's current head again, as a real push of commits
+    /// already on the remote does.
+    pub fn republish_same_head_once(&self) {
+        self.inner.lock().unwrap().republish_same = true;
+    }
+
     /// Someone other than the orchestrator moves the head — the operator merging the base in,
     /// or the provider's "Update branch" — so the pull request's head is one no `publish` made.
     pub fn push_head(&self, number: u64, head_sha: &str) {
@@ -413,17 +429,32 @@ impl Publisher for FakeForge {
         g.taken_in.remove(branch);
         g.ops.push(Op::Publish { branch: branch.into(), base: base.into() });
         g.published.insert(branch.to_string());
-        g.publishes += 1;
-        let head_sha = Self::head_after_publish(g.publishes);
+        let head_sha = if g.republish_same {
+            g.republish_same = false;
+            match g.pushed_heads.get(branch).cloned() {
+                Some(head) => head,
+                None => {
+                    g.publishes += 1;
+                    Self::head_after_publish(g.publishes)
+                }
+            }
+        } else {
+            g.publishes += 1;
+            Self::head_after_publish(g.publishes)
+        };
         g.pushed_heads.insert(branch.to_string(), head_sha.clone());
         // The pull request open for this branch moves with the push, as the real one does. A
-        // push is the gate's rebased branch, so it merges again.
+        // push is the gate's rebased branch, so it merges again. A republish of the same head
+        // must not re-arm the lag against itself: the reads still owed are of the head the
+        // first push replaced.
         let lag = g.lag_reads;
         let mut replaced = Vec::new();
         for rec in g.prs.values_mut() {
             if rec.spec.head == branch && rec.pr.state == PrState::Open {
                 let old = std::mem::replace(&mut rec.pr.head_sha, head_sha.clone());
-                replaced.push((rec.pr.number, old));
+                if old != head_sha {
+                    replaced.push((rec.pr.number, old));
+                }
                 rec.pr.mergeable = Some(true);
             }
         }
@@ -461,6 +492,10 @@ impl Forge for FakeForge {
     fn open_pull_request(&self, spec: &PullRequestSpec) -> Result<PullRequest, ForgeError> {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
+        if g.fail_open > 0 {
+            g.fail_open -= 1;
+            return Err(ForgeError::Transient("open failed after the push".into()));
+        }
         g.ops.push(Op::OpenPr {
             head: spec.head.clone(),
             base: spec.base.clone(),

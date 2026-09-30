@@ -1457,8 +1457,8 @@ pub struct DeliveryRecord {
     pub replaced_head: Option<String>,
 }
 
-/// The head a push left on the remote, and the head it replaced there — `None` when it
-/// replaced none, or the remote already had it.
+/// The head a push left on the remote, and the head it replaced there — `None` when the
+/// caller cannot name one, which leaves the stored head in place (#178).
 #[derive(Debug, Clone, Copy)]
 pub struct PushedHead<'a> {
     pub sha: &'a str,
@@ -1524,6 +1524,10 @@ impl Store {
     /// after this, one reply at a time, and each leaves the queue only once its reply has
     /// landed — see [`Store::set_pending_verdicts`]. Clearing them here would drop the verdicts
     /// of a run whose replies then failed, and the threads would come back round as new.
+    ///
+    /// `head.replaced` of `None` leaves `replaced_head` as it stands. A republish of a head the
+    /// remote already has cannot name what it replaced, and clearing the value recorded before
+    /// a failed open would judge that head (#178).
     pub fn set_delivery_pr(
         &self,
         clock: &dyn Clock,
@@ -1536,7 +1540,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let now = clock.wall().0;
         conn.execute(
-            "UPDATE delivery SET replaced_head = ?7,
+            "UPDATE delivery SET replaced_head = COALESCE(?7, replaced_head),
                rounds_pr = CASE WHEN pr_number IS ?2 THEN rounds_pr ELSE 0 END,
                review_requested = CASE WHEN pr_number IS ?2 AND head_sha IS ?5
                                        THEN review_requested ELSE 0 END,
@@ -1546,6 +1550,23 @@ impl Store {
                stage = 'awaiting', updated_at = ?6
              WHERE issue_id = ?1",
             params![issue_id, pr_number as i64, pr_url, base, head.sha, now, head.replaced],
+        )?;
+        Ok(())
+    }
+
+    /// The head this push replaced, recorded before the pull request is opened. A transient
+    /// failure there retries the push, and that retry's sync already sees the new head — so
+    /// the replaced one has to be on the row already, or the retry reads its CI (#178).
+    pub fn note_replaced_head(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        replaced: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET replaced_head = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, replaced, clock.wall().0],
         )?;
         Ok(())
     }

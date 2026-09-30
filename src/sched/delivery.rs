@@ -368,6 +368,13 @@ impl Scheduler {
                 return Ok(());
             }
 
+            // The open below is what a network failure retries, and the retry's sync already
+            // sees this push. Forgetting the head it replaced would let that retry read the
+            // replaced head's CI (#178).
+            if let Some(old) = synced.remote_head().filter(|h| *h != published.head_sha) {
+                self.store.note_replaced_head(clock.as_ref(), issue_id, old)?;
+            }
+
             let spec = self.pr_spec(issue_id, st, &branch, &base, &published.commits)?;
             let opened = match forge.open_pull_request(&spec) {
                 Err(ForgeError::NothingToDeliver(why)) => {
