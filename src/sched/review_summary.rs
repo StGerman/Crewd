@@ -90,8 +90,8 @@ fn carries_findings(body: &str) -> bool {
     })
 }
 
-/// `text` without its HTML tags. Only a `<` followed by a letter or `/` opens a tag, so prose
-/// such as "a < b" survives and is still read as a finding.
+/// Treating comparison prose such as "a < b" as markup would silently drop a finding, so only a
+/// `<` followed by a letter or `/` opens a tag here; `text` comes back without its HTML tags.
 fn strip_tags(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -190,8 +190,8 @@ mod tests {
         assert!(carries_findings("Previously missed: src/gate/git.rs:325 reports on_base: false"));
     }
 
-    /// Copilot's summary as posted, with the overview sentence and entries cut: what is left is
-    /// the template every review carries (#201).
+    /// Counting this template as a finding spent a delivery round on every Copilot review (#201):
+    /// it is Copilot's summary as posted, with the overview sentence and entries cut.
     const TEMPLATE: &str = "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n\
         ### 🟢 Approved\n\n**Review effort:** Balanced  \n**Findings:** None\n\n\
         <details>\n<summary><strong>Previously missed (0)</strong></summary>\n\n\
