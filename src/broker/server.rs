@@ -162,16 +162,23 @@ pub fn bind() -> std::io::Result<TcpListener> {
 /// it could serve is revoked independently when its [`BrokerSession`](super::BrokerSession) is
 /// dropped. Stopping the listener would add a second thing to get right for no property the
 /// token lifetime does not already provide.
-pub fn serve<S: McpService>(service: Arc<S>, listener: TcpListener) {
-    serve_with(service, listener, Limits::default());
+///
+/// An accept thread that cannot be created is returned rather than panicking, so a caller at
+/// startup can stop naming what failed (#218).
+pub fn serve<S: McpService>(service: Arc<S>, listener: TcpListener) -> std::io::Result<()> {
+    serve_with(service, listener, Limits::default())
 }
 
 /// [`serve`], with the bounds named. Tests set deadlines they can wait out; nothing else needs
 /// to — the defaults are the policy and a caller that wanted looser ones would be removing the
 /// property, not configuring it.
-pub fn serve_with<S: McpService>(service: Arc<S>, listener: TcpListener, limits: Limits) {
+pub fn serve_with<S: McpService>(
+    service: Arc<S>,
+    listener: TcpListener,
+    limits: Limits,
+) -> std::io::Result<()> {
     let live = Arc::new(AtomicUsize::new(0));
-    std::thread::spawn(move || {
+    std::thread::Builder::new().name("crew-broker-accept".into()).spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
@@ -207,7 +214,8 @@ pub fn serve_with<S: McpService>(service: Arc<S>, listener: TcpListener, limits:
                 Err(e) => tracing::warn!(error = %e, "broker accept failed"),
             }
         }
-    });
+    })?;
+    Ok(())
 }
 
 /// One connection's place in [`Limits::max_connections`], returned by [`Drop`].
@@ -495,7 +503,7 @@ mod tests {
             )
             .unwrap(),
         );
-        serve_with(Arc::clone(&broker), listener, limits);
+        serve_with(Arc::clone(&broker), listener, limits).unwrap();
         let session = broker.open(&issue("o/r#1"), "run-1").unwrap();
         (broker, writes, session, addr)
     }

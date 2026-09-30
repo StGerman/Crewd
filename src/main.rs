@@ -265,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // A root that cannot be created stops startup (#218): runs leaving no record is a daemon
+    // A root that cannot be created stops startup (#218): a daemon whose runs leave no record is
     // missing what its config turned on. Defaults beside the worktrees rather than inside one —
     // see `TranscriptsConfig`.
     let transcripts = if cfg.transcripts.enabled {
@@ -376,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(listener) = mcp_listener {
         let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
         let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));
-        broker::server::serve(ops, listener);
+        broker::server::serve(ops, listener).context("starting the ops MCP server")?;
         tracing::info!(%addr, path = crew::api::mcp::PATH, "ops MCP server listening");
     }
 
@@ -570,7 +570,7 @@ fn start_broker(
         Broker::new(writes, clock, limits, cfg.known_states(), addr, &config_dir)
             .context("setting up the tool broker")?,
     );
-    broker::server::serve(Arc::clone(&broker), listener);
+    broker::server::serve(Arc::clone(&broker), listener).context("starting the tool broker")?;
     tracing::info!(%addr, states = ?cfg.known_states(), "tool broker listening");
     Ok(broker)
 }
