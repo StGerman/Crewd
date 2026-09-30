@@ -36,9 +36,10 @@ Write the issue from
    Done when what you will pass is at most `bug` plus one area, with the milestone unset
    and `agent` absent.
 
-4. **Create and check.** Pass `--label` once for each label Areas selected.
+4. **Create and check.** Pass `--label` once for each label step 3 chose: none, an area,
+   `bug`, or `bug` and an area.
    ```bash
-   gh issue create --title "<outcome>" --body-file <file> --label <area>
+   gh issue create --title "<outcome>" --body-file <file> [--label <area>] [--label bug]
    gh issue view <n> --json title,milestone,labels,body
    ```
    The create command prints the URL. The view is the check.

@@ -187,6 +187,7 @@ When a milestone closes:
 Moving issues, labelling and closing are writes to a shared tracker under the operator's
 credential. Present the full set of proposed changes as one table — issue, from-state,
 to-state, labels, reason — and apply it only after the operator confirms. When confirmed,
-apply with `gh issue edit <n> --milestone "<title>" --add-label agent` and `gh issue close
-<n> --reason "not planned" --comment "<why>"`, and batch the calls: the GitHub API budget is
-shared with the running daemon.
+apply each row's milestone and label changes in one call, `gh issue edit <n> --milestone
+"<title>" --add-label <added> --remove-label <removed>`, where the labels are `agent`, the area
+and `bug` as the table changed them, and close with `gh issue close <n> --reason "not planned"
+--comment "<why>"`. Batch the calls: the GitHub API budget is shared with the running daemon.
