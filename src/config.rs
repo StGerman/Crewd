@@ -76,9 +76,11 @@ fn d_delivery_base() -> String {
 fn d_delivery_remote() -> String {
     "origin".into()
 }
+/// The login the reviews endpoint reports for Copilot's automatic review.
+pub const COPILOT_REVIEWER: &str = "copilot-pull-request-reviewer[bot]";
+
 fn d_summary_reviewers() -> Vec<String> {
-    // The login the reviews endpoint reports for Copilot's automatic review.
-    vec!["copilot-pull-request-reviewer[bot]".into()]
+    vec![COPILOT_REVIEWER.into()]
 }
 fn d_rounds_per_pr() -> u32 {
     3
@@ -209,7 +211,8 @@ pub struct DeliveryConfig {
     pub reviewers: Vec<String>,
     /// Logins whose review *summary* is read for findings as well as their inline comments
     /// (#126): any of their reviews on the current head whose body says more than
-    /// "Findings: None" is handed to an agent whole. A review in the `CHANGES_REQUESTED` state
+    /// "Findings: None", Copilot's template (#201) and its approval's overview sentence (#234) is
+    /// handed to an agent whole. A review in the `CHANGES_REQUESTED` state
     /// is read the same way whoever wrote it, so this names only the reviewers whose
     /// `COMMENTED` summaries count too. Defaults to the Copilot reviewer, which puts findings
     /// there that it leaves on no line.

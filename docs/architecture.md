@@ -525,7 +525,8 @@ reviewers *and read back whether they attached*, read CI, read the review thread
 reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
 current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
 `CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" and Copilot's template
-(headings, tags, the "Review effort" line, section labels; #201) is handed back whole
+(headings, tags, the "Review effort" line, section labels; #201), or than the overview sentence
+under Copilot's `🟢 Approved` status that also says "Findings: None" (#234), is handed back whole
 as one more comment keyed `review-<id>`: no parser for its sections, whose format is nobody's
 contract, and noise costs one `rejected` verdict, posted as a pull request comment since a
 summary has no thread. A red CI or
