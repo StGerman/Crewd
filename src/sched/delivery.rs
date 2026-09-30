@@ -974,11 +974,9 @@ impl Scheduler {
             .collect()
     }
 
-    /// The issue a pull request is composed from. After a restart `seen` is empty until the
-    /// first poll, and delivery runs ahead of it, so reading `seen` alone opened a pull request
-    /// titled after its branch that did not close its issue (#223); a parked issue outside the
-    /// active states may never be polled again at all, so this reads it by id. A failed or empty
-    /// read waits for the next delivery poll.
+    /// The issue a pull request is composed from: `seen`, else read by id, since delivery runs
+    /// before the first poll and a parked issue may never be polled again (#223). A failed or
+    /// empty read waits for the next delivery poll.
     fn delivery_issue(&mut self, issue_id: &str) -> Option<Issue> {
         if let Some(issue) = self.seen.get(issue_id) {
             return Some(issue.clone());
@@ -986,8 +984,8 @@ impl Scheduler {
         match self.tracker.by_ids(&[issue_id.to_string()]) {
             Ok(found) => {
                 let Some(issue) = found.into_iter().find(|i| i.id == issue_id) else {
-                    // Visible rather than debug: a Jira issue reassigned away stays omitted, and
-                    // its delivery then waits with nothing else saying why.
+                    // Visible rather than debug: a Jira issue moved out of the configured project
+                    // stays omitted, and its delivery then waits with nothing else saying why.
                     tracing::warn!(issue_id, "tracker omitted the issue; its pull request waits");
                     self.last_error =
                         Some(format!("delivery {issue_id}: the tracker does not return the issue"));
