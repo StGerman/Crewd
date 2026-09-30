@@ -85,9 +85,9 @@ pub enum Command {
 
 /// Bind the API's listener, refusing an exposure nobody asked for.
 ///
-/// Separate from [`Api::serve`] so `main` can report a bind failure — a port already in use, an
-/// address that does not parse — and then carry on scheduling. The API failing to start must
-/// not be the reason agents stop being dispatched.
+/// Separate from [`Api::serve`] so `main` can bind at startup, before the store or any worktree
+/// is opened, and exit naming the address on a failure (a port already in use, an address that
+/// does not parse) rather than schedule with no ops API (#218).
 pub async fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
     let addr = resolve_bind("api.bind", &cfg.bind, cfg.allow_public)?;
     TcpListener::bind(addr).await.with_context(|| format!("binding the ops API to {addr}"))

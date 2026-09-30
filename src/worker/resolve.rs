@@ -1,0 +1,110 @@
+//! Resolving a worker's `bin` at startup (#218).
+//!
+//! Without it a daemon started with no `grok` on its `PATH` came up healthy and quarantined every
+//! issue its Grok slot took, one spawn failure at a time. A name with a `/` is a path, anything
+//! else is searched on `PATH`, and the worker execs the absolute path found here rather than
+//! repeating the lookup at spawn. A binary that disappears while running is #216's.
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+use nix::unistd::{AccessFlags, access};
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ResolveError {
+    #[error("{0} is not an executable file")]
+    NotExecutable(PathBuf),
+    #[error("{0:?} was not found on PATH")]
+    NotOnPath(String),
+}
+
+/// The absolute path `bin` names, given the `PATH` and cwd the daemon was started with.
+///
+/// Absolute because the worker spawns it from a worktree, with an allowlisted environment that
+/// may carry no `PATH`: a relative or bare name would resolve differently there than here.
+pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Result<PathBuf, ResolveError> {
+    let found = if bin.contains('/') {
+        let p = PathBuf::from(bin);
+        if !is_executable(&p) {
+            return Err(ResolveError::NotExecutable(p));
+        }
+        p
+    } else {
+        // An empty entry (a leading, trailing or doubled `:`) is the cwd, as it is to `execvp`;
+        // joining it yields the bare name, which `absolute` below anchors there.
+        path.into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join(bin))
+            .find(|p| is_executable(p))
+            .ok_or_else(|| ResolveError::NotOnPath(bin.to_string()))?
+    };
+    std::path::absolute(&found).map_err(|_| ResolveError::NotExecutable(found))
+}
+
+/// `access(X_OK)` rather than any execute bit in the mode: a file whose bits deny this user
+/// would pass a mode check here and then fail every spawn with `EACCES`.
+fn is_executable(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file()) && access(p, AccessFlags::X_OK).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixtures() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    #[test]
+    fn a_bare_name_is_found_on_path() {
+        let path = std::env::join_paths(["/nonexistent", "/bin"]).unwrap();
+        assert_eq!(resolve_bin("sh", Some(&path)), Ok(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn a_bare_name_missing_from_path_is_refused() {
+        let path = std::env::join_paths(["/bin"]).unwrap();
+        assert_eq!(
+            resolve_bin("crew-no-such-binary-218", Some(&path)),
+            Err(ResolveError::NotOnPath("crew-no-such-binary-218".into()))
+        );
+        assert!(resolve_bin("sh", None).is_err());
+    }
+
+    #[test]
+    fn a_relative_bin_resolves_to_an_absolute_path() {
+        let rel = "tests/fixtures/fake_grok/dump_argv.sh";
+        assert!(std::fs::metadata(rel).is_ok(), "cargo runs unit tests from the package root");
+        assert_eq!(resolve_bin(&format!("./{rel}"), None), Ok(std::path::absolute(rel).unwrap()));
+        let path = std::env::join_paths(["tests/fixtures/fake_grok"]).unwrap();
+        assert_eq!(resolve_bin("dump_argv.sh", Some(&path)), Ok(std::path::absolute(rel).unwrap()));
+    }
+
+    #[test]
+    fn a_file_this_user_cannot_execute_is_skipped_for_a_later_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("crew-resolve-{}", std::process::id()));
+        let (first, second) = (dir.join("a"), dir.join("b"));
+        for d in [&first, &second] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("tool"), "#!/bin/sh\n").unwrap();
+        }
+        // Others may execute; the owner, which is us, may not.
+        std::fs::set_permissions(first.join("tool"), std::fs::Permissions::from_mode(0o601))
+            .unwrap();
+        std::fs::set_permissions(second.join("tool"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let got = resolve_bin("tool", Some(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Ok(second.join("tool")));
+    }
+
+    #[test]
+    fn a_path_must_name_an_executable_file() {
+        let dir = fixtures();
+        assert_eq!(resolve_bin(dir.to_str().unwrap(), None), Err(ResolveError::NotExecutable(dir)));
+        assert!(resolve_bin("/nonexistent/grok", None).is_err());
+        assert_eq!(resolve_bin("/bin/sh", None), Ok(PathBuf::from("/bin/sh")));
+    }
+}

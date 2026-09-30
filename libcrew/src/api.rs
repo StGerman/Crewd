@@ -27,10 +27,10 @@ fn d_mcp_bind() -> String {
 /// that binds `0.0.0.0` because a field was left at a convenient default, is not something an
 /// operator asked for.
 ///
-/// Deliberately absent from `crewd`'s `Config::preflight`: preflight gates *dispatch*, so validating
-/// the bind address there would let a typo in a field the scheduler does not use stop the
-/// scheduler. The address is parsed once, by `crewd`'s `api::bind`, where a failure costs the
-/// API and nothing else.
+/// Deliberately absent from `crewd`'s `Config::preflight`, which runs before every dispatch: the
+/// address is used once, at startup, so it is parsed there instead, by `crewd`'s `api::bind` and
+/// only when the API is on. A failure there stops startup naming the address (#218), and a
+/// config with the API off is never refused over it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     #[serde(default)]

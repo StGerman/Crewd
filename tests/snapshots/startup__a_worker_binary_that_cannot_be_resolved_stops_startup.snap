@@ -1,0 +1,8 @@
+---
+source: tests/startup.rs
+expression: stderr(&out)
+---
+Error: worker "slow" cannot start: its bin "crew-no-such-binary-218" does not resolve
+
+Caused by:
+    "crew-no-such-binary-218" was not found on PATH

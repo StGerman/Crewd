@@ -50,7 +50,7 @@ this file.
   missing looks healthy to its operator (#218). A failure confined to one run stays with that
   run and is retried; one that disables a whole worker pauses that worker (#216); the task
   projection keeps its degrade (CLAUDE.md rule 4). Example: `Config::load` refusing a
-  half-written credentials file by name. Check: review. `Not yet enforced: #216, #217, #218`.
+  half-written credentials file by name. Check: review. `Not yet enforced: #216, #217`.
 - **MUST** handle an error once. Either log it and continue, or propagate it with `?`. Never
   both. Why: a double-handled error appears twice in the log and once in the caller, and the
   reader cannot tell how many failures happened. Example: `log_tracker_failure` in
@@ -187,7 +187,7 @@ this file.
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
-| `nix` (`signal` only) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, without `unsafe` | Replaced `libc` (#50) |
+| `nix` (`signal`, `fs`) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, and the `access(X_OK)` check on a worker's binary in `src/worker/resolve.rs` (#218), without `unsafe` | Replaced `libc` (#50) |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
