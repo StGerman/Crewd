@@ -489,7 +489,7 @@ connected while it was registered only at local scope. The operator accepted thi
 "option 2"): workers run as the same user and are trusted as that user, and the ops tools add
 nothing such a process cannot already do by sending a request to the loopback HTTP API the same
 routes live on. The way to actually withhold them is `--strict-mcp-config` with the worker's
-servers passed explicitly (rust-analyzer from `.mcp.json` among them); it was not taken.
+servers passed explicitly; it was not taken.
 
 
 **`crewd init`** ([src/init/](../src/init/)) registers the operator's own GitHub App through the
