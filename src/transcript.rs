@@ -45,13 +45,13 @@ pub struct Transcripts {
 }
 
 impl Transcripts {
-    /// Creates the root if it does not exist. The error is the caller's cue to run without
-    /// transcripts, never to fail startup.
+    /// Creates the root if it does not exist. `main` treats the error as a failed startup
+    /// (#218): transcripts the config turned on are not silently dropped.
     pub fn new(root: &Path, max_bytes_per_run: u64, keep_runs: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(root)?;
         // A transcript is the agent's raw tool inputs and results, so it can hold anything the
-        // run touched. Fail closed: if the mode cannot be tightened, the caller's cue is to run
-        // without transcripts, not to write them where any local user can read them.
+        // run touched. Fail closed: if the mode cannot be tightened, return the error rather than
+        // write them where any local user can read them.
         restrict(root, 0o700)?;
         Ok(Self { root: root.to_path_buf(), max_bytes_per_run, keep_runs })
     }
