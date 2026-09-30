@@ -72,9 +72,12 @@ spawns a real `claude` and spends tokens, and only a Cargo default (examples are
 CI builds `--locked`, so a drifted `Cargo.lock` fails rather than being quietly rewritten.
 
 On a `crew/` branch a `Stop` hook ([.claude/hooks/lint-before-stop.sh](.claude/hooks/lint-before-stop.sh))
-runs `cargo fmt --check` and clippy when the session tries to finish, and blocks the stop with
-their output (#187), so a lint failure costs a turn rather than a gate round. It blocks once per
-stop, then lets the next through; the gate still decides. Other branches never run it.
+runs `cargo fmt --check` and clippy when a Claude Code session tries to finish, and blocks the
+stop with their output until they pass and the fix is committed (#187), so a lint failure costs
+a turn rather than a gate round. A stop reporting `continue` or `blocked` is let through, and a
+blocked agent repeats its `CREW_OUTCOME`/`CREW_REVIEW` lines, because crewd reads them from the
+final message only. Its timeout stays under `agent.stall_timeout_ms`. Grok and other branches
+never run it; the gate still decides.
 
 The loop while editing, measured on this tree (an agent runs the command the docs name, so this
 table *is* the loop):
