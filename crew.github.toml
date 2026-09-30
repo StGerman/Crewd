@@ -53,8 +53,8 @@ effort = "medium"
 
 [agent]
 # Each concurrent agent brings its own rust-analyzer index and its own `cargo check` — budget
-# 1-2 GB resident apiece, because .mcp.json is committed and so every worktree indexes its own
-# copy of the tree. Time is not the limit here: the wall clock of a dispatch belongs to the
+# 1-2 GB resident apiece, because .claude/settings.json enables the rust-analyzer-lsp plugin and
+# so every worktree indexes its own copy of the tree. Time is not the limit here: the wall clock of a dispatch belongs to the
 # agent, so extra workers are close to free in elapsed time and expensive only in memory. On a
 # machine that cannot hold that many indexes the symptom is swap and a stalled `cargo check`,
 # not an orchestrator error, so lower this before blaming stall_timeout_ms.

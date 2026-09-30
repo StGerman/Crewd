@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# SessionStart probe for the rust-analyzer MCP toolchain.
+# SessionStart probe for the rust-analyzer-lsp plugin's language server.
 #
-# .mcp.json spawns $HOME/.cargo/bin/rust-analyzer-mcp directly, so a machine that
-# never ran the setup gets a bare ENOENT at connect time with no hint of which of
-# the three pieces is missing. This reports that up front. It never installs and
-# never fails the session — a missing toolchain degrades navigation to grep, it
-# does not stop work.
+# .claude/settings.json enables the plugin, which runs `rust-analyzer` from PATH. Under rustup
+# that is a proxy for the pinned toolchain's component (rust-toolchain.toml), and when it cannot
+# resolve one the server exits 1 and the plugin reports only "crashed", with no hint of which
+# piece is missing. This reports that up front. It never installs and never fails the session —
+# a missing server degrades navigation to grep and diagnostics to `cargo check`, it does not
+# stop work.
 set -uo pipefail
 
 missing=()
 
-[ -x "$HOME/.cargo/bin/rust-analyzer-mcp" ] ||
-  missing+=("rust-analyzer-mcp — the MCP bridge .mcp.json spawns")
-
-command -v rust-analyzer >/dev/null 2>&1 ||
-  missing+=("rust-analyzer — the language server itself")
+rust-analyzer --version >/dev/null 2>&1 ||
+  missing+=("rust-analyzer — the language server the plugin runs")
 
 if command -v rustc >/dev/null 2>&1; then
   sysroot=$(rustc --print sysroot 2>/dev/null || true)
@@ -32,4 +30,4 @@ for item in "${missing[@]}"; do
   list="$list\\n  - $item"
 done
 
-printf '{"systemMessage":"rust-analyzer MCP is not set up on this machine:%s\\n\\nRun /setup-rust-analyzer to install it, then /mcp to reconnect. Until then, navigation in this repo is grep rather than LSP."}\n' "$list"
+printf '{"systemMessage":"rust-analyzer is not set up on this machine:%s\\n\\nRun /setup-rust-analyzer to install it, then start a new session. Until then, navigation in this repo is grep rather than LSP, and an edit reports no diagnostics."}\n' "$list"

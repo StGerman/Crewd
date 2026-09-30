@@ -52,10 +52,7 @@
 //! on stdin regardless, so nothing needs to follow it.
 //!
 //! `--strict-mcp-config` is deliberately *not* passed: it would suppress the operator's own MCP
-//! servers, and this repo commits a [`.mcp.json`] that gives every dispatched agent
-//! rust-analyzer. The broker is added to what the operator configured, not substituted for it.
-//!
-//! [`.mcp.json`]: https://github.com/StGerman/crewd/blob/master/.mcp.json
+//! servers. The broker is added to what the operator configured, not substituted for it.
 //!
 //! ## The outcome convention
 //!
