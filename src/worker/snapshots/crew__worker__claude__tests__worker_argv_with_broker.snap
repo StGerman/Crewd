@@ -1,0 +1,17 @@
+---
+source: src/worker/claude.rs
+expression: dump
+---
+-p
+--output-format
+stream-json
+--verbose
+--permission-mode
+bypassPermissions
+--setting-sources
+project
+--strict-mcp-config
+--session-id
+s-new
+--mcp-config
+/broker/run.json
