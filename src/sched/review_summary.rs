@@ -42,9 +42,9 @@ pub(super) fn summary_findings(
 }
 
 /// Whether `body` says anything beyond "Findings: None". The one prose allowed is the overview
-/// sentence under Copilot's approval (`🟢 Approved`), and only in a summary that also says
-/// "Findings: None": that sentence is on every approval, and handing it back spent a delivery
-/// round on each (#234). Prose under any other status, or in any other section, still counts.
+/// sentence under Copilot's approval (`🟢 Approved`), before a "Findings: None" line: that
+/// sentence is on every approval, and handing it back spent a delivery round on each (#234).
+/// Prose under any other status, after the count, or in any other section still counts.
 fn carries_findings(body: &str) -> bool {
     let mut in_html_comment = false;
     let mut under_approval = false;
@@ -92,6 +92,8 @@ fn carries_findings(body: &str) -> bool {
         }
         if bare == "findings: none" {
             says_none = true;
+            // The overview precedes the count; prose after it is something else.
+            under_approval = false;
             continue;
         }
         let template = bare.is_empty()
@@ -268,6 +270,7 @@ mod tests {
         assert!(carries_findings(
             "### 🟢 Approved\nLooks good.\n**Findings:** None\n### Notes\nRename the guard."
         ));
+        assert!(carries_findings("### 🟢 Approved\nLooks good.\n**Findings:** None\nRename it."));
         assert!(carries_findings(
             "### 🟢 Approved\nLooks good.\n**Findings:** None\n<details>\n\
              <summary>Open (1)</summary>\nRename the guard.\n</details>"
