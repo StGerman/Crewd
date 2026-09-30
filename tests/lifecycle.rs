@@ -5,6 +5,10 @@
 //! touches a marker and then sleeps, so the test knows a tick is in progress when it signals.
 //! Without the hook the fake tracker's tick lasts milliseconds and a signal would almost always
 //! land between ticks, which is the case that worked before #215.
+//!
+//! `wait_for` calls `Instant::now` and `thread::sleep` because the thing it waits on is a real
+//! process. This file is a named exception for that in `docs/coding-guidelines.md`; the
+//! `disallowed_methods` allow on these calls lands with #52.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
