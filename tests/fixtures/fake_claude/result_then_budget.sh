@@ -4,4 +4,6 @@
 echo '{"type":"system","subtype":"init","session_id":"test"}'
 echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"result":"","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}'
-sleep 30
+# `exec`, not a forked `sleep`: a group SIGTERM landing mid-fork misses the child, which then
+# holds stdout open past the test's deadline.
+exec sleep 30
