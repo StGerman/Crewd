@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: Triage this repo's GitHub Issues into the milestone/`agent`-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising a new issue, planning the next milestone after one closes, or filing an issue yourself — an agent-filed issue lands in the inbox with no milestone and no `agent` label; other labels may be set, and triage revisits them.
+description: Triage this repo's GitHub Issues into the milestone and agent-label states the daemon dispatches from. Use when running the weekly triage, clearing the inbox (open issues with no milestone), placing or prioritising an issue, or planning the next milestone after one closes. Filing an issue is the issue-authoring skill.
 ---
 
 # Issue triage
@@ -57,10 +57,8 @@ on their explicit say-so, and only to an issue that is:
   an "Open" section in the body) goes to the operator first, and the answer is written into the
   description (see below) before the issue is made dispatchable.
 
-When you file an issue yourself (found a bug mid-task, split out follow-up work), leave it in
-the Inbox with no milestone and no `agent` label. Set one area label when the change has a
-single home, and `bug` when shipped behavior is false. Say in the body what triggered it.
-Triage revisits every label on the issue. `agent` is added only by the rule above.
+Filing an issue is the `issue-authoring` skill. Revisit the labels it set. `agent` is
+added only by the rule above.
 
 ## Decisions go into the description
 
@@ -90,21 +88,10 @@ whatever its milestone.
 
 ## Scope check
 
-Before placing an issue, name the boundary its work lands on
-([ADR 1](../../../docs/adr/0001-extension-boundaries.md)):
-
-| Boundary | Fits when |
-|---|---|
-| **trait implementation** | a new backend behind `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Forge`, `Gate`, `Store` or `Projector` |
-| **external command** | an operator tool that needs only the ops API: a `crewctl-<name>` program on `PATH` |
-| **hook** | a reaction to a lifecycle event that decides nothing: notifications, metrics |
-| **core change** | it closes or protects an invariant, or needs the scheduler's authority: a claim, a budget, a bound, a write on an agent's behalf |
-
-Write the boundary into the description. A one-line `**Boundary:** <name>, because <reason>`
-under the opening section is enough; for a core change, name the invariant row it adds or
-protects. An issue that needs a core change only because no hook or command exists yet
-still gets its boundary from the rule; the missing hook or command becomes its own issue,
-linked from the description. An issue that fits none of the four goes to Backlog, whatever its
+Before placing an issue, confirm the boundary line from the `issue-authoring` skill is
+present and still right. An issue that needs a core change only because no hook or command
+exists yet keeps that boundary; the missing hook or command becomes its own issue, linked
+from the description. An issue that fits none of the four goes to Backlog, whatever its
 urgency sounds like.
 
 ## Placing an issue
@@ -124,9 +111,10 @@ Apply this rule top-down; the first match wins.
 
 "Current milestone" is the open milestone with the lowest `M<n>`.
 
-Revisit the area already on the issue. Keep it or replace it from [Labels](#labels). An issue
-that names more than one of those trees, or none, stays without an area, and the table says
-why. Record the choice in the same confirmation table as the milestone.
+Revisit the area already on the issue against the Areas table in the `issue-authoring`
+skill. Keep it or replace it. An issue that names more than one of those trees, or none,
+stays without an area, and the confirmation table says why. Record the choice there with
+the milestone.
 
 ## Priority is the milestone
 
@@ -147,27 +135,9 @@ order — each PR is based on the one before — so its issues can share a miles
 
 ## Labels
 
-An issue carries three independent marks: `agent` or not, `bug` or not, and one area.
-
-`agent` is set only by the dispatch rule above. `bug` means shipped behavior is false.
-The milestone stays the priority either way.
-
-The author may set the area, and `bug`, at filing. Triage keeps each or replaces it.
-
-The area is where the change lands. Exactly one:
-
-| Area | Lands in |
-|---|---|
-| `delivery` | The handoff: the gate, the forge, rebase, the pull request, review sent back |
-| `scheduler` | Dispatch, claims, the store, startup and shutdown, config, `crewd init`, a release |
-| `worker` | The session: spawn, prompt, resume, budgets, the model, confinement, the broker |
-| `ops` | `crewctl`, the ops API, the TUI, logs, traces, readiness |
-| `workspace` | Worktrees and branch preparation |
-| `guidelines` | Lints, CI, and `docs/coding-guidelines.md` |
-| `tracker` | The GitHub or Jira adapter: poll, the dispatch rule, transitions |
-
-A pull request stays `delivery` when delivery also writes the issue. The broker stays
-`worker`. The store stays `scheduler`.
+`agent` is set only by the dispatch rule above. Area and `bug` are defined in the
+`issue-authoring` skill. The author may have set them. Keep each or replace it. The
+milestone stays the priority.
 
 #181, #84, #153 and #182 have no area: each one names more than one tree, or none. A new
 issue in that shape stays unlabeled, and the report says why.
@@ -185,9 +155,10 @@ Run through these in order. Triage is done when every step's criterion holds.
    Read each issue in full (`gh issue view <n> --comments`) and place it with the rule above.
    Done when the inbox list is empty.
 2. **One area each.** Revisit the area on every open issue, including one set at filing, and
-   keep it or replace it. Exactly one of `delivery`, `scheduler`, `worker`, `ops`,
-   `workspace`, `guidelines`, `tracker`, aside from an issue that names more than one of
-   those trees or none (#181, #84, #153, #182, and any newer one the report names).
+   keep it or replace it. The names are the Areas table in the `issue-authoring` skill:
+   `delivery`, `scheduler`, `worker`, `ops`, `workspace`, `guidelines`, `tracker`. An issue
+   that names more than one of those trees, or none, stays unlabeled (#181, #84, #153,
+   #182, and any newer one the report names).
    ```bash
    gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker)$"))]} | select(.a|length != 1) | .n'
    ```

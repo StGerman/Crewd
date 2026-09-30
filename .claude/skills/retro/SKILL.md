@@ -72,10 +72,7 @@ instead of restating it; say what to do, not what to avoid.
 6. **Present** the survivors in one table, most severe first: category, turns it cost, the
    file to change, the proposed title. Then stop and wait.
 
-7. **File on the operator's say-so**, one issue per candidate, from
-   `.github/ISSUE_TEMPLATE/work.md`. `## Why` opens with the turns this cost and the run.
-   `**Boundary:**` names the ADR 1 boundary, or `none, a docs/CI change`. `## Triggered by`
-   names the run id, the PR and the date. No milestone. No `agent` label, ever; triage adds it.
-   ```bash
-   gh issue create --title "<outcome>" --body-file <file>
-   ```
+7. **File on the operator's say-so**, one issue per candidate, with the `issue-authoring`
+   skill. `## Why` opens with the turns this cost and the run. `**Boundary:**` names the
+   ADR 1 boundary, or `none, a docs/CI change`. `## Triggered by` names the run id, the PR
+   and the date.
