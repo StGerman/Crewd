@@ -152,7 +152,7 @@ Run through these in order. Triage is done when every step's criterion holds.
 2. **One area each.** Revisit every open issue's area per [Labels](#labels). The names in
    the query are the Areas table in `issue-authoring`.
    ```bash
-   gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker)$"))]} | select(.a|length != 1) | .n'
+   gh issue list --state open --limit 200 --json number,labels --jq '.[] | {n:.number, a:[.labels[].name | select(test("^(delivery|scheduler|worker|ops|workspace|guidelines|tracker|onboarding)$"))]} | select(.a|length != 1) | .n'
    ```
    Done when that list is only the issues Labels names, plus any newer one the report explains.
 3. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any

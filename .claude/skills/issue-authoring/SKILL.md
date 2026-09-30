@@ -53,12 +53,13 @@ that lands in none, carries no area label.
 | Area | Lands in |
 |---|---|
 | `delivery` | The handoff: the gate, the forge, rebase, the pull request, review sent back |
-| `scheduler` | Dispatch, claims, the store, startup and shutdown, config, `crewd init`, a release |
+| `scheduler` | Dispatch, claims, the store, startup and shutdown, config |
 | `worker` | The session: spawn, prompt, resume, budgets, the model, confinement, the broker |
 | `ops` | `crewctl`, the ops API, the TUI, logs, traces, readiness |
 | `workspace` | Worktrees and branch preparation |
 | `guidelines` | Lints, CI, and `docs/coding-guidelines.md` |
 | `tracker` | The GitHub or Jira adapter: poll, the dispatch rule, transitions |
+| `onboarding` | `crewd init`, installing, building a release, publishing to crates.io |
 
 A pull request stays `delivery` when delivery also writes the issue.
 
