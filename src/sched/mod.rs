@@ -308,10 +308,12 @@ impl Scheduler {
             self.recover()?;
         }
 
-        // Unconditional: in-flight runs are reconciled even when config is broken.
+        // Unconditional: in-flight runs are reconciled even when config is broken. Warnings are
+        // read before `harvest_finished` removes a run that warned and ended since the last tick,
+        // which would otherwise leave its worker open to dispatch into the closing window.
+        self.observe_rate_limit_warnings();
         self.harvest_finished()?;
         self.observe_progress()?;
-        self.observe_rate_limit_warnings();
         self.harvest_gates()?;
         self.detect_stalls()?;
         self.refresh_running()?;
@@ -729,12 +731,12 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Pause new dispatch on a worker whose run reports its window past the CLI's own warning
-    /// threshold, one window earlier than the rejection would (#184): a run dispatched into a
-    /// 0.98 window spends its turns and dies on the rejection with nothing to show for them.
-    /// The warning run itself is left alone — it finishes on its own power, and only its
-    /// worker's *next* dispatch waits for `resets_at`. A `resets_at` that is missing, overflows
-    /// or is already behind the clock pauses nothing, for the same reason as a rejection's.
+    /// Pause new dispatch on a worker whose run reports its `five_hour` window past
+    /// `agent.rate_limit_warn_utilization`, one window earlier than the rejection would (#184): a
+    /// run dispatched into a 0.98 window spends its turns and dies on the rejection with nothing
+    /// to show for them. The warning run itself is left alone — it finishes on its own power, and
+    /// only its worker's *next* dispatch waits for `resets_at`. A `resets_at` that overflows or is
+    /// already behind the clock pauses nothing, for the same reason as a rejection's.
     fn observe_rate_limit_warnings(&mut self) {
         let now = self.clock.wall().0;
         let warned: Vec<(String, String, RateLimitSignal)> = self

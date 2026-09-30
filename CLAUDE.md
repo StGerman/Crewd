@@ -148,7 +148,8 @@ moves it.
 ```
 recover()                                        ← first tick only
                  ↓
-harvest_finished → observe_progress → harvest_gates → detect_stalls → refresh_running
+observe_rate_limit_warnings → harvest_finished → observe_progress → harvest_gates
+                 → detect_stalls → refresh_running
                  ↓
          advance_deliveries                          ← unconditional too
                  ↓

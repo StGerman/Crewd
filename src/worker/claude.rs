@@ -90,9 +90,9 @@
 //!
 //! `rate_limit_event` is the one exception: a rejected one is not a per-run detail but the
 //! scheduler's cue that the whole account is throttled, so [`parse_rate_limit_event`] reads it
-//! here rather than leaving it for a post-mortem (#37); a warning past the CLI's own threshold
-//! is read the same way, so dispatch can pause before the rejection arrives (#184). It is still copied to the transcript
-//! like every other line.
+//! here rather than leaving it for a post-mortem (#37). A `five_hour` warning past
+//! `agent.rate_limit_warn_utilization` is read the same way, so dispatch can pause before the
+//! rejection arrives (#184). It is still copied to the transcript like every other line.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -153,6 +153,7 @@ pub struct ClaudeWorker {
     bin: PathBuf,
     env_allowlist: Vec<String>,
     max_turns_per_session: u32,
+    rate_limit_warn_utilization: f64,
     model: ModelChoice,
 }
 
@@ -166,8 +167,16 @@ impl ClaudeWorker {
             bin: bin.into(),
             env_allowlist,
             max_turns_per_session,
+            rate_limit_warn_utilization: crate::config::d_rate_limit_warn_utilization(),
             model: ModelChoice::default(),
         }
+    }
+
+    /// `agent.rate_limit_warn_utilization`: the `five_hour` utilization whose warning the run
+    /// reports through [`RunHandle::rate_limit_warning`] (#184).
+    pub fn with_rate_limit_warn_utilization(mut self, threshold: f64) -> Self {
+        self.rate_limit_warn_utilization = threshold;
+        self
     }
 
     /// Unset fields pass no flag, which is exactly the behaviour before `worker.model` existed.
@@ -186,7 +195,8 @@ struct Inner {
     /// Independent of `outcome`: the CLI still reports its own verdict (ordinarily `Failed`,
     /// since the process exits with no explicit marker) alongside this.
     rate_limit: Option<RateLimitSignal>,
-    /// The latest `allowed_warning` past its threshold — see [`parse_rate_limit_warning`].
+    /// The latest `five_hour` warning past the worker's threshold — see
+    /// [`parse_rate_limit_warning`].
     rate_limit_warning: Option<RateLimitSignal>,
     /// Set only once the child has been reaped (`Child::wait` returned). `kill` must not
     /// return before this is true — the caller deletes the workspace next.
@@ -393,12 +403,15 @@ impl Worker for ClaudeWorker {
         let stderr = child.stderr.take().expect("piped at spawn");
 
         let state: SharedState = Arc::new((Mutex::new(Inner::default()), Condvar::new()));
-        let max_turns = self.max_turns_per_session;
+        let limits = ReaderLimits {
+            max_turns_per_session: self.max_turns_per_session,
+            rate_limit_warn_utilization: self.rate_limit_warn_utilization,
+        };
 
         {
             let state = Arc::clone(&state);
             std::thread::spawn(move || {
-                run_reader(child, stdout, stderr, state, pid, max_turns, transcript)
+                run_reader(child, stdout, stderr, state, pid, limits, transcript)
             });
         }
 
@@ -435,15 +448,23 @@ pub(crate) fn last_assistant_text(transcript: &str) -> Option<String> {
 /// stream's, the budget's, or a crash — is published only after `wait` returns: a verdict
 /// published on `result` lets the scheduler reuse the worktree while the child is still in it
 /// (#169).
+/// The worker's settings the reader applies to the stream, as one argument.
+#[derive(Clone, Copy)]
+struct ReaderLimits {
+    max_turns_per_session: u32,
+    rate_limit_warn_utilization: f64,
+}
+
 fn run_reader(
     mut child: Child,
     stdout: ChildStdout,
     stderr: ChildStderr,
     state: SharedState,
     pid: i32,
-    max_turns_per_session: u32,
+    limits: ReaderLimits,
     mut transcript: Option<TranscriptWriter>,
 ) {
+    let max_turns_per_session = limits.max_turns_per_session;
     let stderr_thread = std::thread::spawn(move || drain_capped(stderr));
 
     let mut turns = 0u32;
@@ -522,7 +543,9 @@ fn run_reader(
             Some("rate_limit_event") => {
                 if let Some(sig) = parse_rate_limit_event(&value) {
                     state.0.lock().unwrap().rate_limit = Some(sig);
-                } else if let Some(sig) = parse_rate_limit_warning(&value) {
+                } else if let Some(sig) =
+                    parse_rate_limit_warning(&value, limits.rate_limit_warn_utilization)
+                {
                     state.0.lock().unwrap().rate_limit_warning = Some(sig);
                 }
             }
@@ -1087,49 +1110,55 @@ mod tests {
         serde_json::json!({"type": "rate_limit_event", "rate_limit_info": info})
     }
 
+    fn five_hour_warning(utilization: f64) -> serde_json::Value {
+        warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
+            "utilization": utilization,
+        }))
+    }
+
     #[test]
     fn a_warning_below_threshold_changes_nothing() {
-        let v = warning(serde_json::json!({
-            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
-            "utilization": 0.89, "surpassedThreshold": 0.9,
-        }));
-        assert_eq!(parse_rate_limit_warning(&v), None);
+        let v = five_hour_warning(0.94);
+        assert_eq!(parse_rate_limit_warning(&v, 0.95), None);
         assert_eq!(parse_rate_limit_event(&v), None);
     }
 
+    /// The pause names the event's `rateLimitType` and lasts until its `resetsAt`, as a
+    /// rejection's does. `surpassedThreshold` is not consulted: one sampled `five_hour` warning
+    /// carried none.
     #[test]
-    fn a_warning_at_its_threshold_names_the_window_that_crossed_it() {
-        let v = warning(serde_json::json!({
-            "status": "allowed_warning", "rateLimitType": "seven_day", "resetsAt": 42,
-            "utilization": 0.9, "surpassedThreshold": 0.9,
-            "unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": 7}},
-        }));
+    fn a_five_hour_warning_at_threshold_names_its_window_and_reset() {
         assert_eq!(
-            parse_rate_limit_warning(&v),
-            Some(RateLimitSignal { kind: "seven_day".into(), resets_at: Some(42) })
-        );
-    }
-
-    #[test]
-    fn a_warning_reads_utilization_off_its_own_window_when_the_top_level_has_none() {
-        let v = warning(serde_json::json!({
-            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
-            "surpassedThreshold": 0.9,
-            "unifiedWindows": {"five_hour": {"utilization": 0.98}, "seven_day": {"utilization": 0.1}},
-        }));
-        assert_eq!(
-            parse_rate_limit_warning(&v),
+            parse_rate_limit_warning(&five_hour_warning(0.95), 0.95),
             Some(RateLimitSignal { kind: "five_hour".into(), resets_at: Some(42) })
         );
     }
 
+    /// 46 of the 54 warnings in this repository's transcripts were `seven_day` at 0.82-0.89
+    /// against a `surpassedThreshold` of 0.75; pausing on them would stop dispatch for days.
     #[test]
-    fn a_warning_without_a_surpassed_threshold_changes_nothing() {
+    fn a_seven_day_warning_changes_nothing() {
         let v = warning(serde_json::json!({
-            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
-            "utilization": 0.99,
+            "status": "allowed_warning", "rateLimitType": "seven_day", "resetsAt": 42,
+            "utilization": 0.99, "surpassedThreshold": 0.75,
         }));
-        assert_eq!(parse_rate_limit_warning(&v), None);
+        assert_eq!(parse_rate_limit_warning(&v, 0.95), None);
+    }
+
+    /// Only the top-level `utilization` and `resetsAt` are read; `unifiedWindows` is not a
+    /// fallback for either.
+    #[test]
+    fn a_warning_without_utilization_or_resets_at_changes_nothing() {
+        let no_utilization = warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
+            "unifiedWindows": {"five_hour": {"utilization": 0.98}},
+        }));
+        assert_eq!(parse_rate_limit_warning(&no_utilization, 0.95), None);
+        let no_reset = warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.99,
+        }));
+        assert_eq!(parse_rate_limit_warning(&no_reset, 0.95), None);
     }
 
     #[test]

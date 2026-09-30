@@ -99,28 +99,26 @@ pub(crate) fn parse_rate_limit_event(v: &serde_json::Value) -> Option<RateLimitS
     Some(RateLimitSignal { kind, resets_at })
 }
 
-/// Reads an `allowed_warning` off a `rate_limit_event` line, when its window's `utilization` is
-/// at or above the event's own `surpassedThreshold` (#184). The threshold is the CLI's rather
-/// than a config key, so an event without one is not a warning this crate can judge and yields
-/// `None`. `utilization` is read off `rate_limit_info` itself, else off the named window in
-/// `unifiedWindows`: `rateLimitType` names the window that crossed, and that is the one whose
-/// `resetsAt` the pause must wait for, the same window a rejection pauses on.
-pub(crate) fn parse_rate_limit_warning(v: &serde_json::Value) -> Option<RateLimitSignal> {
+/// Reads an `allowed_warning` off a `rate_limit_event` line, when it is a `five_hour` warning
+/// whose top-level `utilization` is at or above `threshold` (`agent.rate_limit_warn_utilization`,
+/// #184). Any other window yields `None`: `seven_day` warns from 0.75 and resets days away, so
+/// pausing on it would stop dispatch for days, and its rejection still pauses as before. The
+/// event's own `surpassedThreshold` is not read, since that is the 0.75. A warning without
+/// `utilization` or `resetsAt` is not one this crate can judge, and yields `None`.
+pub(crate) fn parse_rate_limit_warning(
+    v: &serde_json::Value,
+    threshold: f64,
+) -> Option<RateLimitSignal> {
     let info = v.get("rate_limit_info")?;
-    if info.get("status").and_then(|s| s.as_str()) != Some("allowed_warning") {
+    if info.get("status").and_then(|s| s.as_str()) != Some("allowed_warning")
+        || info.get("rateLimitType").and_then(|s| s.as_str()) != Some("five_hour")
+    {
         return None;
     }
-    let kind = info.get("rateLimitType").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
-    let threshold = info.get("surpassedThreshold").and_then(|t| t.as_f64())?;
-    let utilization = info
-        .get("utilization")
-        .or_else(|| info.pointer(&format!("/unifiedWindows/{kind}/utilization")))
-        .and_then(|u| u.as_f64())?;
-    if utilization < threshold {
-        return None;
-    }
-    let resets_at = info.get("resetsAt").and_then(|r| r.as_i64());
-    Some(RateLimitSignal { kind, resets_at })
+    let utilization = info.get("utilization").and_then(|u| u.as_f64())?;
+    let resets_at = info.get("resetsAt").and_then(|r| r.as_i64())?;
+    (utilization >= threshold)
+        .then(|| RateLimitSignal { kind: "five_hour".into(), resets_at: Some(resets_at) })
 }
 
 pub(crate) fn extract_text(v: &serde_json::Value) -> Option<String> {

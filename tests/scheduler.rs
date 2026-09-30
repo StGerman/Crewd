@@ -1071,6 +1071,35 @@ fn a_rate_limit_warning_at_threshold_pauses_new_dispatch_and_the_running_run_fin
     assert_eq!(h.worker.sessions_for("iss-2").len(), 1, "dispatch resumes once the window resets");
 }
 
+/// A run can warn and finish between two ticks. The warning is read before `harvest_finished`
+/// removes that run, or its worker would stay open to dispatch into the closing window (#184).
+#[test]
+fn a_run_that_warned_and_finished_between_ticks_still_pauses_new_dispatch() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.max_concurrent = 2;
+        });
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(500).with_rate_limit_warning(RateLimitSignal {
+            kind: "five_hour".into(),
+            resets_at: Some(h.clock.wall().0 / 1_000 + 60),
+        }),
+    );
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "the warned run was harvested this tick");
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "no new dispatch into a closing window");
+    let pauses = h.sched.snapshot().unwrap().rate_limit_pauses;
+    assert_eq!(pauses.len(), 1, "{pauses:?}");
+}
+
 // ---- several workers (#119) --------------------------------------------------
 
 /// A second worker beside the harness's own, one slot each, in dispatch order: the harness's
