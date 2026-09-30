@@ -44,7 +44,7 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.4.2"
-nix = { version = "0.30", default-features = false, features = ["signal"] }
+nix = { version = "0.30", default-features = false, features = ["fs", "signal"] }
 
 [dev-dependencies]
 insta = "1.48.0"

@@ -208,9 +208,13 @@ to stateless re-polling, never to incorrect behaviour — the session id lives t
 losing it costs cold continuations rather than a wrong conversation. The claim is the one entry
 that could invert that, because *keeping* it across a hard kill is what went wrong: an issue
 marked `running` with nothing running is refused by `claim()` forever, is invisible to
-`detect_stalls`, and has no retry row to bring it back. `Scheduler::recover` is what holds the
-contract — it releases those claims at startup and reconciles their worktrees, so the worst a
-surviving database can do is still cost a re-poll.
+`detect_stalls`, and has no retry row to bring it back. `Scheduler::recover` releases those
+claims at startup and reconciles their worktrees, so the worst a surviving database can do is
+still cost a re-poll. It is safe only while one process
+has the store: `main` holds an exclusive OS lock on `<store>.lock` for the life of the process,
+and a second daemon exits at startup naming the store and the pid that holds it (#217). The
+kernel releases that lock when the process dies, including a hard kill, and the next start
+proceeds.
 
 **Independent brakes on the same runaway** — the `Outcome` verdict, the per-issue turn budget,
 `parked_state` and the gate's `max_failures` — cover different paths; removing one looks safe

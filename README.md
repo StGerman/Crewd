@@ -22,7 +22,8 @@ it falls apart — and it falls apart in specific, repeatable ways:
   reset. An agent cannot buy itself a fresh budget by starting a new session.
 - **A crash should cost a poll, not a wedged queue.** The database is a cache of judgment, not
   a system of record. Losing it degrades to re-polling the tracker. A hard kill releases its
-  claims at the next startup rather than leaving an issue marked running forever.
+  claims at the next startup rather than leaving an issue marked running forever. A second
+  `crewd` pointed at the same database refuses to start while the first is alive.
 - **You should be able to see what happened.** Every run writes its full event stream to a
   transcript on disk, and a running daemon answers questions over an HTTP API without being
   disturbed.
