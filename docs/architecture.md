@@ -100,8 +100,10 @@ before that the name is a prediction and pointing an operator at a ref nobody wr
 than saying nothing.
 
 `Tracker` gets its third implementation in [src/tracker/github.rs](../src/tracker/github.rs):
-`GithubTracker<H: Http>`, generic over a small `Http` seam (`FakeHttp` in tests, `UreqHttp` —
-over `ureq` with `rustls`, no C toolchain needed — in `main.rs`). GitHub has no workflow
+`GithubTracker<H: Http>`, generic over the `Http` seam in [src/http.rs](../src/http.rs)
+(`FakeHttp` in tests, `UreqHttp` — over `ureq` with `rustls`, no C toolchain needed — in
+`main.rs`). The same seam, percent-encoder and authenticated-request helper serve the Jira
+tracker and the GitHub forge (#181). GitHub has no workflow
 states beyond open/closed; the module doc there is the write-up of that mapping (a
 `state:<name>` label convention) and should be read before touching it. Two contract details
 worth knowing before changing either `Tracker` impl: `by_ids` must fail the whole call on
@@ -113,7 +115,7 @@ discards the headers and body this adapter classifies on (rate-limit header, err
 `UreqHttp::default()` disables that (`http_status_as_error(false)`) so every status code
 arrives as an ordinary response. `FakeHttp`-based tests are structurally blind to that class
 of bug — they hand `GithubTracker` an already-correct `HttpResponse` — which is why
-`ureq_http_tests` in the same file talks to a raw `TcpListener` instead.
+`ureq_http_tests` in [src/http.rs](../src/http.rs) talks to a raw `TcpListener` instead.
 
 A tracker failure has no issue to quarantine against — `by_states`/`by_ids` are batch calls,
 not scoped to one ticket — so `TrackerError::class()` ([src/tracker/mod.rs](../src/tracker/mod.rs))

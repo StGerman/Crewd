@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::clock::FakeClock;
-use crate::tracker::github::{HttpResponse, HttpTransportError};
+use crate::http::{HttpResponse, HttpTransportError};
 
 const CLIENT_SECRET: &str = "client-secret-7c1d0f3e9a";
 const WEBHOOK_SECRET: &str = "webhook-secret-51be2a";

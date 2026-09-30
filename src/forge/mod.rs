@@ -51,6 +51,17 @@ impl ForgeError {
     }
 }
 
+impl From<crate::http::AuthError> for ForgeError {
+    fn from(e: crate::http::AuthError) -> Self {
+        match e {
+            crate::http::AuthError::Credential(c) => c.into(),
+            crate::http::AuthError::Transport(t) => {
+                ForgeError::Transient(format!("transport error: {}", t.0))
+            }
+        }
+    }
+}
+
 /// Everything needed to open a pull request. The body is composed by the scheduler from the
 /// run record — never by the agent — which is what keeps it honest about what happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
