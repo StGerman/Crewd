@@ -34,7 +34,7 @@ use crew::http::UreqHttp;
 use crew::init;
 use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use crew::sched::{Scheduler, Snapshot, WorkerPool};
-use crew::store::Store;
+use crew::store::{Store, StoreLock};
 use crew::tracker::Tracker;
 use crew::tracker::fake::FakeTracker;
 use crew::tracker::github::{DispatchRule, GithubTracker};
@@ -158,6 +158,9 @@ async fn main() -> anyhow::Result<()> {
 
     let db_path =
         std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
+    // Before the store is opened and before the first tick's `recover`. A second process on
+    // this file must exit here rather than release claims a live daemon still holds (#217).
+    let _store_lock = StoreLock::acquire(&db_path)?;
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
     let ws_root =

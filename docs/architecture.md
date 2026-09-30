@@ -54,7 +54,11 @@ claim stranded by the last process must not stay stranded behind a config typo. 
 `tick()` rather than in `main.rs` on purpose — recovery a second entry point can forget to call
 is recovery that silently does not happen, which is the exact failure it exists to fix. It is
 callable directly (`Scheduler::recover`) and idempotent, so a caller that wants it eagerly can
-have it.
+have it. It releases every unmatched claim, so it is safe only while one process has the store.
+`main` takes that premise before the first tick: an exclusive OS lock beside the canonical path
+of the database, held until the process dies and released by the kernel on a hard kill (#217).
+A symlink and a `./crew.db` spelling of one file share that lock. A second daemon on the same
+store exits at startup, naming the store and the pid that holds it.
 
 ## Subsystems
 
@@ -437,9 +441,10 @@ answer for hours at the moment diagnosis instead went to a block-buffered log fi
 wrong answer (#24). Nothing was missing server-side — what was missing was something to type.
 So it is a client and nothing else, in its own binary: an operator asking what is running must
 not be able to disturb it, and a second process on `crew.db` while the daemon holds it would be
-exactly that. `crewctl` links no `Store`, worktree or tracker code at all — see the package
-split under **What this is** — and its HTTP is a single `std::net` GET rather than an HTTP
-crate, so its graph stays that small. It shares `Snapshot` and `Row` with the server through
+exactly that — the daemon now refuses that second process at startup (#217). `crewctl` links no
+`Store`, worktree or tracker code at all — see the package split under **What this is** — and
+its HTTP is a single `std::net` GET rather than an HTTP crate, so its graph stays that small.
+It shares `Snapshot` and `Row` with the server through
 `libcrew` instead of re-describing them, so a renamed field fails the build rather than
 rendering a blank column, and it uses the same `fmt_count`/`fmt_ms`/`Phase::label` as the
 dashboard so a duration means the same thing on all three surfaces.

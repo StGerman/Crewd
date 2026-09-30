@@ -8,6 +8,10 @@
 
 pub mod schema;
 
+mod lock;
+
+pub use lock::{StoreLock, StoreLockError};
+
 use std::path::Path;
 use std::sync::Mutex;
 

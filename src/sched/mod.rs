@@ -349,7 +349,9 @@ impl Scheduler {
     /// Release the claims of runs that did not survive the previous process.
     ///
     /// `running` is in-memory and the claim is in the store, so the two can only disagree
-    /// across a process boundary. Every ordinary exit reconciles them — `shutdown()`, `Drop for
+    /// across a process boundary. The daemon holds [`StoreLock`](crate::store::StoreLock) for
+    /// the life of the process, so a second daemon exits before it can reach this (#217).
+    /// Every ordinary exit reconciles them — `shutdown()`, `Drop for
     /// Scheduler`, the interrupt arm in `main` — and a `SIGKILL`, an OOM kill or a host reboot
     /// reaches none of those. What is left afterwards is an issue marked `running` in a
     /// database with nothing running: [`Store::claim`] refuses it forever, `detect_stalls`
