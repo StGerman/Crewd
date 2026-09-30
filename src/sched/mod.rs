@@ -80,8 +80,8 @@ fn log_tracker_failure(context: &str, e: &TrackerError) {
 }
 
 /// The continuation brief for a conflict handed back to the agent (#111). It says the attempt
-/// was aborted because an agent told otherwise goes looking for a half-finished rebase that is
-/// not there; and it names the migration rule for `schema.rs` because the obvious resolution —
+/// was aborted because an agent told otherwise goes looking for a half-finished rebase or merge
+/// that is not there; and it names the migration rule for `schema.rs` because the obvious resolution —
 /// keep both sides' v<N> — edits a released migration, which the gate's own `cargo test` would
 /// then fail on, spending a try on a rule the brief could have stated. The commands name the
 /// commit, not the ref: a ref resolves in the agent's worktree, where an unset base's `HEAD` is
