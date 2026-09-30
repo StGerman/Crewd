@@ -134,6 +134,8 @@ fn main() -> anyhow::Result<()> {
     )?;
     report("fresh", &fresh);
     write_fixture("stream.jsonl", &redact(&fresh.stdout, &redact_from))?;
+    // #172's pin lines are appended to that file after this write. Re-running the probe
+    // overwrites it and drops them; the reduction test fails until they are put back.
     anyhow::ensure!(fresh.code == Some(0), "fresh session exit {:?}\n{}", fresh.code, fresh.stderr);
 
     let resume_prompt = write_prompt(

@@ -10,6 +10,7 @@ pub mod jira;
 #[cfg(test)]
 pub(crate) mod test_http;
 
+use crate::http::AuthError;
 use crate::model::{ErrorClass, Issue};
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -38,6 +39,15 @@ impl TrackerError {
             TrackerError::Status(_) | TrackerError::Response(_) => ErrorClass::TrackerStatus,
             TrackerError::RateLimited => ErrorClass::RateLimited,
             TrackerError::Auth(_) => ErrorClass::AuthFailed,
+        }
+    }
+}
+
+impl From<AuthError> for TrackerError {
+    fn from(e: AuthError) -> Self {
+        match e {
+            AuthError::Credential(c) => c.into(),
+            AuthError::Transport(t) => TrackerError::Request(t.0),
         }
     }
 }

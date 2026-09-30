@@ -1,6 +1,6 @@
 ---
 source: src/worker/claude.rs
-expression: "build_continuation_prompt(&issue(), None, Some(&fb), &[], false)"
+expression: "build_continuation_prompt(&issue(), None, std::slice::from_ref(&fb), &[],\nfalse)"
 ---
 Continue working on MT-1. Your previous session on this issue reported its work finished, but the orchestrator could not hand the branch off; what stopped it is below. The working directory is the same worktree, with whatever you committed still in it. Pick up where you left off.
 
@@ -10,4 +10,4 @@ CREW_OUTCOME: continue: <one-sentence reason>
 If you are stuck and need a human to unblock you, end with:
 CREW_OUTCOME: blocked: <one-sentence reason>
 
-The orchestrator could not rebase your branch onto master (0123456789abcdef0123456789abcdef01234567): conflicts in src/store/schema.rs, src/store/mod.rs. The rebase was aborted, so your branch is exactly as you left it. Your job this run is to resolve that yourself — `git rebase 0123456789abcdef0123456789abcdef01234567`, resolve each conflict (the description may say how), `git rebase --continue` — then run the project's own gate and commit. Do not report done while the branch still conflicts with master.
+The orchestrator could not bring your branch onto master (0123456789abcdef0123456789abcdef01234567): conflicts in src/store/schema.rs, src/store/mod.rs. It was aborted, so your branch is exactly as you left it. Your job this run is to resolve that yourself — `git merge 0123456789abcdef0123456789abcdef01234567`, resolve each conflict (the description may say how), commit the merge — then run the project's own gate. Do not rebase: the orchestrator merges the base into a branch that has merged it, so a merge keeps your resolution. Do not report done while the branch still conflicts with master.

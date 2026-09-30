@@ -345,6 +345,17 @@ fn classify_push(remote: &str, branch: &str, text: &str) -> ForgeError {
     }
 }
 
+/// A failed `read_remote`: a refused credential is permanent for the reason it is in
+/// [`classify_push`], and anything else is the network.
+fn classify_read(what: String, e: &WorkspaceError) -> ForgeError {
+    let text = e.to_string();
+    if is_auth_refusal(&text) {
+        ForgeError::Permanent(format!("{what}: the remote refused the credential: {text}"))
+    } else {
+        ForgeError::Transient(format!("{what}: {text}"))
+    }
+}
+
 /// What git prints when the remote refused the credential it sent: `Authentication failed` is
 /// git's own wording for a 401 over HTTPS, and `Invalid username or token` is GitHub's.
 pub(crate) fn is_auth_refusal(stderr: &str) -> bool {
@@ -452,8 +463,13 @@ impl GitWorktreeWorkspace {
         let reason = match fetch_lock.try_lock_for(*lock_wait) {
             None => format!("another fetch of the base held the lock for {lock_wait:?}"),
             Some(_hold) => {
-                match self.read_remote(&self.repo, remote, &BASE_FETCH, &refspec, Some(*fetch_wait))
-                {
+                match self.read_remote(
+                    &self.repo,
+                    remote,
+                    &BASE_FETCH,
+                    &[&refspec],
+                    Some(*fetch_wait),
+                ) {
                     Ok(Ok(_)) => return Ok(Some(tracking)),
                     Ok(Err(e)) => e.to_string(),
                     Err(e) => e.to_string(),
@@ -532,17 +548,18 @@ impl GitWorktreeWorkspace {
         Ok((args, Some(file)))
     }
 
-    /// `git <cmd> <where> <refspec>` in `worktree`, where `where` is the URL and credential
-    /// `publish` pushes with when there is one, and `remote` otherwise. A read on the ambient
-    /// credential while the push uses the App's fails wherever only the App can reach the
-    /// repository, and a sync that cannot read leaves the lease refusing a push whose missing
-    /// commits the worktree never got to take in. Retried on a fresh token as a push is.
+    /// A read on the ambient credential while the push uses the App's fails wherever only the App
+    /// can reach the repository, and a sync that cannot read leaves the lease refusing a push
+    /// whose missing commits the worktree never got to take in (#189). Every read of the remote
+    /// goes through here: `git <cmd> <where> <refspecs>` in `worktree`, where `where` is the URL
+    /// and credential `publish` pushes with when there is one, and `remote` otherwise. Retried on
+    /// a fresh token as a push is.
     fn read_remote(
         &self,
         worktree: &Path,
         remote: &str,
         cmd: &[&str],
-        refspec: &str,
+        refspecs: &[&str],
         limit: Option<std::time::Duration>,
     ) -> Result<Result<String, WorkspaceError>, ForgeError> {
         self.retry_on_auth(|| {
@@ -556,7 +573,8 @@ impl GitWorktreeWorkspace {
                 }
             };
             args.extend(cmd.iter().map(|c| c.to_string()));
-            args.extend([target, refspec.to_string()]);
+            args.push(target);
+            args.extend(refspecs.iter().map(|r| r.to_string()));
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let out = match limit {
                 Some(limit) => Self::git_within(worktree, &args, limit),
@@ -1012,8 +1030,8 @@ impl Publisher for GitWorktreeWorkspace {
         let full = format!("refs/heads/{branch}");
         let lease_ref = Self::lease_ref(branch);
         let listed = self
-            .read_remote(worktree, remote, &["ls-remote", "--heads"], &full, None)?
-            .map_err(|e| ForgeError::Transient(format!("reading {remote}/{branch}: {e}")))?;
+            .read_remote(worktree, remote, &["ls-remote", "--heads"], &[&full], None)?
+            .map_err(|e| classify_read(format!("reading {remote}/{branch}"), &e))?;
         if listed.is_empty() {
             // A lease left from a branch since deleted (merged, or by hand) would make the push
             // that recreates it expect a head the remote no longer has, and be refused forever.
@@ -1023,8 +1041,8 @@ impl Publisher for GitWorktreeWorkspace {
         }
         // Into `FETCH_HEAD`, which is per worktree, rather than any shared ref a fetch in
         // `workspace.repo` could also move.
-        self.read_remote(worktree, remote, &["fetch", "--quiet"], &full, None)?
-            .map_err(|e| ForgeError::Transient(format!("fetching {remote}/{branch}: {e}")))?;
+        self.read_remote(worktree, remote, &["fetch", "--quiet"], &[&full], None)?
+            .map_err(|e| classify_read(format!("fetching {remote}/{branch}"), &e))?;
         let remote_head = Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"])
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
         let is_ancestor =
@@ -1105,16 +1123,23 @@ impl Publisher for GitWorktreeWorkspace {
             let _ = Self::git(worktree, &["branch", "--set-upstream-to", &upstream, branch]);
         }
 
-        // Best-effort: a fetch that fails leaves the local `base`, which is right whenever the
-        // remote has nothing newer, and only over-lists commits otherwise.
-        let _ = Self::git(worktree, &["fetch", "--quiet", remote, base]);
+        // Best-effort: a fetch that fails leaves the remote-tracking `base`, else the local
+        // one, which is right whenever the remote has nothing newer, and only over-lists commits
+        // otherwise. Read off `FETCH_HEAD`, because a fetch from the App's URL moves no
+        // remote-tracking ref.
+        let fetched = self
+            .read_remote(worktree, remote, &["fetch", "--quiet"], &[base], None)
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|_| Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"]).ok());
         let remote_base = format!("refs/remotes/{remote}/{base}");
-        let base_ref =
-            if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &remote_base]).is_ok() {
-                remote_base
-            } else {
-                base.to_string()
-            };
+        let base_ref = if let Some(sha) = fetched {
+            sha
+        } else if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &remote_base]).is_ok() {
+            remote_base
+        } else {
+            base.to_string()
+        };
         let range = format!("{base_ref}..{branch}");
         let log = Self::git(worktree, &["log", "--format=%s", &range])
             .map_err(|e| ForgeError::Transient(e.to_string()))?;
@@ -1135,8 +1160,9 @@ impl Publisher for GitWorktreeWorkspace {
         // pushed by another clone — or deleted after its merge — would be misread either way.
         // One round trip for every candidate at once; a network failure here is the same
         // transient the push after it would hit.
-        let heads = Self::git(worktree, &["ls-remote", "--heads", remote])
-            .map_err(|e| ForgeError::Transient(format!("listing {remote}'s branches: {e}")))?;
+        let heads = self
+            .read_remote(worktree, remote, &["ls-remote", "--heads"], &[], None)?
+            .map_err(|e| classify_read(format!("listing {remote}'s branches"), &e))?;
         let on_remote: HashSet<&str> = heads
             .lines()
             .filter_map(|l| l.split_once('\t'))
@@ -2281,6 +2307,64 @@ mod tests {
         }
     }
 
+    /// #189.
+    #[test]
+    fn stacked_on_lists_the_remote_with_the_push_credential() {
+        let root = tmp_root("wt-stack-app");
+        let (repo, bare) = repo_with_remote("wt-stack-app");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(
+            Arc::new(crate::credentials::StaticToken::new("tok")),
+            bare.to_str().unwrap(),
+        );
+        let lower = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&lower.path, "lower.txt", "lower");
+        let lower_branch = lower.branch.clone().unwrap();
+        ws.publish(&lower.path, &lower_branch, "origin", "main").unwrap();
+        let upper = ws.prepare("id-2", "MT-2").unwrap();
+        git_out(&upper.path, &["merge", "-q", "--ff-only", &lower_branch]).unwrap();
+        commit_in(&upper.path, "upper.txt", "upper");
+        let upper_branch = upper.branch.clone().unwrap();
+        git_out(&repo, &["remote", "set-url", "origin", "/nonexistent/crew-test.git"]).unwrap();
+
+        let candidates = vec![lower_branch.clone()];
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
+            Some(lower_branch)
+        );
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #189.
+    #[test]
+    fn publish_fetches_the_base_with_the_push_credential() {
+        let root = tmp_root("wt-publish-base-app");
+        let (repo, bare) = repo_with_remote("wt-publish-base-app");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(
+            Arc::new(crate::credentials::StaticToken::new("tok")),
+            bare.to_str().unwrap(),
+        );
+        // The remote's `main` lands a commit the worktree is built on, while the local `main`
+        // and its remote-tracking ref stay behind it.
+        commit_in(&repo, "landed.txt", "landed on the remote's main");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        git_out(&repo, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+        git_out(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        commit_in(&p.path, "a.txt", "the branch's own");
+        git_out(&repo, &["remote", "set-url", "origin", "/nonexistent/crew-test.git"]).unwrap();
+
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.commits, vec!["the branch's own"]);
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     /// Review on #174: a lease outliving its remote branch refused the push recreating it.
     #[test]
     fn a_branch_deleted_on_the_remote_can_be_pushed_again() {
@@ -2373,6 +2457,16 @@ mod tests {
             classify_push("origin", "crew/x", "Could not resolve host: github.com").retryable(),
             "the network is still transient"
         );
+    }
+
+    #[test]
+    fn a_read_refused_for_authentication_after_its_retry_is_permanent() {
+        let git =
+            |stderr: &str| WorkspaceError::Git { args: "ls-remote".into(), stderr: stderr.into() };
+        let refused = git("fatal: Authentication failed for 'https://github.com/o/r/'");
+        assert!(matches!(classify_read("listing".into(), &refused), ForgeError::Permanent(_)));
+        let offline = git("Could not resolve host: github.com");
+        assert!(classify_read("listing".into(), &offline).retryable(), "the network is transient");
     }
 
     #[test]

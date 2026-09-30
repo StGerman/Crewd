@@ -39,8 +39,8 @@ use serde_json::{Value, json};
 use super::{Tracker, TrackerError};
 use crate::broker::TrackerWrites;
 use crate::credentials::{CredentialError, Credentials};
+use crate::http::{self, AuthScheme, Http, HttpResponse, HttpTransportError};
 use crate::model::Issue;
-use crate::tracker::github::{Http, HttpResponse, HttpTransportError};
 use issue::{FIELDS, JiIssue, MapContext};
 
 /// `search_all`'s ceiling on pages of `search_page`'s own 100-result page size. Jira Cloud
@@ -131,25 +131,13 @@ impl<H: Http> JiraTracker<H> {
         self
     }
 
-    fn headers(&self) -> Result<Vec<(&'static str, String)>, TrackerError> {
-        Ok(vec![
-            ("Authorization", format!("Basic {}", self.creds.token()?)),
-            ("Accept", "application/json".to_string()),
-            ("User-Agent", "crewd".to_string()),
-        ])
-    }
-
-    /// Sends once, and once more with a fresh token if the first was refused with a 401 — see
-    /// `GithubTracker::authed` for why a refused request is always safe to repeat.
     fn authed(
         &self,
         send: impl Fn(&[(&str, String)]) -> Result<HttpResponse, HttpTransportError>,
     ) -> Result<HttpResponse, TrackerError> {
-        let resp = send(&self.headers()?).map_err(|e| TrackerError::Request(e.0))?;
-        if resp.status == 401 && self.creds.invalidate() {
-            return send(&self.headers()?).map_err(|e| TrackerError::Request(e.0));
-        }
-        Ok(resp)
+        let extra =
+            [("Accept", "application/json".to_string()), ("User-Agent", "crewd".to_string())];
+        http::authed(self.creds.as_ref(), AuthScheme::Basic, &extra, send).map_err(Into::into)
     }
 
     fn request(&self, url: &str) -> Result<HttpResponse, TrackerError> {
@@ -258,11 +246,11 @@ impl<H: Http> JiraTracker<H> {
         let mut url = format!(
             "{}/rest/api/3/search/jql?jql={}&fields={}&maxResults=100",
             self.base_url,
-            query_escape(jql),
+            http::percent_encode(jql),
             FIELDS.join(",")
         );
         if let Some(t) = token {
-            url.push_str(&format!("&nextPageToken={}", query_escape(t)));
+            url.push_str(&format!("&nextPageToken={}", http::percent_encode(t)));
         }
         let resp = self.request(&url)?;
         serde_json::from_slice(&resp.body).map_err(|e| TrackerError::Response(e.to_string()))
@@ -451,20 +439,6 @@ fn body_snippet(resp: &HttpResponse) -> String {
         }
     }
     String::from_utf8_lossy(&resp.body).chars().take(200).collect()
-}
-
-/// Percent-encodes a query-string value. A JQL query carries spaces, quotes, `=` and `,`, and a
-/// page token may carry `+`, `/` or `=`; any of them left raw changes what Jira reads.
-fn query_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 /// `Pull request owner/repo#N` for a GitHub pull request URL, else the generic fallback. The

@@ -35,19 +35,19 @@ already over and may queue a retry the gate below then decides whether to dispat
 touches issues nothing else owns. It comes *after* `harvest_gates` in the tick and, more to the
 point, after it in the life of a `Done`: with a gate attached, a run's `Done` enters `gating`
 and only the gate's pass reaches the `Done` arm of `apply_outcome` that queues delivery, so the
-branch delivery pushes is the rebased, re-gated one. That order is the stack #43/#42 were built
+branch delivery pushes is the one brought onto the base and re-gated. That order is the stack #43/#42 were built
 as — gate, then delivery — and
 `a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes_nothing` is
 what fails if it is ever inverted.
 
 `harvest_gates` is where a `Done` becomes a verdict. With a handoff gate attached (see below), a
 run whose agent reports `Done` leaves `running` for a `gating` map instead of being released: its
-claim stays held, its run row stays open, and the gate — rebase onto the base, then the configured
+claim stays held, its run row stays open, and the gate — bring the branch onto the base, then the configured
 commands, in the run's own worktree — runs on a thread the scheduler polls. This step turns the
 gate's answer into `Done`, `Blocked` or `Continue` and hands it to the same `apply_outcome` an
 agent's verdict goes through, which is what makes a gate-sent continuation subject to the same
 turn budget and the same escalating delay. It sits with the rest of reconciliation, ahead of
-`preflight`, because a claim held mid-rebase must not stay held behind a config typo.
+`preflight`, because a claim held mid-rebase or mid-merge must not stay held behind a config typo.
 
 `recover()` is startup reconciliation, and it runs ahead of the gate for the same reason: a
 claim stranded by the last process must not stay stranded behind a config typo. It lives inside
@@ -112,8 +112,10 @@ before that the name is a prediction and pointing an operator at a ref nobody wr
 than saying nothing.
 
 `Tracker` gets its third implementation in [src/tracker/github.rs](../src/tracker/github.rs):
-`GithubTracker<H: Http>`, generic over a small `Http` seam (`FakeHttp` in tests, `UreqHttp` —
-over `ureq` with `rustls`, no C toolchain needed — in `main.rs`). GitHub has no workflow
+`GithubTracker<H: Http>`, generic over the `Http` seam in [src/http.rs](../src/http.rs)
+(`FakeHttp` in tests, `UreqHttp` — over `ureq` with `rustls`, no C toolchain needed — in
+`main.rs`). The same seam, percent-encoder and authenticated-request helper serve the Jira
+tracker and the GitHub forge (#181). GitHub has no workflow
 states beyond open/closed; the module doc there is the write-up of that mapping (a
 `state:<name>` label convention) and should be read before touching it. Two contract details
 worth knowing before changing either `Tracker` impl: `by_ids` must fail the whole call on
@@ -125,7 +127,7 @@ discards the headers and body this adapter classifies on (rate-limit header, err
 `UreqHttp::default()` disables that (`http_status_as_error(false)`) so every status code
 arrives as an ordinary response. `FakeHttp`-based tests are structurally blind to that class
 of bug — they hand `GithubTracker` an already-correct `HttpResponse` — which is why
-`ureq_http_tests` in the same file talks to a raw `TcpListener` instead.
+`ureq_http_tests` in [src/http.rs](../src/http.rs) talks to a raw `TcpListener` instead.
 
 A tracker failure has no issue to quarantine against — `by_states`/`by_ids` are batch calls,
 not scoped to one ticket — so `TrackerError::class()` ([src/tracker/mod.rs](../src/tracker/mod.rs))
@@ -273,7 +275,10 @@ would otherwise turn into a silent, permanent stop.
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
 — so the `system` and tool-call lines it drops, and the lines it could not parse at all, are
-still there afterwards — then appends how the process exited and what it said on stderr. The
+still there afterwards — then appends how the process exited and what it said on stderr. A
+Grok `tool_call_update` is stored without the repeated `in_progress` output: writing each prefix
+fills the cap before `end` (#172). The latest of those updates is written when the stream ends
+before `completed`. `text`, `usage`, `end` and `error` stay the bytes that got parsed. The
 path is on the run row (`Store::run`, `runs_for`) and in the dispatch log line and the TUI
 detail pane, so "show me what run X did" needs no knowledge of the layout. Three
 things there are load-bearing and each looks removable: writes are **unbuffered, one per line**,
@@ -322,7 +327,7 @@ holds degrades to a cold start instead of failing every retry identically into q
 A resume leaves the issue body out, as already held, unless it changed: `launch` swaps the
 body's hash into `issue_state.session_body` (v12), and a resume whose hash differs sends the
 body again under a "changed since your last session" heading, because the description is where
-decisions are written (#109). A rebase conflict that parked the issue `Blocked` is queued in
+decisions are written (#109). A gate conflict that parked the issue `Blocked` is queued in
 `issue_state.pending_feedback` as `Feedback::Conflict` and taken by the next launch, so the
 run a human's unblocking dispatches is told the base and the paths, not that it ran out of
 turns.
@@ -345,13 +350,16 @@ Nothing rebased a finished branch onto the current base, and nothing re-ran the 
 resolves `gate.base` in `workspace.repo` (not in the worktree, whose HEAD is the run's own
 branch) — with delivery on, `delivery.base` when `gate.base` is unset, fetched from
 `delivery.remote` with the push's credential (retried once if the remote refuses the token) and resolved as `<remote>/<base>`, because the local branch lags until someone pulls and a fetch that fails
-fails the gate rather than passing on it (#134) — skips a branch with no commits beyond it, rebases — unless the branch already contains the
-base's tip, since a rebase would drop an agent's merge of the base and its conflict resolution
-with it (#122) — and on a clean rebase execs each
+fails the gate rather than passing on it (#134) — skips a branch with no commits beyond it,
+brings the rest onto the base, and once the branch is on it execs each
 `gate.commands` argv directly in the worktree — no shell, for the same reason the worker has
 none, and this one inherits the operator's environment because it is the operator's own suite
-with no agent involved. The verdict is deliberately three-way and the split is the point: a
-**conflict** is a human's problem, so the rebase is aborted (the branch goes back to exactly what
+with no agent involved. How the base comes in depends on the branch: one that already contains
+the base's tip is left as it is, one that merged an older base has the new one merged in, and
+any other is rebased. A rebase replays a branch's own commits and drops its merges, so rebasing
+a branch whose agent resolved a conflict by merging the base drops the resolution and raises the
+same conflict again (#122, #177); both conflict briefs therefore tell the agent to merge. The verdict is deliberately three-way and the split is the point: a
+**conflict** is a human's problem, so the rebase or merge is aborted (the branch goes back to exactly what
 the agent committed, which is what keeps `remove`'s merged check on its side) and the issue parks
 `Blocked` naming the paths — unless every path is in `gate.agent_resolvable` (`CLAUDE.md`,
 `docs/**` and `src/store/schema.rs` in `crew.github.toml`), where two branches appended to the
@@ -364,7 +372,7 @@ name. A `Blocked` reason now also lands in the store's `last_error`, so the dash
 an issue is parked instead of only the log. Setting no gate is a decision, not a degrade — unlike
 the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
-empty command list, which makes the default a rebase and nothing more) and the scheduler tests
+empty command list, which makes the default bringing the branch onto the base and nothing more) and the scheduler tests
 attach `FakeGate` explicitly. `crew.github.toml` sets the commit-gate commands from **Commands**
 above; the fake worker never commits, so under `crew.toml` every gate finds nothing to hand
 off.
@@ -393,7 +401,7 @@ issues — identifiers are not unique, which is the same fact `worktree_key` exi
 the guard lives in `Store::unquarantine`'s `WHERE` clause, because an unconditional version
 would reset a *running* issue's phase to `released` and let the next tick dispatch a second
 agent onto its worktree. `POST /unblock` (#108) is the same shape for a park: it is how a
-`Blocked` issue — a gate's rebase conflict, typically — is handed back once a human has resolved
+`Blocked` issue — a gate's conflict with the base, typically — is handed back once a human has resolved
 it, since with `active_states = ["open"]` the tracker has no state to move it through. It clears
 `parked_state` and the parked note and nothing else, so the next `dispatch_new` claims it the
 ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
@@ -499,7 +507,8 @@ request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the con
 reviewers *and read back whether they attached*, read CI, read the review threads — and the
 reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
 current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
-`CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" is handed back whole
+`CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" and Copilot's template
+(headings, tags, the "Review effort" line, section labels; #201) is handed back whole
 as one more comment keyed `review-<id>`: no parser for its sections, whose format is nobody's
 contract, and noise costs one `rejected` verdict, posted as a pull request comment since a
 summary has no thread. A red CI or
@@ -508,7 +517,7 @@ due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 `Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".
 A pull request the provider reports unable to merge is not waited on at all, since GitHub runs no
 CI on it: delivery charges a round and re-gates the branch as if its `Done` were new, so the
-gate's rebase and its conflict rule decide what follows (#159).
+gate's rebase or merge and its conflict rule decide what follows (#159).
 The handoff gate's failing output travels the same way, as `Feedback::Gate`: `launch` builds one
 `Feedback` from delivery's structured row when there is one and from the retry reason otherwise,
 so `Worker::spawn` has a single parameter for the question and `feedback_help` in the worker is
@@ -524,7 +533,7 @@ that fails is retried next poll without a second reply. A comment the agent give
 line for stays open — and so does one whose acceptance names no commit, or a commit the branch
 does not carry: the worker drops an `accepted:` whose detail is not shaped like a commit, and
 the scheduler checks the rest against the branch (`Publisher::carries`) at the moment the run
-reports `Done`, before the gate's rebase rewrites the shas the agent named.
+reports `Done`, before a rebase by the gate rewrites the shas the agent named.
 
 Four things there are load-bearing. Every hand-back is a *round*, bounded per pull request
 (`max_rounds_per_pr`) and per issue (`max_rounds_per_issue`), and the per-issue count never

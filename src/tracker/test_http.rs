@@ -1,6 +1,6 @@
 //! Shared `FakeHttp` for tracker adapters' tests (#99).
 //!
-//! `GithubTracker` and `JiraTracker` both talk to the same [`super::github::Http`] seam, so one
+//! `GithubTracker` and `JiraTracker` both talk to the same [`crate::http::Http`] seam, so one
 //! scripted queue of responses serves both test modules instead of each declaring its own.
 
 use std::collections::VecDeque;
@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use super::github::{Http, HttpResponse, HttpTransportError};
+use crate::http::{Http, HttpResponse, HttpTransportError};
 
 pub(crate) struct FakeHttp {
     inner: Mutex<FakeHttpInner>,
@@ -96,4 +96,25 @@ pub(crate) fn status_body(code: u16, body: Value) -> Result<HttpResponse, HttpTr
         headers: Default::default(),
         body: body.to_string().into_bytes(),
     })
+}
+
+/// Shared with the forge it scripts, so the test can keep pushing answers after handing it over.
+impl Http for std::sync::Arc<FakeHttp> {
+    fn get(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+    ) -> Result<HttpResponse, HttpTransportError> {
+        (**self).get(url, headers)
+    }
+
+    fn send_json(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpTransportError> {
+        (**self).send_json(method, url, headers, body)
+    }
 }

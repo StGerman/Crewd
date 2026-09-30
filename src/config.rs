@@ -121,19 +121,20 @@ pub struct Config {
     pub delivery: DeliveryConfig,
 }
 
-/// The handoff gate (see [`crate::gate`]): rebase a `Done` run's branch onto `base`, then run
+/// The handoff gate (see [`crate::gate`]): bring a `Done` run's branch onto `base`, then run
 /// `commands` in its worktree, before the verdict is believed.
 ///
-/// On by default with no commands, which makes the default a rebase and nothing else: the
-/// rebase is what turns "green against the base it forked from" into "green against the base it
-/// will merge into", and it costs nothing on a branch with no commits. The commands are the
-/// repository's own bar and cannot be guessed here — a Rust crate wants `cargo test`, a
-/// checked-in script wants itself — so they are the operator's to name.
+/// On by default with no commands, which makes the default bringing the branch onto the base
+/// and nothing else. That is what turns "green against the base it forked from" into "green
+/// against the base it will merge into", and it costs nothing on a branch with no commits. A
+/// branch that already merged the base has the new one merged in; any other is rebased. The
+/// commands are the repository's own bar and cannot be guessed here — a Rust crate wants
+/// `cargo test`, a checked-in script wants itself — so they are the operator's to name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateConfig {
     #[serde(default = "d_gate_enabled")]
     pub enabled: bool,
-    /// The ref a finished branch is rebased onto, resolved in `workspace.repo`. With delivery on
+    /// The ref a finished branch is brought onto, resolved in `workspace.repo`. With delivery on
     /// it is fetched from `delivery.remote` first and `<remote>/<base>` is used, since the local
     /// branch lags until someone pulls (#134). Unset means `delivery.base` with delivery on (see
     /// [`Config::gate_base`]) and otherwise that repository's current HEAD — the same commit
@@ -142,7 +143,7 @@ pub struct GateConfig {
     pub base: Option<String>,
     /// Each command is an argv, exec'd directly in the worktree with no shell: `["cargo",
     /// "test"]`, not `"cargo test"`. The first to exit non-zero ends the gate, and its output
-    /// goes back to the agent. Empty means the rebase alone is the gate.
+    /// goes back to the agent. Empty means bringing the branch onto the base is the whole gate.
     #[serde(default)]
     pub commands: Vec<Vec<String>>,
     /// Consecutive gate failures before the issue parks `Blocked` instead of continuing. This
@@ -154,10 +155,11 @@ pub struct GateConfig {
     /// cold `cargo test`, not for a fake. `0` disables the timeout.
     #[serde(default = "d_gate_timeout")]
     pub timeout_ms: u64,
-    /// Paths whose rebase conflicts go back to the agent instead of to a human (#111): when
-    /// *every* conflicted path matches one of these, the verdict is `Continue`, counted against
-    /// `max_failures` like a failing command. `*` matches within one path segment and `**` any
-    /// number of them. Empty means every conflict is a human's, as before #111.
+    /// Paths whose conflicts go back to the agent instead of to a human (#111). Whether the
+    /// gate was merging or rebasing, when *every* conflicted path matches one of these, the
+    /// verdict is `Continue`, counted against `max_failures` like a failing command. `*`
+    /// matches within one path segment and `**` any number of them. Empty means every conflict
+    /// is a human's, as before #111.
     #[serde(default)]
     pub agent_resolvable: Vec<String>,
 }

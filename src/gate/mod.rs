@@ -5,17 +5,18 @@
 //! green against the base it forked from and unknown against the base it will actually merge
 //! into — and the three defects in issue #21 existed only in that combination, where neither
 //! agent could have seen them. So a `Done` verdict is not applied until the run's branch has
-//! been rebased onto the configured base *and* the gate commands have passed on the rebased
-//! tree, in that order, in the agent's own worktree. The rebase has to come first because a
-//! gate run against a stale base answers a question nobody asked. A branch that already
-//! contains the base's tip is on it and is not rebased: a rebase would drop a merge of the base,
-//! and with it the conflict resolution an agent made that way (#122).
+//! been brought onto the configured base *and* the gate commands have passed on the resulting
+//! tree, in that order, in the agent's own worktree. The base has to come in first because a
+//! gate run against a stale base answers a question nobody asked. How it comes in depends on
+//! the branch: one that already contains the base's tip is left as it is, one that merged an
+//! older base has the new one merged in, and any other is rebased. A rebase drops a merge of
+//! the base, and with it the conflict resolution an agent made that way (#122, #177).
 //!
 //! Like the worker, a gate is a process the scheduler supervises rather than a call it makes:
 //! `cargo test` in a real worktree runs for minutes, and a tick that blocked on it would stall
 //! stall-detection for every other run. [`Gate::start`] returns a handle the scheduler polls;
 //! the claim stays held for as long as the handle is open, so nothing can dispatch a second
-//! agent onto a worktree that is mid-rebase.
+//! agent onto a worktree the gate is rebasing or merging.
 //!
 //! The verdict the scheduler derives from the gate is deliberately three-way. A conflict is a
 //! human's problem — the branch is restored to where the agent left it and the issue parks
@@ -43,28 +44,29 @@ pub enum Verdict {
     /// The branch holds nothing the base does not. There is nothing to hand off, so there is
     /// nothing to rebase and nothing worth gating; the run's `Done` stands as it was.
     NoCommits,
-    /// Rebased onto the base — or already on top of it — and every command exited zero.
+    /// Brought onto the base — or already on it — and every command exited zero.
     Passed {
-        /// True when the rebase actually moved commits, false when the branch was already
-        /// current. For the log; the scheduler treats both the same.
-        rebased: bool,
+        /// True when a rebase moved commits or a merge brought the base in, false when the
+        /// branch was already current. For the log; the scheduler treats both the same.
+        base_updated: bool,
     },
-    /// The rebase stopped on conflicts. The rebase was aborted, so the branch is exactly where
+    /// The rebase or merge stopped on conflicts and was aborted, so the branch is exactly where
     /// the agent left it: green against the old base, and safe for a human to pick up.
     Conflict {
         paths: Vec<String>,
-        /// The commit the rebase was attempted onto, resolved in `workspace.repo`. Carried
-        /// because a brief that names the base by ref sends the agent to rebase onto whatever
+        /// The commit the gate tried to bring the branch onto, resolved in `workspace.repo`.
+        /// Carried because a brief that names the base by ref sends the agent to merge whatever
         /// that ref means *in its worktree* — and with `gate.base` unset that is `HEAD`, the
         /// agent's own branch, a no-op that leaves the conflict to recur.
         base_sha: String,
     },
-    /// The rebase stopped and could not be aborted: the worktree is still mid-rebase, so it is
-    /// neither the branch the agent left nor a tree any brief describes. A human's, always —
-    /// an agent resumed into it would build on gate state or trip over a second rebase.
+    /// The rebase or merge stopped and could not be aborted: the worktree is still mid-way, so
+    /// it is neither the branch the agent left nor a tree any brief describes. A human's,
+    /// always — an agent resumed into it would build on gate state or trip over a second
+    /// rebase or merge.
     Stuck { step: String, output: String },
     /// A step failed for a reason the agent can act on: a command exited non-zero, the rebase
-    /// was refused (a dirty tree, most likely), or a command could not be started at all.
+    /// or merge was refused (a dirty tree, most likely), or a command could not be started.
     /// `step` names which, and `output` is what it said — bounded, tail-first, because a
     /// failing `cargo test` puts its summary at the end.
     Failed {
@@ -72,18 +74,21 @@ pub enum Verdict {
         output: String,
         /// Whether the branch is sitting on the base by the time this failed.
         ///
-        /// False for every step that runs before the rebase — resolving the base, counting
-        /// commits — and for a rebase that was refused and therefore aborted. True once the
-        /// branch is on the base — rebased, or already containing its tip — which covers a
-        /// command failing *on the base* and a dirty tree refused on a branch that skipped the
-        /// rebase because it already contained the base. The scheduler needs the distinction because it tells the agent where its work
-        /// now sits: saying "the branch has been rebased, fix this on top of it" when nothing
-        /// was rebased describes a tree the agent will not find, and an agent that cannot
-        /// reconcile the instruction with what it sees tends to report `Done` again unchanged.
+        /// False for every step that runs before the branch is brought onto the base —
+        /// resolving it, counting commits — and for a rebase or merge that was refused or
+        /// aborted, which puts the branch back where the agent left it. True once the branch
+        /// is on the base: rebased onto it, merged onto it, or already containing its tip.
+        /// That covers a command failing after a merge as well as after a rebase, and a dirty
+        /// tree refused on a branch that already contained the base. A dirty tree refused
+        /// before the merge that would get it there is false. The scheduler needs the
+        /// distinction because it tells the agent where its work now sits: saying the branch
+        /// is on the base when the rebase or merge never landed describes a tree the agent
+        /// will not find, and an agent that cannot reconcile the instruction with what it
+        /// sees tends to report `Done` again unchanged.
         ///
-        /// Distinct from [`Verdict::Passed`]'s `rebased`, which answers a different question —
-        /// whether the rebase *moved* anything. A branch already on the base is `rebased:
-        /// false` there and `on_base: true` here.
+        /// Distinct from [`Verdict::Passed`]'s `base_updated`, which answers a different
+        /// question — whether a rebase or merge *moved* anything. A branch already on the base
+        /// is `base_updated: false` there and `on_base: true` here.
         on_base: bool,
     },
 }

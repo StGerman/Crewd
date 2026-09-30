@@ -23,6 +23,8 @@
 //!   one still running. A repository with no CI at all therefore reads as pending forever; the
 //!   scheduler bounds that with a timeout rather than this trait guessing.
 
+#[cfg(test)]
+mod contract;
 pub mod fake;
 pub mod github;
 
@@ -48,6 +50,17 @@ pub enum ForgeError {
 impl ForgeError {
     pub fn retryable(&self) -> bool {
         matches!(self, ForgeError::Transient(_))
+    }
+}
+
+impl From<crate::http::AuthError> for ForgeError {
+    fn from(e: crate::http::AuthError) -> Self {
+        match e {
+            crate::http::AuthError::Credential(c) => c.into(),
+            crate::http::AuthError::Transport(t) => {
+                ForgeError::Transient(format!("transport error: {}", t.0))
+            }
+        }
     }
 }
 

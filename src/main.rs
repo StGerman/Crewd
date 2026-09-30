@@ -30,13 +30,14 @@ use crew::forge::fake::FakeForge;
 use crew::forge::github::GithubForge;
 use crew::forge::{Forge, Publisher};
 use crew::gate::{Gate, GitGate};
+use crew::http::UreqHttp;
 use crew::init;
 use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use crew::sched::{Scheduler, Snapshot, WorkerPool};
 use crew::store::Store;
 use crew::tracker::Tracker;
 use crew::tracker::fake::FakeTracker;
-use crew::tracker::github::{DispatchRule, GithubTracker, UreqHttp};
+use crew::tracker::github::{DispatchRule, GithubTracker};
 use crew::tracker::jira::JiraTracker;
 use crew::transcript::Transcripts;
 use crew::tui::{Ui, UiAction};
@@ -313,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             base = cfg.gate_base().as_deref().unwrap_or("HEAD"),
             commands = cfg.gate.commands.len(),
-            "handoff gate on: done runs are rebased and re-gated before release"
+            "handoff gate on: done runs are brought onto the base and re-gated before release"
         );
         let mut gate = GitGate::new(repo, cfg.gate_base(), cfg.gate.commands.clone())
             .with_fetch_lock(fetch_lock.clone());

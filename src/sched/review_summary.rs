@@ -10,7 +10,9 @@
 //! The summary is handed over whole. Copilot's format is not a published contract, and a parser
 //! for its sections that drifted would drop findings silently; a noisy summary costs one
 //! `rejected` verdict instead. The only text recognised is the one that says there is nothing:
-//! a body that is "Findings: None" once headings, HTML comments and blank lines are set aside.
+//! a body that is "Findings: None" once Copilot's template is set aside — headings, HTML
+//! comments and tags, the "Review effort" line, and its section labels (#201). Any prose left
+//! over is a finding; a template line counted as one spent a delivery round on every review.
 
 use crate::forge::{Review, ReviewComment, SUMMARY_PREFIX, summary_review_id};
 
@@ -72,11 +74,51 @@ fn carries_findings(body: &str) -> bool {
         if text.is_empty() || text.starts_with('#') {
             return false;
         }
-        let bare: String =
-            text.chars().filter(|c| !matches!(c, '*' | '_')).collect::<String>().to_lowercase();
+        let bare: String = strip_tags(text)
+            .chars()
+            .filter(|c| !matches!(c, '*' | '_'))
+            .map(|c| if c == '\u{2019}' { '\'' } else { c })
+            .collect::<String>()
+            .to_lowercase();
         let bare: String = bare.split_whitespace().collect::<Vec<_>>().join(" ");
-        bare != "findings: none"
+        let template = bare.is_empty()
+            || bare == "findings: none"
+            || bare.starts_with("review effort:")
+            || bare == "in code that hasn't changed since last review"
+            || (text.starts_with('<') && is_section_label(&bare));
+        !template
     })
+}
+
+/// Treating comparison prose such as "a < b" as markup would silently drop a finding, so only a
+/// `<` followed by a letter or `/` opens a tag here; `text` comes back without its HTML tags.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let opens_tag = after.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/');
+        match after.find('>') {
+            Some(j) if opens_tag => rest = &after[j + 1..],
+            _ => {
+                out.push('<');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `bare` is a `<summary>` heading such as "Open (1)" or "Previously missed (5)": the
+/// entries under it are what carry a finding, so the heading alone must not.
+fn is_section_label(bare: &str) -> bool {
+    let Some(head) = bare.strip_suffix(')') else { return false };
+    let Some((words, count)) = head.rsplit_once(" (") else { return false };
+    !count.is_empty()
+        && count.chars().all(|c| c.is_ascii_digit())
+        && words.chars().all(|c| c.is_alphabetic() || c == ' ')
 }
 
 /// What is posted on the pull request when a summary's verdict lands: the verdict, and the
@@ -146,6 +188,44 @@ mod tests {
              no-rebase status.\n\n**Findings:** None"
         ));
         assert!(carries_findings("Previously missed: src/gate/git.rs:325 reports on_base: false"));
+    }
+
+    /// Counting this template as a finding spent a delivery round on every Copilot review (#201):
+    /// it is Copilot's summary as posted, with the overview sentence and entries cut.
+    const TEMPLATE: &str = "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n\
+        ### 🟢 Approved\n\n**Review effort:** Balanced  \n**Findings:** None\n\n\
+        <details>\n<summary><strong>Previously missed (0)</strong></summary>\n\n\
+        In code that hasn’t changed since last review\n<br>\n\n</details>\n";
+
+    #[test]
+    fn a_copilot_summary_that_is_only_its_template_is_not_a_finding() {
+        assert!(!carries_findings(TEMPLATE));
+        assert!(!carries_findings("*Review effort:* Lite\n<details open>\n</details>"));
+        let reviews = [review("1", COPILOT, "COMMENTED", "head", TEMPLATE)];
+        assert!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_summary_with_an_overview_sentence_is_still_a_finding() {
+        let body = TEMPLATE.replace(
+            "### 🟢 Approved\n\n",
+            "### 🔵 Needs a closer look\n\nThe guard can still judge an older stale head.\n\n",
+        );
+        let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
+        assert_eq!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).len(), 1);
+        assert!(carries_findings("a < b is <b>still</b> said"));
+    }
+
+    #[test]
+    fn a_summary_with_a_previously_missed_entry_is_still_a_finding() {
+        let body = TEMPLATE.replace(
+            "<br>\n",
+            "<details>\n<summary><picture><img src=\"low.png\" alt=\"Low severity\"></picture> \
+             Doc comment should lead with the failure</summary>\n\n`src/workspace.rs:435`\n\
+             </details>\n",
+        );
+        let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
+        assert_eq!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).len(), 1);
     }
 
     #[test]
