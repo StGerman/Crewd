@@ -70,9 +70,21 @@ bare existence — a plain directory there, e.g. left by a prior `DirWorkspace` 
 same root, must surface through git's own "already exists" error rather than being silently
 trusted as an already-prepared worktree. The branch, not the directory, is what a run leaves
 behind: `remove` deletes the worktree but only deletes the branch when git's own merged check
-says it carries nothing `repo`'s HEAD does not already have, and `prepare` attaches to an
-existing branch that does carry commits rather than `-B`-resetting it. What the agent had *not* committed when
-its run was stopped is snapshotted by `remove` to a new ref under `refs/crew/wip/<issue key>/`
+says it carries nothing `repo`'s HEAD (or the base) does not already have, and `prepare` attaches
+to an existing branch that does carry commits rather than `-B`-resetting it.
+
+A new branch starts from
+the base the gate will rebase onto — `<delivery.remote>/<base>` fetched under the gate's lock and
+credential, else the local base — not from `repo`'s HEAD, the operator's checkout, which can be
+any branch at any age. A failed fetch fails `prepare` as a retryable workspace error, and so
+does a lock still held after a bounded wait, or a fetch that has not finished within its own —
+it is killed, rather than left to hold the tick (#170).
+
+An existing branch is attached where it is when it holds commits the base does not. The checkout
+is that measure only when no base is configured: a checkout that already contains the branch
+would otherwise send `prepare` down `-B` and move the branch onto a base that lacks it.
+
+What the agent had *not* committed when its run was stopped is snapshotted by `remove` to a new ref under `refs/crew/wip/<issue key>/`
 — keyed on the issue id, not the renameable identifier, one ref per snapshot so a second stop
 cannot orphan the first, and outside `refs/heads/` so the gate, delivery and the merged check
 see only the agent's own commits — and the next run is told every such ref and its diffstat

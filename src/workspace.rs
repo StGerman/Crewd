@@ -7,9 +7,14 @@
 //! mandates the check for launch.
 
 use std::collections::HashSet;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
 use crate::credentials::Credentials;
 use crate::forge::{ForgeError, Published, Publisher, Synced};
@@ -37,6 +42,13 @@ pub enum WorkspaceError {
          (e.g. a throwaway clone) and workspace.root outside every worktree of it"
     )]
     Nested { path: PathBuf, worktree: PathBuf, main: PathBuf },
+    /// The base a new branch starts from could not be fetched. Not answered by branching from
+    /// `HEAD` instead: that is the operator's checkout, which can be any branch at any age (#170).
+    #[error(
+        "cannot fetch the base `{base}` from `{remote}`; not branching from HEAD, which may be \
+         behind it: {reason}"
+    )]
+    BaseFetch { remote: String, base: String, reason: String },
 }
 
 #[derive(Debug)]
@@ -78,8 +90,8 @@ pub struct WipSnapshot {
 pub struct Removed {
     /// True only when this call deleted the branch along with the directory. `false` covers
     /// every case a caller must treat alike: the branch outlived cleanup because it holds
-    /// commits `repo`'s HEAD does not, there was never a branch for this issue, or this impl
-    /// has no branches at all. A caller that persisted the branch at `prepare` time clears that
+    /// commits the base does not (or, with no base configured, `repo`'s HEAD), there was never
+    /// a branch for this issue, or this impl has no branches at all. A caller that persisted the branch at `prepare` time clears that
     /// record exactly when this is `true`, and leaves it alone otherwise.
     pub branch_deleted: bool,
 }
@@ -173,8 +185,9 @@ impl Workspace for DirWorkspace {
     }
 }
 
-/// A real `git worktree` per issue, checked out on its own branch off whatever `repo`'s HEAD
-/// happens to be when the worktree is created.
+/// A real `git worktree` per issue, on its own branch. A new one starts from the base
+/// [`GitWorktreeWorkspace::branching_from`] names — the remote's copy, after a fetch, when
+/// delivery is on — and from `repo`'s HEAD only when that is unset (#170).
 ///
 /// **Uncommitted work is snapshotted, not discarded, on removal.** A run killed mid-flight —
 /// stall, turn budget, shutdown — leaves whatever it had not committed in the directory, and
@@ -186,13 +199,59 @@ impl Workspace for DirWorkspace {
 /// snapshot can sit in the window between `kill` and deletion without a caller forgetting it.
 ///
 /// **Committed work survives it.** The branch outlives the worktree whenever it carries commits
-/// `repo`'s HEAD does not already have. Cleanup is driven by a ticket reaching a terminal state,
-/// and closing a ticket is not a decision to discard the run's output — so the directory goes
-/// and the branch stays.
+/// `repo`'s HEAD or the base does not already have. Cleanup is driven by a ticket reaching a
+/// terminal state, and closing a ticket is not a decision to discard the run's output — so the
+/// directory goes and the branch stays.
 pub struct GitWorktreeWorkspace {
     root: PathBuf,
     repo: PathBuf,
     push_auth: Option<PushAuth>,
+    start: Option<StartPoint>,
+}
+
+/// Held across every fetch of the base into `repo`. The gate and `prepare` update the same
+/// remote-tracking ref, and the one that loses `cannot lock ref` would be charged a failure (#161).
+pub type FetchLock = Arc<parking_lot::Mutex<()>>;
+
+/// Kills `pid`'s process group on drop, unless disarmed after `wait`. `Child`'s drop signals
+/// only that pid, so a helper it spawned would survive an early return.
+struct KillGroup {
+    pid: i32,
+    armed: bool,
+}
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = kill(Pid::from_raw(-self.pid), Signal::SIGKILL);
+        }
+    }
+}
+
+/// Flags for every fetch of the base: `--no-write-fetch-head` leaves `repo`'s existing
+/// `FETCH_HEAD` untouched, so a merge the operator has pending still sees the fetch it made, and
+/// `--no-auto-gc` stops the detached `git maintenance` that would otherwise lock `repo` under the
+/// next gate or `prepare`.
+pub(crate) const BASE_FETCH: [&str; 5] =
+    ["fetch", "--quiet", "--no-tags", "--no-auto-gc", "--no-write-fetch-head"];
+
+/// `prepare` runs on the scheduler's tick, so a wait here stops `harvest_gates` from timing out
+/// the gate whose fetch holds the lock. Past it, `prepare` fails as a retryable error instead.
+const PREPARE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Kills a `prepare` fetch that has not exited by then. `http.lowSpeedTime` never arms until
+/// bytes are moving, so a connect that never answers holds the tick until the OS gives up,
+/// which a blackholed route may never do (review on #194).
+const PREPARE_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Where a new branch starts: `base` in `repo`, or `remote`'s copy of it after a fetch. Unset,
+/// a new branch starts from `repo`'s HEAD, the operator's checkout.
+struct StartPoint {
+    base: String,
+    remote: Option<String>,
+    fetch_lock: FetchLock,
+    lock_wait: std::time::Duration,
+    fetch_wait: std::time::Duration,
 }
 
 /// The credential `publish` pushes with when the orchestrator has an identity of its own (#64),
@@ -312,8 +371,9 @@ impl Drop for PushCredentialFile {
 }
 
 impl GitWorktreeWorkspace {
-    /// `repo` is the git repository worktrees are created from — its HEAD is the branch point,
-    /// and its `.git` directory is where every worktree's admin state lives.
+    /// `repo` is the git repository worktrees are created from — its HEAD is the branch point
+    /// unless [`GitWorktreeWorkspace::branching_from`] names a base, and its `.git` directory is
+    /// where every worktree's admin state lives.
     pub fn new(root: impl Into<PathBuf>, repo: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
         let root = root.into();
         std::fs::create_dir_all(&root)
@@ -365,7 +425,68 @@ impl GitWorktreeWorkspace {
             }
         }
 
-        Ok(Self { root, repo, push_auth: None })
+        Ok(Self { root, repo, push_auth: None, start: None })
+    }
+
+    /// Start a new branch from `base` rather than from `repo`'s HEAD, the operator's checkout,
+    /// which can be any branch at any age (#170). With `remote`, from
+    /// its copy of `base`, fetched as the gate fetches it and under the gate's `fetch_lock`, so
+    /// the branch starts where the gate will measure it and the pull request will merge it.
+    pub fn branching_from(
+        mut self,
+        base: impl Into<String>,
+        remote: Option<String>,
+        fetch_lock: FetchLock,
+    ) -> Self {
+        self.start = Some(StartPoint {
+            base: base.into(),
+            remote,
+            fetch_lock,
+            lock_wait: PREPARE_LOCK_WAIT,
+            fetch_wait: PREPARE_FETCH_WAIT,
+        });
+        self
+    }
+
+    /// The ref a new branch starts from; `None` for `repo`'s HEAD. A failed fetch is an error,
+    /// never a fall back to the local ref, which lags until someone pulls (#134).
+    fn start_ref(&self) -> Result<Option<String>, WorkspaceError> {
+        let Some(StartPoint { base, remote, fetch_lock, lock_wait, fetch_wait }) = &self.start
+        else {
+            return Ok(None);
+        };
+        let Some(remote) = remote else {
+            return Ok(Some(base.clone()));
+        };
+        let tracking = format!("refs/remotes/{remote}/{base}");
+        let refspec = format!("+refs/heads/{base}:{tracking}");
+        let reason = match fetch_lock.try_lock_for(*lock_wait) {
+            None => format!("another fetch of the base held the lock for {lock_wait:?}"),
+            Some(_hold) => {
+                match self.read_remote(
+                    &self.repo,
+                    remote,
+                    &BASE_FETCH,
+                    &[&refspec],
+                    Some(*fetch_wait),
+                ) {
+                    Ok(Ok(_)) => return Ok(Some(tracking)),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => e.to_string(),
+                }
+            }
+        };
+        Err(WorkspaceError::BaseFetch { remote: remote.clone(), base: base.clone(), reason })
+    }
+
+    /// The base as `repo` last saw it, without fetching: what `remove` measures a branch
+    /// against, since a branch that started there and gained nothing holds nothing to keep.
+    fn known_base(&self) -> Option<String> {
+        let StartPoint { base, remote, .. } = self.start.as_ref()?;
+        Some(match remote {
+            Some(remote) => format!("refs/remotes/{remote}/{base}"),
+            None => base.clone(),
+        })
     }
 
     /// Pushes once, and once more on a fresh token if git reports the first refused for
@@ -439,6 +560,7 @@ impl GitWorktreeWorkspace {
         remote: &str,
         cmd: &[&str],
         refspecs: &[&str],
+        limit: Option<std::time::Duration>,
     ) -> Result<Result<String, WorkspaceError>, ForgeError> {
         self.retry_on_auth(|| {
             let (mut args, file, target) = match &self.push_auth {
@@ -454,7 +576,10 @@ impl GitWorktreeWorkspace {
             args.push(target);
             args.extend(refspecs.iter().map(|r| r.to_string()));
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let out = Self::git(worktree, &args);
+            let out = match limit {
+                Some(limit) => Self::git_within(worktree, &args, limit),
+                None => Self::git(worktree, &args),
+            };
             drop(file);
             Ok(out)
         })
@@ -477,6 +602,102 @@ impl GitWorktreeWorkspace {
 
     fn git(repo: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
         Self::git_env(repo, args, &[])
+    }
+
+    /// `http.lowSpeedTime` does not arm until bytes move, so a connect that never answers would
+    /// hold `prepare`'s tick until the OS gives up. This kills the process group at `limit`.
+    ///
+    /// The `Child` stays on this thread and the pipes are drained on others, so the kill
+    /// happens before `wait`: the pid is still this process's child and cannot have been reused.
+    fn git_within(
+        repo: &Path,
+        args: &[&str],
+        limit: std::time::Duration,
+    ) -> Result<String, WorkspaceError> {
+        let io = |source| WorkspaceError::Io { path: repo.to_path_buf(), source };
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd.spawn().map_err(&io)?;
+        let pid = child.id() as i32;
+        // Declared after `child` so it drops first and the pid above is still unreaped.
+        let mut kill_group = KillGroup { pid, armed: true };
+
+        let mut stdout = child.stdout.take().ok_or_else(|| WorkspaceError::Git {
+            args: args.join(" "),
+            stderr: "stdout was not piped".to_string(),
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| WorkspaceError::Git {
+            args: args.join(" "),
+            stderr: "stderr was not piped".to_string(),
+        })?;
+        let (tx_out, rx_out) = std::sync::mpsc::channel();
+        let (tx_err, rx_err) = std::sync::mpsc::channel();
+        // `Builder::spawn`, not `thread::spawn`: an OS that refuses a thread is an error this
+        // call returns, not a panic on the tick's thread (review on #194). The process group is
+        // still armed for `kill_group`, so an early return here takes `git` down with it.
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf);
+                let _ = tx_out.send(buf);
+            })
+            .map_err(&io)?;
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stderr.read_to_end(&mut buf);
+                let _ = tx_err.send(buf);
+            })
+            .map_err(&io)?;
+
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+        let (alarm_tx, alarm_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = cancel_rx.recv_timeout(limit);
+                let _ = alarm_tx.send(());
+            })
+            .map_err(&io)?;
+
+        let mut killed = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(&io)? {
+                break status;
+            }
+            match alarm_rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+                    killed = true;
+                    break child.wait().map_err(&io)?;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::park_timeout(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+        kill_group.armed = false;
+        drop(cancel_tx);
+        let stdout_bytes = rx_out.recv().unwrap_or_default();
+        let stderr_bytes = rx_err.recv().unwrap_or_default();
+        if !status.success() {
+            let detail = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+            let stderr = if killed {
+                match detail.is_empty() {
+                    true => format!("fetch did not finish within {limit:?}"),
+                    false => format!("fetch did not finish within {limit:?}: {detail}"),
+                }
+            } else {
+                detail
+            };
+            return Err(WorkspaceError::Git { args: args.join(" "), stderr });
+        }
+        Ok(String::from_utf8_lossy(&stdout_bytes).trim().to_string())
     }
 
     fn git_env(
@@ -611,16 +832,20 @@ impl GitWorktreeWorkspace {
             .collect()
     }
 
-    /// True when `branch` exists and holds commits `repo`'s HEAD does not already contain.
+    /// True when `branch` exists and is not an ancestor of `base`, or of `HEAD` when no base is
+    /// configured. The checkout is the wrong measure once a base is set: it can contain the
+    /// branch — the operator merged it locally — while the base the pull request merges into
+    /// does not, and `-B` would then move the branch off those commits (review on #194).
     ///
     /// `merge-base --is-ancestor` exits non-zero both for a branch that is ahead and for one
     /// that does not exist, so existence is established first rather than inferred from it.
-    fn branch_carries_work(repo: &Path, branch: &str) -> bool {
+    fn branch_carries_work(repo: &Path, branch: &str, base: Option<&str>) -> bool {
         let full = format!("refs/heads/{branch}");
         if Self::git(repo, &["rev-parse", "--verify", "--quiet", &full]).is_err() {
             return false;
         }
-        Self::git(repo, &["merge-base", "--is-ancestor", branch, "HEAD"]).is_err()
+        let into = base.unwrap_or("HEAD");
+        Self::git(repo, &["merge-base", "--is-ancestor", branch, into]).is_err()
     }
 
     fn is_worktree_checkout(path: &Path) -> bool {
@@ -675,16 +900,24 @@ impl Workspace for GitWorktreeWorkspace {
         }
 
         let path_str = path.to_string_lossy().into_owned();
+        let start = self.start_ref()?;
         // A branch left behind by an earlier run holds that run's commits, so this attaches to
         // it rather than resetting it — otherwise a re-dispatch after `Done`, or a crash
         // between `prepare` and `remove`, would throw the agent's work away. `-B` stays the
-        // path for a branch carrying nothing HEAD does not already have, so a run that crashed
-        // before committing anything still cannot turn every future `prepare` for this issue
-        // into a permanent "branch already exists" failure. If `path` exists but is not a
-        // worktree checkout, git itself refuses with a clear error rather than this type
-        // guessing at what to do with foreign state.
-        if Self::branch_carries_work(&self.repo, &branch) {
+        // path for a branch carrying nothing the configured base does not already have — or
+        // `HEAD`, when no base is configured. Judged against the checkout, a branch the
+        // operator merged locally would be reset onto a base that lacks it (review on #194).
+        // A run that crashed before committing anything still cannot turn every future
+        // `prepare` for this issue into a permanent "branch already exists" failure. If `path`
+        // exists but is not a worktree checkout, git itself refuses with a clear error rather
+        // than this type guessing at what to do with foreign state.
+        if Self::branch_carries_work(&self.repo, &branch, start.as_deref()) {
             Self::git(&self.repo, &["worktree", "add", &path_str, &branch])?;
+        } else if let Some(start) = &start {
+            // `--no-track`: a branch tracking `origin/<base>` would have an agent's bare
+            // `git push` refused by `push.default=simple`, or aimed at the base itself.
+            let args = ["worktree", "add", "--no-track", "-B", &branch, &path_str, start];
+            Self::git(&self.repo, &args)?;
         } else {
             Self::git(&self.repo, &["worktree", "add", "-B", &branch, &path_str])?;
         }
@@ -727,16 +960,25 @@ impl Workspace for GitWorktreeWorkspace {
         let path_str = path.to_string_lossy().into_owned();
         Self::git(&self.repo, &["worktree", "remove", "--force", &path_str])?;
 
-        // `-d` rather than `-D`: git's own merged check is the test for whether this branch
-        // still holds the run's work. One carrying nothing HEAD does not already have is
-        // deleted exactly as before, so an issue that produced no commit leaves no litter; one
-        // carrying commits outlives its worktree.
+        // A branch carrying nothing the base does not already hold is deleted, so an issue that
+        // produced no commit leaves no litter; one carrying commits outlives its worktree.
+        // With a base configured (#170) the base alone decides, as in `branch_carries_work`,
+        // and the delete is `-D` once `merge-base --is-ancestor` has shown the base holds it:
+        // `-d` would ask the operator's checkout instead, and a checkout that merged the
+        // agent's commits locally would let them go while the base still lacks them (review on
+        // #194). With no base, `-d` against `HEAD` is the test, git's own merged check.
         //
         // Best-effort either way: a branch that was already deleted, or never created because
         // `prepare` failed before reaching it, must not turn a successful worktree removal into
         // an error — it just means `branch_deleted` reads `false`, same as "kept".
         let branch = Self::branch_name(issue_id, identifier);
-        let branch_deleted = Self::git(&self.repo, &["branch", "-d", &branch]).is_ok();
+        let branch_deleted = match self.known_base() {
+            Some(base) => {
+                Self::git(&self.repo, &["merge-base", "--is-ancestor", &branch, &base]).is_ok()
+                    && Self::git(&self.repo, &["branch", "-D", &branch]).is_ok()
+            }
+            None => Self::git(&self.repo, &["branch", "-d", &branch]).is_ok(),
+        };
 
         // Reconcile what the removal just orphaned in the shared metadata. The registrations
         // now point at directories that no longer exist, which is precisely what `prune`
@@ -788,7 +1030,7 @@ impl Publisher for GitWorktreeWorkspace {
         let full = format!("refs/heads/{branch}");
         let lease_ref = Self::lease_ref(branch);
         let listed = self
-            .read_remote(worktree, remote, &["ls-remote", "--heads"], &[&full])?
+            .read_remote(worktree, remote, &["ls-remote", "--heads"], &[&full], None)?
             .map_err(|e| classify_read(format!("reading {remote}/{branch}"), &e))?;
         if listed.is_empty() {
             // A lease left from a branch since deleted (merged, or by hand) would make the push
@@ -799,7 +1041,7 @@ impl Publisher for GitWorktreeWorkspace {
         }
         // Into `FETCH_HEAD`, which is per worktree, rather than any shared ref a fetch in
         // `workspace.repo` could also move.
-        self.read_remote(worktree, remote, &["fetch", "--quiet"], &[&full])?
+        self.read_remote(worktree, remote, &["fetch", "--quiet"], &[&full], None)?
             .map_err(|e| classify_read(format!("fetching {remote}/{branch}"), &e))?;
         let remote_head = Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"])
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
@@ -886,7 +1128,7 @@ impl Publisher for GitWorktreeWorkspace {
         // otherwise. Read off `FETCH_HEAD`, because a fetch from the App's URL moves no
         // remote-tracking ref.
         let fetched = self
-            .read_remote(worktree, remote, &["fetch", "--quiet"], &[base])
+            .read_remote(worktree, remote, &["fetch", "--quiet"], &[base], None)
             .ok()
             .and_then(Result::ok)
             .and_then(|_| Self::git(worktree, &["rev-parse", "FETCH_HEAD^{commit}"]).ok());
@@ -919,7 +1161,7 @@ impl Publisher for GitWorktreeWorkspace {
         // One round trip for every candidate at once; a network failure here is the same
         // transient the push after it would hit.
         let heads = self
-            .read_remote(worktree, remote, &["ls-remote", "--heads"], &[])?
+            .read_remote(worktree, remote, &["ls-remote", "--heads"], &[], None)?
             .map_err(|e| classify_read(format!("listing {remote}'s branches"), &e))?;
         let on_remote: HashSet<&str> = heads
             .lines()
@@ -975,6 +1217,7 @@ impl Publisher for GitWorktreeWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn tmp_root(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -1434,6 +1677,252 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #170: the operator's checkout is on another branch, behind the remote base. A new branch
+    /// starts at the remote base the gate will rebase onto, and the checkout is not moved.
+    #[test]
+    fn a_new_branch_starts_from_the_remote_base_not_the_operators_checkout() {
+        let root = tmp_root("wt-remote-base");
+        let (repo, bare) = repo_with_remote("wt-remote-base");
+        git_out(&repo, &["checkout", "-q", "-b", "probe/elsewhere"]).unwrap();
+        let operators = head_of(&repo);
+        let base = advance_remote(&bare, "wt-remote-base");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+
+        assert_eq!(head_of(&p.path), base, "the branch starts at the fetched remote base");
+        assert_eq!(p.head.as_deref(), Some(base.as_str()));
+        assert_eq!(head_of(&repo), operators, "the operator's checkout is never moved");
+        assert_eq!(
+            git_out(&repo, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "probe/elsewhere"
+        );
+        assert!(
+            git_out(&p.path, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_err(),
+            "the branch does not track the base, so an agent's bare push cannot aim at it"
+        );
+
+        // Given nothing, it holds nothing to keep, though the lagging checkout lacks its base.
+        let removed = ws.remove("id-1", "MT-1").unwrap();
+        assert!(removed.branch_deleted);
+        assert!(!branch_exists(&repo, p.branch.as_deref().unwrap()));
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Review on #194: the operator merged the agent's branch into their own checkout, but the
+    /// base has not got it. `branch -d` would call it merged and delete it; the base decides.
+    #[test]
+    fn a_branch_the_checkout_merged_but_the_base_lacks_is_kept() {
+        let root = tmp_root("wt-keep-unbased");
+        let (repo, bare) = repo_with_remote("wt-keep-unbased");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&p.path, "work.txt", "the agent output");
+        let branch = p.branch.clone().unwrap();
+        git_out(&repo, &["merge", "-q", "--no-edit", &branch]).unwrap();
+
+        let removed = ws.remove("id-1", "MT-1").unwrap();
+
+        assert!(!removed.branch_deleted, "the base does not hold the agent's commits");
+        assert!(branch_exists(&repo, &branch));
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// With the base configured, a branch holding commits is attached where it is: neither
+    /// reset to the base that moved since, nor rebased onto it here — that is the gate's job.
+    #[test]
+    fn a_branch_that_carries_work_is_attached_where_it_is() {
+        let root = tmp_root("wt-attach-base");
+        let (repo, bare) = repo_with_remote("wt-attach-base");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+
+        let first = ws.prepare("id-1", "MT-1").unwrap().path;
+        commit_in(&first, "work.txt", "the agent output");
+        let committed = head_of(&first);
+        ws.remove("id-1", "MT-1").unwrap();
+        advance_remote(&bare, "wt-attach-base");
+
+        let again = ws.prepare("id-1", "MT-1").unwrap();
+        assert_eq!(head_of(&again.path), committed, "the branch must not have been moved");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A fetch that fails leaves `prepare` failing, retried as any workspace error is, rather
+    /// than quietly starting the branch from the operator's checkout.
+    #[test]
+    fn a_failed_base_fetch_fails_prepare_rather_than_branching_from_head() {
+        let root = tmp_root("wt-base-fetch-fails");
+        let (repo, bare) = repo_with_remote("wt-base-fetch-fails");
+        std::fs::remove_dir_all(&bare).unwrap();
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+
+        let err = ws.prepare("id-1", "MT-1").unwrap_err();
+
+        assert!(matches!(err, WorkspaceError::BaseFetch { .. }), "got {err:?}");
+        let path = ws.path_for("id-1", "MT-1");
+        assert!(!path.exists(), "no worktree is created on a guessed start point");
+        assert!(!branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Copilot on #194: `prepare` runs on the tick, and a gate's hung fetch holding the lock
+    /// would otherwise stop the tick from ever reaching the gate's timeout.
+    #[test]
+    fn a_base_fetch_lock_held_elsewhere_fails_prepare_rather_than_stalling_the_tick() {
+        let root = tmp_root("wt-lock-held");
+        let (repo, bare) = repo_with_remote("wt-lock-held");
+        let lock = FetchLock::default();
+        let mut ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            lock.clone(),
+        );
+        ws.start.as_mut().unwrap().lock_wait = std::time::Duration::from_millis(50);
+
+        let held = lock.lock();
+        let err = ws.prepare("id-1", "MT-1").unwrap_err();
+        drop(held);
+
+        assert!(matches!(err, WorkspaceError::BaseFetch { .. }), "got {err:?}");
+        assert!(!ws.path_for("id-1", "MT-1").exists());
+        assert!(ws.prepare("id-1", "MT-1").is_ok(), "the retry goes through once it is free");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Copilot on #194: the operator's checkout contains the branch (they merged it) and the
+    /// base does not. `prepare` must attach it, not `-B` it onto that base.
+    #[test]
+    fn a_branch_the_checkout_contains_is_kept_when_the_base_does_not() {
+        let root = tmp_root("wt-head-contains");
+        let (repo, bare) = repo_with_remote("wt-head-contains");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+
+        let first = ws.prepare("id-1", "MT-1").unwrap().path;
+        commit_in(&first, "work.txt", "the agent output");
+        let committed = head_of(&first);
+        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
+        ws.remove("id-1", "MT-1").unwrap();
+        git_out(&repo, &["merge", "--ff-only", &branch]).unwrap();
+
+        let again = ws.prepare("id-1", "MT-1").unwrap();
+        assert_eq!(head_of(&again.path), committed, "the branch must not have been reset");
+        assert_eq!(head_of(&repo), committed, "the operator's checkout is never moved");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Copilot on #194: a peer that accepts the fetch and never answers. `http.lowSpeedTime`
+    /// would not be what ends it during connect, and `prepare` must not hold the tick either way.
+    #[test]
+    fn a_base_fetch_that_does_not_finish_fails_prepare_rather_than_stalling_the_tick() {
+        let root = tmp_root("wt-fetch-hangs");
+        let (repo, bare) = repo_with_remote("wt-fetch-hangs");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = sock.read(&mut buf);
+            }
+        });
+        git_out(&repo, &["remote", "set-url", "origin", &format!("http://127.0.0.1:{port}/r.git")])
+            .unwrap();
+        let mut ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+        ws.start.as_mut().unwrap().fetch_wait = std::time::Duration::from_millis(400);
+
+        let err = ws.prepare("id-1", "MT-1").unwrap_err();
+
+        assert!(
+            matches!(&err, WorkspaceError::BaseFetch { reason, .. } if reason.contains("did not finish")),
+            "got {err:?}"
+        );
+        assert!(!ws.path_for("id-1", "MT-1").exists());
+        assert!(!branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")));
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Without delivery there is no remote to fetch: the local base is the start point.
+    #[test]
+    fn with_no_remote_a_new_branch_starts_from_the_local_base() {
+        let root = tmp_root("wt-local-base");
+        let repo = tmp_repo("wt-local-base");
+        let base = head_of(&repo);
+        git_out(&repo, &["checkout", "-q", "-b", "probe/elsewhere"]).unwrap();
+        commit_in(&repo, "probe.txt", "operator's own probe");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            None,
+            FetchLock::default(),
+        );
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        assert_eq!(head_of(&p.path), base);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Push a new commit onto the bare remote's `main` from a clone `repo` has never fetched,
+    /// and return it.
+    fn advance_remote(bare: &Path, tag: &str) -> String {
+        let clone = tmp_root(&format!("clone-{tag}"));
+        std::fs::remove_dir_all(&clone).ok();
+        // `-b main`: the bare remote's HEAD names `init.defaultBranch`, `master` on CI, and a
+        // clone of a HEAD that does not exist commits an orphan that cannot fast-forward `main`.
+        let (bare, clone_str) = (bare.to_str().unwrap(), clone.to_str().unwrap());
+        git_out(Path::new("."), &["clone", "-q", "-b", "main", bare, clone_str]).unwrap();
+        git_out(&clone, &["config", "user.email", "test@example.com"]).unwrap();
+        git_out(&clone, &["config", "user.name", "test"]).unwrap();
+        commit_in(&clone, "upstream.txt", "landed on the base meanwhile");
+        git_out(&clone, &["push", "-q", "origin", "HEAD:main"]).unwrap();
+        let sha = head_of(&clone);
+        std::fs::remove_dir_all(&clone).ok();
+        sha
     }
 
     #[test]

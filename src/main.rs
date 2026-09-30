@@ -45,7 +45,7 @@ use crew::worker::Worker;
 use crew::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
 use crew::worker::fake::{FakeWorker, Script};
 use crew::worker::grok::GrokWorker;
-use crew::workspace::GitWorktreeWorkspace;
+use crew::workspace::{FetchLock, GitWorktreeWorkspace};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
@@ -170,6 +170,12 @@ async fn main() -> anyhow::Result<()> {
     let mut workspace = GitWorktreeWorkspace::new(&ws_root, &repo)?;
     if let Some(app) = &app {
         workspace = workspace.with_push_credentials(app.clone(), app_url.clone());
+    }
+    // A new branch starts where the gate will measure it (#170), so both fetch under one lock.
+    let fetch_lock = FetchLock::default();
+    if let Some(base) = cfg.gate_base() {
+        let remote = cfg.delivery.enabled.then(|| cfg.delivery.remote.clone());
+        workspace = workspace.branching_from(base, remote, fetch_lock.clone());
     }
     let workspace = Arc::new(workspace);
 
@@ -310,7 +316,8 @@ async fn main() -> anyhow::Result<()> {
             commands = cfg.gate.commands.len(),
             "handoff gate on: done runs are brought onto the base and re-gated before release"
         );
-        let mut gate = GitGate::new(repo, cfg.gate_base(), cfg.gate.commands.clone());
+        let mut gate = GitGate::new(repo, cfg.gate_base(), cfg.gate.commands.clone())
+            .with_fetch_lock(fetch_lock.clone());
         // With delivery on, the base is the remote's: the one the pull request merges into. It
         // is fetched as the push is made, so a host with no ambient credential can do both.
         if cfg.delivery.enabled {

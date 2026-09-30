@@ -24,7 +24,7 @@ use super::{Gate, GateHandle, Verdict};
 use crate::credentials::Credentials;
 use crate::model::Issue;
 use crate::worker::KillResult;
-use crate::workspace::PushCredentialFile;
+use crate::workspace::{BASE_FETCH, FetchLock, PushCredentialFile};
 
 /// How much of a failing command's output travels back to the agent. The tail, not the head:
 /// `cargo test` prints its `failures:` section and summary last, and a compiler stops at the
@@ -44,7 +44,7 @@ pub struct GitGate {
     fetch_auth: Option<FetchAuth>,
     /// Held across the fetch. Two gates share `repo` and both update the same remote-tracking
     /// ref; the one that loses `cannot lock ref` would be charged a gate failure.
-    fetch_lock: Arc<parking_lot::Mutex<()>>,
+    fetch_lock: FetchLock,
     commands: Vec<Vec<String>>,
 }
 
@@ -86,6 +86,13 @@ impl GitGate {
     /// `HEAD` names nothing to fetch.
     pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
         self.remote = Some(remote.into());
+        self
+    }
+
+    /// Share the lock with `GitWorktreeWorkspace::branching_from`, whose `prepare` fetches the
+    /// same base into the same ref (#170).
+    pub fn with_fetch_lock(mut self, fetch_lock: FetchLock) -> Self {
+        self.fetch_lock = fetch_lock;
         self
     }
 }
@@ -206,7 +213,7 @@ struct GateRun {
     base: Option<String>,
     remote: Option<String>,
     fetch_auth: Option<FetchAuth>,
-    fetch_lock: Arc<parking_lot::Mutex<()>>,
+    fetch_lock: FetchLock,
     commands: Vec<Vec<String>>,
     workspace: PathBuf,
     identifier: String,
@@ -621,12 +628,8 @@ impl GateRun {
     }
 }
 
-/// `git fetch` rewrites `FETCH_HEAD` and then detaches `git maintenance run --auto`, which
-/// locks this same repository under whatever gate or rebase runs next.
 fn fetch_args(repository: &str, refspec: &str) -> Vec<String> {
-    ["fetch", "--quiet", "--no-tags", "--no-auto-gc", "--no-write-fetch-head", repository, refspec]
-        .map(str::to_string)
-        .to_vec()
+    BASE_FETCH.into_iter().chain([repository, refspec]).map(str::to_string).collect()
 }
 
 fn authed_fetch_args(file: &PushCredentialFile, url: &str, refspec: &str) -> Vec<String> {
