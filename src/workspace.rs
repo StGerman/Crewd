@@ -1047,8 +1047,17 @@ impl Publisher for GitWorktreeWorkspace {
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
         let is_ancestor =
             |a: &str, b: &str| Self::git(worktree, &["merge-base", "--is-ancestor", a, b]).is_ok();
+        // Folding this head back in after the gate rebases onto a moved base merges crewd's own
+        // pre-rebase commits into their rewritten copies. Where the two sides touched the same
+        // lines that merge conflicts, and delivery reports it as someone else's push (#227, on
+        // #191). The lease names the last head this worktree took in or itself pushed, so a
+        // fetched head that is still that one has not moved; the divergence is the rewrite, and
+        // the push replaces it. A head the lease does not name is still merged (#163).
+        let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &lease_ref])
+            .unwrap_or_default();
+        let own_push = lease == remote_head;
 
-        let synced = if is_ancestor(&remote_head, "HEAD") {
+        let synced = if is_ancestor(&remote_head, "HEAD") || own_push {
             Synced::Current { remote_head: remote_head.clone() }
         } else {
             let fast_forward = is_ancestor("HEAD", &remote_head);
@@ -1077,7 +1086,8 @@ impl Publisher for GitWorktreeWorkspace {
             }
             Synced::Advanced { remote_head: remote_head.clone(), merged: !fast_forward }
         };
-        // Only now: the lease may name a head only once the worktree holds it.
+        // Only now may the lease move to a head, and only once the worktree holds it. When the
+        // fetched head is already the lease, this writes that same head back.
         Self::git(worktree, &["update-ref", &lease_ref, &remote_head])
             .map_err(|e| ForgeError::Transient(format!("recording the fetched head: {e}")))?;
         Ok(synced)
@@ -2701,6 +2711,105 @@ mod tests {
             git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
             theirs
         );
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #227: the gate rebases a delivered branch onto a base that has moved, rewriting every
+    /// commit. The remote still holds crewd's own pre-rebase push, the head the lease recorded,
+    /// which is not an ancestor of the rewrite. `sync` leaves that branch alone, and the push
+    /// replaces the earlier head. Merging those commits back in is the conflict #191 was handed
+    /// with its own push.
+    #[test]
+    fn a_branch_the_gate_rebased_onto_a_moved_base_replaces_crewds_own_earlier_push() {
+        let root = tmp_root("wt-rebase-own");
+        let (repo, bare) = repo_with_remote("wt-rebase-own");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the agent's change");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        commit_in(&repo, "base.txt", "base moved");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["fetch", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["rebase", "-q", "FETCH_HEAD"]).unwrap();
+        let rebased = head_of(&p.path);
+        assert_ne!(rebased, first.head_sha, "the gate rewrote the delivered commits");
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: first.head_sha.clone() },
+            "the remote head is crewd's own push, so there is nothing to merge"
+        );
+        assert_eq!(
+            head_of(&p.path),
+            rebased,
+            "sync must leave the rebased branch as the gate left it"
+        );
+
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.head_sha, rebased);
+        let remote = git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap();
+        assert_eq!(remote, rebased, "the push replaces crewd's own earlier head");
+        assert!(
+            git_out(&bare, &["merge-base", "--is-ancestor", &first.head_sha, &remote]).is_err(),
+            "the earlier push was replaced, not merged back in"
+        );
+        let base = git_out(&bare, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert!(
+            git_out(&bare, &["merge-base", "--is-ancestor", &base, &remote]).is_ok(),
+            "the replaced branch still sits on the base the gate rebased onto"
+        );
+        let parents = git_out(&bare, &["rev-list", "--parents", "-n", "1", &remote]).unwrap();
+        assert_eq!(parents.split_whitespace().count(), 2, "the replaced head is not a merge");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #227 stops at crewd's own head. A commit someone else pushed after that — a head the lease
+    /// does not name — is still merged in, including once the gate has rewritten the worktree so
+    /// ancestry alone can no longer tell the two apart (#163).
+    #[test]
+    fn a_commit_someone_else_pushed_after_crewd_is_still_merged_in() {
+        let root = tmp_root("wt-rebase-theirs");
+        let (repo, bare) = repo_with_remote("wt-rebase-theirs");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the agent's change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-rebase-theirs-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+
+        commit_in(&repo, "base.txt", "base moved");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["fetch", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["rebase", "-q", "FETCH_HEAD"]).unwrap();
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Advanced { remote_head: theirs.clone(), merged: true }
+        );
+        assert!(p.path.join("theirs.txt").exists(), "their commit was merged in");
+        assert!(p.path.join("base.txt").exists(), "the rebase onto the moved base was kept");
+        assert!(
+            git_out(&p.path, &["merge-base", "--is-ancestor", &theirs, "HEAD"]).is_ok(),
+            "their commit is an ancestor of the branch, not something the push will replace"
+        );
+
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        let remote = git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap();
+        assert!(git_out(&bare, &["merge-base", "--is-ancestor", &theirs, &remote]).is_ok());
+        let base = git_out(&bare, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert!(git_out(&bare, &["merge-base", "--is-ancestor", &base, &remote]).is_ok());
 
         for d in [&root, &repo, &bare, &other] {
             std::fs::remove_dir_all(d).ok();

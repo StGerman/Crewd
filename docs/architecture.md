@@ -586,8 +586,11 @@ The lease is a ref crewd owns, `refs/crew/lease/<branch>`, written by `Publisher
 `publish` and by nothing else (#163). The bare `--force-with-lease` took it from
 `refs/remotes/<remote>/<branch>`, which any fetch in `workspace.repo` moves onto commits the
 worktree never had, so the push replaced an operator's merge instead of refusing. `sync` runs
-before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch
-into the worktree and fast-forwards, or merges when the worktree has commits of its own. It never
+before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch.
+When the fetched head is the one the lease already names, the remote has not moved and a
+divergence is crewd's own rewrite — the gate rebasing onto a base that moved — so the worktree
+is left alone and the push replaces that head (#227). Any other head is fast-forwarded, or
+merged when the worktree has commits of its own. It never
 rebases, which would rewrite commits a reviewer saw and drop the operator's merge. A conflict is
 aborted and treated like a gate conflict (#111): a brief when every path is agent-resolvable,
 `Blocked` naming the paths otherwise, with the brief queued for the run an unblock dispatches.

@@ -221,7 +221,9 @@ pub struct Published {
 pub enum Synced {
     /// The remote has no such branch: nothing has been pushed to it yet.
     Absent,
-    /// The worktree already holds every commit the remote's branch does.
+    /// Nothing on the remote to take in. The worktree already holds every commit the remote's
+    /// branch does, or that head is the one the lease recorded — crewd's own last push, which a
+    /// rebase rewrites and the next push replaces (#227).
     Current { remote_head: String },
     /// The worktree took the remote's commits: fast-forwarded when it had none of its own,
     /// merged when it had (`merged`). Never rebased, which would rewrite the agent's commits and
@@ -251,9 +253,12 @@ impl Synced {
 /// workspace has to be able to say "no branch here" rather than fake one.
 pub trait Publisher: Send + Sync {
     /// Bring into `worktree` whatever someone else pushed to `branch` on `remote` (#163): fetch
-    /// it, fast-forward or merge it in, and record the head taken in as the lease the next
-    /// [`Publisher::publish`] pushes against. Called before every agent run and every re-gate,
-    /// so the branch those build on is the one the pull request shows.
+    /// it, fast-forward or merge a head the lease does not name, and record the head taken in
+    /// as the lease the next [`Publisher::publish`] pushes against. A fetched head the lease
+    /// already names has not moved; the worktree's divergence is crewd's own rewrite — the gate
+    /// rebasing onto a base that moved (#227) — and is left for that push to replace. Called
+    /// before every agent run, every re-gate and every delivery push, so the branch those build
+    /// on is the one the pull request shows.
     fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError>;
 
     /// Push `branch` from `worktree` to `remote`, and list its commits over `base`.
