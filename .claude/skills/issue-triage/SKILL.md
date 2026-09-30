@@ -136,9 +136,9 @@ order — each PR is based on the one before — so its issues can share a miles
 `issue-authoring` skill. The author may have set them. Keep each or replace it.
 
 #84, #153 and #182 carry no area. The report says why for any newer issue that
-Areas leaves unlabeled.
+Areas leaves with no area.
 
-Done when the confirmation table names one area, or names the issue unlabeled and why.
+Done when the confirmation table names one area, or says the issue has no area and why.
 
 ## Weekly triage
 
