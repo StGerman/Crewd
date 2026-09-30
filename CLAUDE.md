@@ -71,6 +71,11 @@ spawns a real `claude` and spends tokens, and only a Cargo default (examples are
 `test = false`) keeps `cargo test` from calling it. `rust-toolchain.toml` pins the compiler and
 CI builds `--locked`, so a drifted `Cargo.lock` fails rather than being quietly rewritten.
 
+On a `crew/` branch a `Stop` hook ([.claude/hooks/lint-before-stop.sh](.claude/hooks/lint-before-stop.sh))
+runs `cargo fmt --check` and clippy when the session tries to finish, and blocks the stop with
+their output (#187), so a lint failure costs a turn rather than a gate round. It blocks once per
+stop, then lets the next through; the gate still decides. Other branches never run it.
+
 The loop while editing, measured on this tree (an agent runs the command the docs name, so this
 table *is* the loop):
 
