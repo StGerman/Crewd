@@ -1,9 +1,9 @@
 //! Resolving a worker's `bin` at startup (#218).
 //!
 //! Without it a daemon started with no `grok` on its `PATH` came up healthy and quarantined every
-//! issue its Grok slot took, one spawn failure at a time. The lookup mirrors the one `Command`
-//! makes at spawn: a name with a `/` is a path, anything else is searched on `PATH`. It is a
-//! startup check only; a binary that disappears while running is #216's.
+//! issue its Grok slot took, one spawn failure at a time. A name with a `/` is a path, anything
+//! else is searched on `PATH`, and the worker execs the absolute path found here rather than
+//! repeating the lookup at spawn. A binary that disappears while running is #216's.
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
@@ -17,18 +17,26 @@ pub enum ResolveError {
     NotOnPath(String),
 }
 
-/// Where `bin` would be executed from, given the `PATH` the daemon was started with.
+/// The absolute path `bin` names, given the `PATH` and cwd the daemon was started with.
+///
+/// Absolute because the worker spawns it from a worktree, with an allowlisted environment that
+/// may carry no `PATH`: a relative or bare name would resolve differently there than here.
 pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Result<PathBuf, ResolveError> {
-    if bin.contains('/') {
+    let found = if bin.contains('/') {
         let p = PathBuf::from(bin);
-        return if is_executable(&p) { Ok(p) } else { Err(ResolveError::NotExecutable(p)) };
-    }
-    path.into_iter()
-        .flat_map(std::env::split_paths)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(bin))
-        .find(|p| is_executable(p))
-        .ok_or_else(|| ResolveError::NotOnPath(bin.to_string()))
+        if !is_executable(&p) {
+            return Err(ResolveError::NotExecutable(p));
+        }
+        p
+    } else {
+        path.into_iter()
+            .flat_map(std::env::split_paths)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join(bin))
+            .find(|p| is_executable(p))
+            .ok_or_else(|| ResolveError::NotOnPath(bin.to_string()))?
+    };
+    std::path::absolute(&found).map_err(|_| ResolveError::NotExecutable(found))
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -57,6 +65,15 @@ mod tests {
             Err(ResolveError::NotOnPath("crew-no-such-binary-218".into()))
         );
         assert!(resolve_bin("sh", None).is_err());
+    }
+
+    #[test]
+    fn a_relative_bin_resolves_to_an_absolute_path() {
+        let rel = "tests/fixtures/fake_grok/dump_argv.sh";
+        assert!(std::fs::metadata(rel).is_ok(), "cargo runs unit tests from the package root");
+        assert_eq!(resolve_bin(&format!("./{rel}"), None), Ok(std::path::absolute(rel).unwrap()));
+        let path = std::env::join_paths(["tests/fixtures/fake_grok"]).unwrap();
+        assert_eq!(resolve_bin("dump_argv.sh", Some(&path)), Ok(std::path::absolute(rel).unwrap()));
     }
 
     #[test]

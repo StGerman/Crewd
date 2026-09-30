@@ -119,15 +119,22 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
 
-    // Everything the config turns on is checked before anything is opened or created, and any
-    // one that cannot start stops startup by name: a daemon up with part of itself missing looks
-    // healthy to its operator (#218). Only the task projection below keeps its degrade.
+    // A component the config turns on that cannot start stops startup by name: a daemon up with
+    // part of itself missing looks healthy to its operator (#218). The workers and the ops
+    // listeners are checked here, before the store or any worktree is opened; only the task
+    // projection below keeps its degrade.
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    // `Config::load` ran preflight, which parses it; matching on the enum rather than a string
+    // comparison is what keeps a new kind from falling through to the fake (#69).
+    let tracker_kind = cfg.tracker.kind()?;
+    let mut pools = Vec::new();
     for w in cfg.workers() {
-        if let Some(bin) = worker_bin(&w, w.kind()?) {
-            resolve_bin(&bin, std::env::var_os("PATH").as_deref()).with_context(|| {
-                format!("worker {:?} cannot start: its bin {bin:?} does not resolve", w.name())
-            })?;
-        }
+        let kind = w.kind()?;
+        pools.push(WorkerPool {
+            name: w.name(),
+            worker: build_worker(&w, kind, &cfg, &clock, tracker_kind)?,
+            max_concurrent: w.max_concurrent.unwrap_or(cfg.agent.max_concurrent),
+        });
     }
     // `--api` and `--mcp` override `[api]` rather than being a second source of truth.
     let mut api_cfg = cfg.api.clone();
@@ -143,8 +150,6 @@ async fn main() -> anyhow::Result<()> {
     let mcp_listener =
         if api_cfg.mcp_enabled { Some(crew::api::mcp::bind(&api_cfg)?) } else { None };
 
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-
     // One client for the whole process (#150): `SSL_CERT_FILE` is read once, here, so a bundle
     // that cannot be read stops startup instead of failing the first poll as an opaque transport
     // error, and the tracker, the forge and the GitHub App below share one connection pool and
@@ -154,10 +159,6 @@ async fn main() -> anyhow::Result<()> {
     let db_path =
         std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
-
-    // `Config::load` ran preflight, which parses it; matching on the enum rather than a string
-    // comparison is what keeps a new kind from falling through to the fake (#69).
-    let tracker_kind = cfg.tracker.kind()?;
 
     let ws_root =
         cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
@@ -220,15 +221,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let mut pools = Vec::new();
-    for w in cfg.workers() {
-        let kind = w.kind()?;
-        pools.push(WorkerPool {
-            name: w.name(),
-            worker: build_worker(&w, kind, &cfg, &clock, tracker_kind),
-            max_concurrent: w.max_concurrent.unwrap_or(cfg.agent.max_concurrent),
-        });
-    }
     let real_worker = cfg
         .workers()
         .iter()
@@ -583,19 +575,17 @@ fn start_broker(
     Ok(broker)
 }
 
-/// The binary a real worker execs, `None` for the fake. One source for the startup check and
-/// the spawn, so the check cannot pass on a name the worker never runs.
-fn worker_bin(w: &WorkerConfig, kind: WorkerKind) -> Option<String> {
-    let default = match kind {
-        WorkerKind::Claude => "claude",
-        WorkerKind::Grok => "grok",
-        WorkerKind::Fake => return None,
-    };
-    Some(w.bin.clone().unwrap_or_else(|| default.to_string()))
+/// The absolute path a real worker execs, resolved once at startup (#218). The worker is handed
+/// this path rather than the configured name, because the child's environment is the allowlist
+/// alone: a list without `PATH`, or a relative `bin` spawned from a worktree, would otherwise
+/// pass this check and fail every dispatch.
+fn worker_bin(w: &WorkerConfig, default: &str) -> anyhow::Result<PathBuf> {
+    let bin = w.bin.as_deref().unwrap_or(default);
+    resolve_bin(bin, std::env::var_os("PATH").as_deref()).with_context(|| {
+        format!("worker {:?} cannot start: its bin {bin:?} does not resolve", w.name())
+    })
 }
 
-/// Give the demo tracker a spread of behaviours so the dashboard shows every state worth
-/// recognising: clean completions, work that continues, a hard failure, and a wedged agent.
 /// One configured worker. Deliberately independent of the tracker: see `WorkerConfig`'s doc for
 /// why a real tracker does not imply a real worker.
 fn build_worker(
@@ -604,48 +594,50 @@ fn build_worker(
     cfg: &Config,
     clock: &Arc<dyn Clock>,
     tracker_kind: TrackerKind,
-) -> Arc<dyn Worker> {
-    match kind {
-        WorkerKind::Claude => {
-            let bin = worker_bin(w, kind).unwrap_or_default();
-            // An operator-supplied list replaces the default outright rather than extending it,
-            // so what reaches the child is exactly what the config says.
-            let env_allowlist = w
-                .env_allowlist
-                .clone()
-                .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
-            Arc::new(
-                ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
-                    .with_model(w.model_choice())
-                    .with_rate_limit_warn_utilization(cfg.agent.rate_limit_warn_utilization),
-            )
-        }
-        WorkerKind::Grok => {
-            let bin = worker_bin(w, kind).unwrap_or_default();
-            // The same list Claude gets. Nothing is added: Grok's login lives in the keychain
-            // the way Claude's does, and a tracker credential is still not a worker's to hold.
-            let env_allowlist = w
-                .env_allowlist
-                .clone()
-                .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
-            Arc::new(
-                GrokWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
-                    .with_model(w.model_choice()),
-            )
-        }
-        WorkerKind::Fake => {
-            let fake = Arc::new(FakeWorker::new(clock.clone()));
-            // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
-            // silently ignored, since none of those ids would ever be dispatched) against a
-            // real tracker's real ids.
-            if tracker_kind == TrackerKind::Fake {
-                seed_demo_scripts(&fake);
+) -> anyhow::Result<Arc<dyn Worker>> {
+    let worker: Arc<dyn Worker> =
+        match kind {
+            WorkerKind::Claude => {
+                let bin = worker_bin(w, "claude")?;
+                // An operator-supplied list replaces the default outright rather than extending it,
+                // so what reaches the child is exactly what the config says.
+                let env_allowlist = w.env_allowlist.clone().unwrap_or_else(|| {
+                    DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
+                });
+                Arc::new(
+                    ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
+                        .with_model(w.model_choice())
+                        .with_rate_limit_warn_utilization(cfg.agent.rate_limit_warn_utilization),
+                )
             }
-            fake
-        }
-    }
+            WorkerKind::Grok => {
+                let bin = worker_bin(w, "grok")?;
+                // The same list Claude gets. Nothing is added: Grok's login lives in the keychain
+                // the way Claude's does, and a tracker credential is still not a worker's to hold.
+                let env_allowlist = w.env_allowlist.clone().unwrap_or_else(|| {
+                    DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
+                });
+                Arc::new(
+                    GrokWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
+                        .with_model(w.model_choice()),
+                )
+            }
+            WorkerKind::Fake => {
+                let fake = Arc::new(FakeWorker::new(clock.clone()));
+                // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
+                // silently ignored, since none of those ids would ever be dispatched) against a
+                // real tracker's real ids.
+                if tracker_kind == TrackerKind::Fake {
+                    seed_demo_scripts(&fake);
+                }
+                fake
+            }
+        };
+    Ok(worker)
 }
 
+/// Give the demo tracker a spread of behaviours so the dashboard shows every state worth
+/// recognising: clean completions, work that continues, a hard failure, and a wedged agent.
 fn seed_demo_scripts(w: &FakeWorker) {
     use crew::model::{ErrorClass, Outcome};
 
