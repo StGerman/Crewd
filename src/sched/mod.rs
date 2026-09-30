@@ -1492,7 +1492,7 @@ impl Scheduler {
         let pool = self.pool(worker).expect("pick_worker only names a configured worker");
         let (pool_worker, pool_name) = (pool.worker.clone(), pool.name.clone());
 
-        self.store.ensure(
+        let st = self.store.ensure(
             self.clock.as_ref(),
             &issue.id,
             &issue.identifier,
@@ -1504,7 +1504,15 @@ impl Scheduler {
             return Ok(());
         }
 
-        let prepared = match self.workspace.prepare(&issue.id, &issue.identifier) {
+        // The stored branch, not a name recomputed from the title: a title edit between
+        // dispatches would otherwise mint a second branch and leave the commits on the one
+        // delivery pushes (#205).
+        let prepared = match self.workspace.prepare_for(
+            &issue.id,
+            &issue.identifier,
+            &issue.title,
+            st.branch.as_deref(),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(issue_id = %issue.id, error = %e, "workspace preparation failed");

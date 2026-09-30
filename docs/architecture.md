@@ -77,6 +77,14 @@ behind: `remove` deletes the worktree but only deletes the branch when git's own
 says it carries nothing `repo`'s HEAD (or the base) does not already have, and `prepare` attaches
 to an existing branch that does carry commits rather than `-B`-resetting it.
 
+A new branch is named `crew/<number>-<slug>`: the identifier with one leading `#` dropped, then
+a slug of the title cut at a word boundary. The name is fixed when the branch is created.
+`issue_state.branch` is what delivery pushes, and a symbolic ref `refs/crew/branch/<issue key>`
+is what the next `prepare` finds when the store does not have the name yet — including after a
+title edit, which must not mint a second branch. A pretty name already recorded for another
+dispatch id gains the same dispatch-id suffix as the worktree directory. A branch created under
+the old `crew/<sanitised key>` name is reattached, not renamed (#205).
+
 A new branch starts from
 the base the gate will rebase onto — `<delivery.remote>/<base>` fetched under the gate's lock and
 credential, else the local base — not from `repo`'s HEAD, the operator's checkout, which can be
