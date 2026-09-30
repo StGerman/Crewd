@@ -17,6 +17,7 @@ terminal_states = ["closed"]
 # The `agent` label is the dispatch marker (#64): carrying it is what makes an issue ready, and
 # an assignee is neither needed nor sufficient — a teammate taking a ticket does not hand it to
 # an agent. The poll filters on it too, so its cost follows the labelled issues, not the backlog.
+# Area labels on this backlog are not dispatch signals.
 dispatch_label = "agent"
 # Every write — comments, `state:*` labels, pull requests, pushes — authored by the Crew GitHub
 # App (crew-bot[bot]) rather than by whoever's GITHUB_TOKEN this is. The file holds app_id,

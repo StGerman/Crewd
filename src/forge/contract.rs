@@ -31,6 +31,10 @@ trait PublisherBackend {
     fn publisher(&self) -> &dyn Publisher;
     /// A worktree whose branch carries one commit the base does not, and that branch's name.
     fn branch_with_work(&self, tag: &str) -> (PathBuf, String);
+    /// Rewrite the commits `publish` just pushed, as the gate's rebase does, leaving the remote
+    /// on that pushed head. The fake has no commits to rewrite: its `sync` already answers with
+    /// the head that branch itself published.
+    fn rewrite_published_head(&self, at: &Path);
 }
 
 struct FakePublisher(FakeForge);
@@ -47,6 +51,8 @@ impl PublisherBackend for FakePublisher {
     fn branch_with_work(&self, tag: &str) -> (PathBuf, String) {
         (PathBuf::from("/nowhere").join(tag), format!("crew/{tag}"))
     }
+
+    fn rewrite_published_head(&self, _at: &Path) {}
 }
 
 /// [`GitWorktreeWorkspace`] over a throwaway repository with a bare `origin`.
@@ -100,6 +106,10 @@ impl PublisherBackend for GitPublisher {
         git(&p.path, &["commit", "-q", "-m", tag]);
         (p.path, p.branch.unwrap())
     }
+
+    fn rewrite_published_head(&self, at: &Path) {
+        git(at, &["commit", "-q", "--amend", "-m", "rebased"]);
+    }
 }
 
 fn git(at: &Path, args: &[&str]) {
@@ -127,8 +137,28 @@ fn a_sync_reports_the_head_its_own_branch_last_published(b: &dyn PublisherBacken
     assert_eq!(p.sync(&at_c, &never, "origin").unwrap(), Synced::Absent, "{}", b.name());
 }
 
-const PUBLISHER_CASES: &[fn(&dyn PublisherBackend)] =
-    &[a_sync_reports_the_head_its_own_branch_last_published];
+/// #227: after the gate rebases a delivered branch, the remote still holds the head publish
+/// recorded. `FakeForge::sync` already reported that head as `Current`, because it never
+/// confuses a branch with another branch's publish. The real `sync` merged the pre-rebase
+/// commits back in (`Advanced`) until a fetched head equal to the lease — no movement since the
+/// last sync or publish — was left alone.
+fn a_rewritten_branch_syncs_as_the_head_it_already_published(b: &dyn PublisherBackend) {
+    let p = b.publisher();
+    let (at, branch) = b.branch_with_work("MT-rewrite");
+    let first = p.publish(&at, &branch, "origin", "main").unwrap().head_sha;
+    b.rewrite_published_head(&at);
+    assert_eq!(
+        p.sync(&at, &branch, "origin").unwrap(),
+        Synced::Current { remote_head: first },
+        "{}",
+        b.name()
+    );
+}
+
+const PUBLISHER_CASES: &[fn(&dyn PublisherBackend)] = &[
+    a_sync_reports_the_head_its_own_branch_last_published,
+    a_rewritten_branch_syncs_as_the_head_it_already_published,
+];
 
 // ---- Forge -----------------------------------------------------------------
 
