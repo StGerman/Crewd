@@ -951,14 +951,18 @@ impl Workspace for GitWorktreeWorkspace {
         // `prepare` failed before reaching it, must not turn a successful worktree removal into
         // an error — it just means `branch_deleted` reads `false`, same as "kept".
         //
-        // A branch started from the base (#170) and given nothing is not merged into a HEAD
-        // that lags the base, so `-d` keeps it; it goes only once the base is shown to hold it.
+        // With a base configured (#170) the base alone decides, as in `branch_carries_work`:
+        // `-d` asks whether the operator's checkout holds the branch, and a checkout that
+        // merged the agent's commits locally would let them go while the base still lacks them
+        // (review on #194). Without one, `-d` against `HEAD` is the test, as before.
         let branch = Self::branch_name(issue_id, identifier);
-        let branch_deleted = Self::git(&self.repo, &["branch", "-d", &branch]).is_ok()
-            || self.known_base().is_some_and(|base| {
+        let branch_deleted = match self.known_base() {
+            Some(base) => {
                 Self::git(&self.repo, &["merge-base", "--is-ancestor", &branch, &base]).is_ok()
                     && Self::git(&self.repo, &["branch", "-D", &branch]).is_ok()
-            });
+            }
+            None => Self::git(&self.repo, &["branch", "-d", &branch]).is_ok(),
+        };
 
         // Reconcile what the removal just orphaned in the shared metadata. The registrations
         // now point at directories that no longer exist, which is precisely what `prune`
@@ -1685,6 +1689,31 @@ mod tests {
         assert!(removed.branch_deleted);
         assert!(!branch_exists(&repo, p.branch.as_deref().unwrap()));
 
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Review on #194: the operator merged the agent's branch into their own checkout, but the
+    /// base has not got it. `branch -d` would call it merged and delete it; the base decides.
+    #[test]
+    fn a_branch_the_checkout_merged_but_the_base_lacks_is_kept() {
+        let root = tmp_root("wt-keep-unbased");
+        let (repo, bare) = repo_with_remote("wt-keep-unbased");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().branching_from(
+            "main",
+            Some("origin".into()),
+            FetchLock::default(),
+        );
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&p.path, "work.txt", "the agent output");
+        let branch = p.branch.clone().unwrap();
+        git_out(&repo, &["merge", "-q", "--no-edit", &branch]).unwrap();
+
+        let removed = ws.remove("id-1", "MT-1").unwrap();
+
+        assert!(!removed.branch_deleted, "the base does not hold the agent's commits");
+        assert!(branch_exists(&repo, &branch));
         for d in [&root, &repo, &bare] {
             std::fs::remove_dir_all(d).ok();
         }
