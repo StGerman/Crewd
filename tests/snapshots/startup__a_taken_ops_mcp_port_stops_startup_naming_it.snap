@@ -1,0 +1,8 @@
+---
+source: tests/startup.rs
+expression: "diagnostic(&out, &addr)"
+---
+Error: binding the ops MCP server to [ADDR]
+
+Caused by:
+    Address already in use

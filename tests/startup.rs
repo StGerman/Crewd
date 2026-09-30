@@ -81,6 +81,16 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Stderr with what differs per run and per OS taken out: the ephemeral address, and the errno
+/// `EADDRINUSE` is on this platform.
+fn diagnostic(out: &Output, addr: &str) -> String {
+    let err = stderr(out).replace(addr, "[ADDR]");
+    match err.find(" (os error") {
+        Some(i) => format!("{}{}", &err[..i], err[i..].split_once(')').map_or("", |(_, t)| t)),
+        None => err,
+    }
+}
+
 #[test]
 fn a_taken_ops_api_port_stops_startup_naming_it() {
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -90,7 +100,7 @@ fn a_taken_ops_api_port_stops_startup_naming_it() {
     let out = scratch.run(&["--api", &addr]);
 
     assert!(!out.status.success(), "crewd started with its ops API port taken");
-    assert!(stderr(&out).contains(&format!("binding the ops API to {addr}")), "{}", stderr(&out));
+    insta::assert_snapshot!(diagnostic(&out, &addr));
     assert!(!scratch.dir.join("crew.db").exists(), "the store was opened before the bind");
 }
 
@@ -103,7 +113,7 @@ fn a_taken_ops_mcp_port_stops_startup_naming_it() {
     let out = scratch.run(&["--mcp", &addr]);
 
     assert!(!out.status.success(), "crewd started with its ops MCP port taken");
-    assert!(stderr(&out).contains(&format!("binding the ops MCP server to {addr}")));
+    insta::assert_snapshot!(diagnostic(&out, &addr));
 }
 
 #[test]
@@ -115,8 +125,7 @@ fn a_worker_binary_that_cannot_be_resolved_stops_startup() {
     let out = scratch.run(&[]);
 
     assert!(!out.status.success(), "crewd started with a worker binary it cannot resolve");
-    let err = stderr(&out);
-    assert!(err.contains("\"slow\"") && err.contains("crew-no-such-binary-218"), "{err}");
+    insta::assert_snapshot!(stderr(&out));
 }
 
 #[test]
