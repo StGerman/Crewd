@@ -46,13 +46,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::review_summary::{summary_findings, verdict_comment};
-use super::{Gating, Running, Scheduler};
+use super::{Gating, Running, Scheduler, log_tracker_failure};
 use crate::clock::{Mono, Wall};
 use crate::forge::{
     CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, Synced,
     summary_review_id,
 };
-use crate::model::{Feedback, Outcome, ReviewVerdict, Verdict};
+use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState, PushedHead};
 use crate::worker::{KillResult, Progress, RunHandle};
 
@@ -315,6 +315,11 @@ impl Scheduler {
         }
 
         if d.stage == DeliveryStage::Pending {
+            // Before the push, so a pull request is never opened without its issue's title and
+            // link: the push is idempotent and the next poll repeats it at no cost.
+            let Some(issue) = self.delivery_issue(issue_id) else {
+                return Ok(());
+            };
             let branch = st
                 .branch
                 .clone()
@@ -375,7 +380,7 @@ impl Scheduler {
                 self.store.note_replaced_head(clock.as_ref(), issue_id, old)?;
             }
 
-            let spec = self.pr_spec(issue_id, st, &branch, &base, &published.commits)?;
+            let spec = self.pr_spec(&issue, st, &branch, &base, &published.commits)?;
             let opened = match forge.open_pull_request(&spec) {
                 Err(ForgeError::NothingToDeliver(why)) => {
                     tracing::info!(issue_id, why, "nothing to deliver");
@@ -969,31 +974,52 @@ impl Scheduler {
             .collect()
     }
 
+    /// The issue a pull request is composed from. After a restart `seen` is empty until the
+    /// first poll, and delivery runs ahead of it, so reading `seen` alone opened a pull request
+    /// titled after its branch that did not close its issue (#223); a parked issue outside the
+    /// active states may never be polled again at all, so this reads it by id. A failed or empty
+    /// read waits for the next delivery poll.
+    fn delivery_issue(&mut self, issue_id: &str) -> Option<Issue> {
+        if let Some(issue) = self.seen.get(issue_id) {
+            return Some(issue.clone());
+        }
+        match self.tracker.by_ids(&[issue_id.to_string()]) {
+            Ok(found) => {
+                let Some(issue) = found.into_iter().find(|i| i.id == issue_id) else {
+                    tracing::debug!(issue_id, "tracker omitted the issue; pull request waits");
+                    return None;
+                };
+                self.seen.insert(issue.id.clone(), issue.clone());
+                Some(issue)
+            }
+            Err(e) => {
+                log_tracker_failure("issue read for its pull request failed", &e);
+                self.last_error = Some(format!("delivery {issue_id}: {e}"));
+                None
+            }
+        }
+    }
+
     /// The pull request's title and body, derived from the run record — never composed by the
     /// agent. What a reviewer needs first is what the issue asked for and what the branch
     /// actually contains; both are facts the orchestrator holds and the agent could only
     /// restate.
     fn pr_spec(
         &self,
-        issue_id: &str,
+        issue: &Issue,
         st: &IssueState,
         branch: &str,
         base: &str,
         commits: &[String],
     ) -> Result<PullRequestSpec, StepError> {
-        let issue = self.seen.get(issue_id);
-        let title = match issue {
-            Some(i) if !i.title.is_empty() => format!("{}: {}", i.identifier, i.title),
-            _ => format!("{}: {}", st.identifier, branch),
-        };
+        let issue_id = issue.id.as_str();
+        let title = format!("{}: {}", issue.identifier, issue.title);
 
         let mut body = String::new();
-        match issue.and_then(|i| i.url.as_deref().map(|url| (i, url))) {
-            Some((_, url)) if is_github_issue_url(url) => {
-                body.push_str(&format!("Closes {url}\n\n"))
-            }
-            Some((i, url)) => body.push_str(&format!("Issue: [{}]({url})\n\n", i.identifier)),
-            None => body.push_str(&format!("Issue: {}\n\n", st.identifier)),
+        match issue.url.as_deref() {
+            Some(url) if is_github_issue_url(url) => body.push_str(&format!("Closes {url}\n\n")),
+            Some(url) => body.push_str(&format!("Issue: [{}]({url})\n\n", issue.identifier)),
+            None => body.push_str(&format!("Issue: {}\n\n", issue.identifier)),
         }
         if base != self.cfg.delivery.base {
             body.push_str(&format!(
