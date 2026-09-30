@@ -319,6 +319,10 @@ impl RunHandle for ClaudeRun {
 }
 
 impl Worker for ClaudeWorker {
+    fn bin(&self) -> Option<PathBuf> {
+        Some(self.bin.clone())
+    }
+
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
         let Spawn {
             issue,

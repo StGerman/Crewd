@@ -1,5 +1,6 @@
-//! Several workers side by side (#119): per-worker capacity, a per-worker rate-limit pause, and
-//! the pin that keeps a continuation on the worker holding its session.
+//! Several workers side by side (#119): per-worker capacity, a per-worker pause (a rate limit,
+//! or a binary that cannot be spawned), and the pin that keeps a continuation on the worker
+//! holding its session.
 //!
 //! One global limit and one account-wide pause could not serve two providers: a Claude
 //! five-hour limit stopped dispatch to Grok, which is exactly the idle time a second worker
@@ -11,7 +12,7 @@
 
 use std::sync::Arc;
 
-use super::{RateLimitPause, Reservations, Scheduler};
+use super::{MissingBinary, RateLimitPause, Reservations, Scheduler};
 use crate::model::{Feedback, session_id};
 use crate::worker::{Session, Worker};
 
@@ -83,7 +84,8 @@ impl Scheduler {
     /// first worker in order that is not paused and has a free slot. A pinned one gets its own
     /// worker, and waits for it while it is only full: a full worker frees a slot within a run,
     /// and moving would cost the session. A paused one may be minutes to hours from its
-    /// window, so its issue overflows like an unpinned one and `launch` hands it off (#165).
+    /// window, or missing its binary until restart (#216), so its issue overflows like an
+    /// unpinned one and `launch` hands it off (#165).
     pub(super) fn pick_worker(&self, pin: Option<&str>, reserved: &Reservations) -> Option<String> {
         let open = |w: &WorkerPool| !self.paused(&w.name) && self.worker_slots(w, reserved) > 0;
         match self.resolve_pin(pin) {
@@ -95,13 +97,14 @@ impl Scheduler {
     }
 
     pub(super) fn paused(&self, worker: &str) -> bool {
-        self.rate_limit_pauses.contains_key(worker)
+        self.rate_limit_pauses.contains_key(worker) || self.missing_binaries.contains_key(worker)
     }
 
-    /// Lift every pause whose `resets_at` has passed, so a tick that finds a window already
-    /// reset needs no separate step remembering to un-pause (#37). True while every worker is
-    /// still paused, which is when dispatch has nowhere to go at all.
-    pub(super) fn all_rate_limited(&mut self) -> bool {
+    /// Lift every rate-limit pause whose `resets_at` has passed, so a tick that finds a window
+    /// already reset needs no separate step remembering to un-pause (#37). A missing binary is
+    /// not among them: that pause lasts until the process exits (#216). True while every worker
+    /// is still paused, which is when dispatch has nowhere to go at all.
+    pub(super) fn all_paused(&mut self) -> bool {
         let now = self.clock.wall().0;
         self.rate_limit_pauses.retain(|worker, p| {
             let live = now < p.resets_at;
@@ -129,6 +132,18 @@ impl Scheduler {
     /// The published pauses, in dispatch order.
     pub(super) fn published_pauses(&self) -> Vec<RateLimitPause> {
         self.workers.iter().filter_map(|w| self.rate_limit_pauses.get(&w.name).cloned()).collect()
+    }
+
+    /// Workers whose binary could not be spawned, in dispatch order (#216).
+    pub(super) fn published_missing(&self) -> Vec<MissingBinary> {
+        self.workers
+            .iter()
+            .filter_map(|w| {
+                self.missing_binaries
+                    .get(&w.name)
+                    .map(|binary| MissingBinary { worker: w.name.clone(), binary: binary.clone() })
+            })
+            .collect()
     }
 }
 
@@ -185,14 +200,15 @@ impl Scheduler {
     pub(super) fn handoff_brief(&self, issue_id: &str, from: &str) -> anyhow::Result<Feedback> {
         let last =
             self.store.runs_for(issue_id)?.into_iter().find(|r| r.worker.as_deref() == Some(from));
-        let why = match self.rate_limit_pauses.get(from) {
-            Some(p) => {
-                format!("its account hit a rate limit ({}), and its window has not reset", p.kind)
-            }
-            None => match last.as_ref().and_then(|r| r.outcome.as_deref()) {
+        let why = if let Some(bin) = self.missing_binaries.get(from) {
+            format!("its binary could not be found ({bin})")
+        } else if let Some(p) = self.rate_limit_pauses.get(from) {
+            format!("its account hit a rate limit ({}), and its window has not reset", p.kind)
+        } else {
+            match last.as_ref().and_then(|r| r.outcome.as_deref()) {
                 Some(o) => format!("its last run ended {o}"),
                 None => "its last run left no outcome".into(),
-            },
+            }
         };
         let last_text = last
             .and_then(|r| r.transcript)

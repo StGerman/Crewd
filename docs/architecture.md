@@ -292,6 +292,15 @@ every tick, before `harvest_finished` can remove a run that warned and ended sin
 the warned run is left to finish, since slowing a running run is out of scope and killing it
 would cost the work it is doing.
 
+A spawn that fails `agent_not_found` is the same kind of mistake on the worker (#216): the
+binary went missing while the daemon was running, and treating it as the issue's permanent
+failure quarantines a ticket nothing is wrong with. `harvest_finished` releases that claim with
+`Store::release_for_rate_limit` and pauses only that worker. The pause is not lifted on a later
+tick and the binary is not re-resolved; a restart is what #218's startup check is for.
+`Snapshot::missing_binaries` names the worker and the path, beside
+`rate_limit_pauses`, so `status` reads "grok paused: binary not found (/path/to/grok)" rather
+than an idle worker. `model_not_found` stays on the ordinary per-run path.
+
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
 — so the `system` and tool-call lines it drops, and the lines it could not parse at all, are

@@ -1177,6 +1177,117 @@ fn a_rate_limit_on_one_worker_does_not_pause_dispatch_to_the_other() {
     assert_eq!(pauses[0].kind, "five_hour");
 }
 
+/// What a spawn reports when its binary is not there (#216). Immediate, and with no turns:
+/// the process never started, so there is no conversation and no cost.
+fn agent_not_found() -> Script {
+    Script {
+        turns: 0,
+        outcome: Outcome::Failed {
+            class: ErrorClass::AgentNotFound,
+            msg: format!("spawning {MISSING_BIN}: No such file or directory"),
+        },
+        ..Script::succeeds_in(0)
+    }
+}
+
+const MISSING_BIN: &str = "/no/such/grok";
+
+/// A worker whose binary cannot be spawned stops taking issues. The issues it already took
+/// are released uncharged — not quarantined, and not given a retry of their own — and the
+/// pause stays up however far the clock moves, until the daemon restarts (#216).
+#[test]
+fn a_missing_worker_binary_pauses_that_worker_and_quarantines_nothing() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    h.worker.set_bin(MISSING_BIN);
+    h.worker.set_default(agent_not_found());
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2);
+
+    // Nonzero history, so "untouched" is distinguishable from `release()`, which zeroes both.
+    for id in ["iss-1", "iss-2"] {
+        for _ in 0..2 {
+            h.sched
+                .store()
+                .record_failure(h.clock.as_ref(), id, ErrorClass::AgentCrash, "earlier", 99)
+                .unwrap();
+        }
+    }
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0);
+
+    for id in ["iss-1", "iss-2"] {
+        let st = h.sched.store().get(id).unwrap().unwrap();
+        assert_eq!(st.attempt, 2, "{id} must keep the attempt it was on");
+        assert_eq!(st.consecutive_fail, 2, "{id} must keep the identical-failure streak it had");
+        assert!(!st.is_quarantined(), "{id} must not be quarantined for a missing binary");
+        assert_eq!(st.phase, Phase::Released, "{id} must be dispatchable again, not parked");
+        assert_eq!(h.worker.sessions_for(id).len(), 1, "{id} is not dispatched again");
+    }
+    assert!(
+        h.sched.store().all_retries().unwrap().is_empty(),
+        "no per-issue retry owns this — the worker's dispatch is what pauses"
+    );
+
+    let missing = h.sched.snapshot().unwrap().missing_binaries;
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0].worker, "fake");
+    assert_eq!(missing[0].binary, MISSING_BIN);
+    assert!(h.sched.snapshot().unwrap().rate_limit_pauses.is_empty());
+
+    // The pause does not lift on a later tick, and the binary is not re-resolved.
+    h.clock.advance_ms(3_600_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "still paused an hour later");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+    let missing = h.sched.snapshot().unwrap().missing_binaries;
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0].binary, MISSING_BIN);
+}
+
+/// One worker's missing binary is that worker's. The other keeps taking issues, including the
+/// one the paused worker had to put down (#216).
+#[test]
+fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_bin(MISSING_BIN);
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script("iss-1", agent_not_found());
+    grok.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "claude is paused and takes nothing more");
+    assert_eq!(grok.sessions_for("iss-1").len(), 1, "grok takes the issue claude could not start");
+    let fed = grok.feedback_for("iss-1");
+    let [Feedback::Handoff { from, why, .. }] = fed[0].as_slice() else {
+        panic!("the handoff carries a brief: {fed:?}");
+    };
+    assert_eq!(from, "claude");
+    assert!(why.contains(MISSING_BIN), "{why}");
+    let missing = h.sched.snapshot().unwrap().missing_binaries;
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!((missing[0].worker.as_str(), missing[0].binary.as_str()), ("claude", MISSING_BIN));
+    assert!(!h.sched.store().get("iss-1").unwrap().unwrap().is_quarantined());
+
+    // grok finishes iss-1 and is still the one that takes the next issue.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(grok.sessions_for("iss-2").len(), 1, "grok keeps dispatching");
+    assert!(h.worker.sessions_for("iss-2").is_empty());
+    assert_eq!(h.sched.snapshot().unwrap().missing_binaries.len(), 1);
+}
+
 /// A session id means nothing to another provider, so a continuation goes back to the worker
 /// that holds its session, even while another worker has room.
 #[test]

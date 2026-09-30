@@ -146,7 +146,7 @@ struct Gating {
     started: Mono,
 }
 
-pub use libcrew::{RateLimitPause, Row, Snapshot};
+pub use libcrew::{MissingBinary, RateLimitPause, Row, Snapshot};
 
 pub struct Scheduler {
     pub cfg: Config,
@@ -198,6 +198,10 @@ pub struct Scheduler {
     /// that run still charges no attempt, the same as the one that set the pause in the first
     /// place (#37).
     rate_limit_pauses: HashMap<String, RateLimitPause>,
+    /// Keyed by worker name: the binary a spawn failed to exec (`agent_not_found`). Never
+    /// cleared and never re-resolved — the pause lasts until this process exits, and a restart
+    /// is what looks for the binary again (#216, #218).
+    missing_binaries: HashMap<String, String>,
     /// Set when a `prepare` in this tick's dispatch could not fetch the base, and read by both
     /// dispatch loops to stop there: every later `prepare` would wait out the same bounded
     /// fetch against the same remote, a minute each, and a tick has to end (review on #194).
@@ -248,6 +252,7 @@ impl Scheduler {
             recovered: false,
             last_parked_sweep: None,
             rate_limit_pauses: HashMap::new(),
+            missing_binaries: HashMap::new(),
             base_unreachable: false,
             ticks: 0,
             last_error: None,
@@ -329,10 +334,10 @@ impl Scheduler {
         self.sweep_parked()?;
 
         // Checked after the housekeeping above and before the two dispatch steps it guards:
-        // reclaiming a closed parked issue's workspace has nothing to do with the account being
-        // throttled, but starting a new agent does (#37). Only when every worker is paused;
+        // reclaiming a closed parked issue's workspace has nothing to do with a worker being
+        // paused, but starting a new agent does (#37, #216). Only when every worker is paused;
         // otherwise `pick_worker` skips the paused ones and the rest keep dispatching (#119).
-        if self.all_rate_limited() {
+        if self.all_paused() {
             self.publish()?;
             return Ok(());
         }
@@ -478,6 +483,14 @@ impl Scheduler {
                 }
             }
 
+            // A binary that cannot be spawned is the worker's failure, not this issue's: the
+            // same release as a rate limit, and a pause that lasts until restart (#216).
+            // `model_not_found` is deliberately not this path — the model is per run.
+            if matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }) {
+                self.pause_for_missing_binary(&issue_id, &r)?;
+                continue;
+            }
+
             if outcome == Outcome::Done {
                 // Now, and not when delivery applies them: the gate below rebases the branch,
                 // and a rebase rewrites the very shas these verdicts name. Checked against the
@@ -553,6 +566,37 @@ impl Scheduler {
             "account-wide rate limit; pausing this worker's dispatch until it resets"
         );
         self.pause_worker(&r.worker, kind, resets_at_ms);
+        Ok(())
+    }
+
+    /// The worker's binary could not be spawned. The claim is released uncharged
+    /// (`Store::release_for_rate_limit`), and dispatch to this worker stays paused for the
+    /// rest of the process: the path is not looked up again on a later tick (#216).
+    fn pause_for_missing_binary(&mut self, issue_id: &str, r: &Running) -> anyhow::Result<()> {
+        let p = r.handle.progress();
+        self.store.finish_run(
+            self.clock.as_ref(),
+            &r.run_id,
+            "agent_not_found",
+            p.turns,
+            p.tokens,
+        )?;
+        self.store.add_turns(issue_id, p.turns)?;
+        self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
+
+        let binary = self
+            .pool(&r.worker)
+            .and_then(|pool| pool.worker.bin())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::error!(
+            issue_id,
+            identifier = %r.issue.identifier,
+            worker = %r.worker,
+            %binary,
+            "worker binary cannot be spawned; pausing this worker's dispatch until restart"
+        );
+        self.missing_binaries.entry(r.worker.clone()).or_insert(binary);
         Ok(())
     }
 
@@ -1461,11 +1505,11 @@ impl Scheduler {
             }
 
             // `st.attempt`, not a literal 0. For a genuinely new issue these are the same,
-            // but a rate-limit pause releases the claim with the attempt preserved
-            // (`release_for_rate_limit`) and sends the issue back through here — so a hard 0
-            // would tell the worker and the transcript this is a first attempt while the store
-            // still says it is the Nth, which is exactly the disagreement the pause exists to
-            // avoid.
+            // but a rate-limit pause, and a worker whose binary cannot be spawned, release the
+            // claim with the attempt preserved (`release_for_rate_limit`) and send the issue
+            // back through here — so a hard 0 would tell the worker and the transcript this is
+            // a first attempt while the store still says it is the Nth, which is exactly the
+            // disagreement the pause exists to avoid.
             //
             // An issue holding a session — one a rate limit or a human's unblock sent back
             // through here — is pinned to its worker like a continuation, and skipped while
@@ -1823,6 +1867,7 @@ impl Scheduler {
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
             rate_limit_pauses: self.published_pauses(),
+            missing_binaries: self.published_missing(),
             rows,
         })
     }

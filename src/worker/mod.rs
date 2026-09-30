@@ -269,6 +269,13 @@ pub trait Worker: Send + Sync {
         true
     }
 
+    /// The binary [`Worker::spawn`] executes, when this worker has one. Published when a spawn
+    /// fails [`crate::model::ErrorClass::AgentNotFound`], so an operator sees which path was
+    /// missing (#216). Defaulted for a worker that does not exec a binary.
+    fn bin(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// The last message this worker's agent wrote in a run, read back from that run's
     /// transcript, for the brief another worker is handed when it takes the issue over (#165).
     /// Each CLI streams its own shape, so only the worker that wrote a transcript can read it.

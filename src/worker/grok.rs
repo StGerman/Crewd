@@ -146,6 +146,10 @@ impl Worker for GrokWorker {
         false
     }
 
+    fn bin(&self) -> Option<PathBuf> {
+        Some(self.bin.clone())
+    }
+
     fn model(&self) -> ModelChoice {
         self.model.clone()
     }
