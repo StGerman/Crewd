@@ -45,11 +45,10 @@
 //!   URL pointed here by mistake answers no tools.
 //!
 //! A worker never loads this server from the operator's `claude` configuration either: it runs
-//! with `--strict-mcp-config`, so only the broker's `--mcp-config` starts (#191). Before that, a
-//! dispatched run on 2026-09-26 listed `crew_ops` connected while it was registered only at
-//! local scope, because a worktree is the same project to Claude Code. A same-user process can
-//! still call the loopback HTTP API serving the same routes; only OS confinement (#135) closes
-//! that. Off by default for the same reason the HTTP API is: a daemon must not grow a control plane by being upgraded.
+//! with `--strict-mcp-config`, so only the broker's `--mcp-config` starts (#191). A same-user
+//! process can still call the loopback HTTP API serving the same routes; only OS confinement
+//! (#135) closes that. Off by default for the same reason the HTTP API is: a daemon must not
+//! grow a control plane by being upgraded.
 //!
 //! ## Exposure
 //!

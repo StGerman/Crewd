@@ -488,13 +488,12 @@ worker is handed), answers only at `/ops`, and is never passed to `Broker`, whos
 the only `--mcp-config` crewd gives a worker. `a_dispatched_worker_is_not_handed_the_ops_tools`
 reads that file from a real session and connects to what it names.
 
-The operator's own `claude` config no longer reaches a worker either. A dispatched run on
-2026-09-26 listed `crew_ops` connected while it was registered only at local scope, because a
-worker's cwd is a worktree of the same repository and Claude Code treats it as the same project.
-Since #191 the worker passes `--setting-sources project --strict-mcp-config`, so it loads MCP
-servers only from the broker's `--mcp-config`, and user, local, plugin and claude.ai servers —
-this one among them — never start. What remains is the loopback HTTP API serving the same
-routes, which a same-user process can still call; only OS confinement (#135) closes that.
+The operator's own `claude` config no longer reaches a worker either (#191): the worker passes
+`--setting-sources project --strict-mcp-config`, so it loads MCP servers only from the broker's
+`--mcp-config`, and user, local, plugin and claude.ai servers — this one among them — never
+start. A live init event with those flags lists no MCP server of source `user`, `local`,
+`plugin` or `claudeai`. What remains is the loopback HTTP API serving the same routes, which a
+same-user process can still call; only OS confinement (#135) closes that.
 
 
 **`crewd init`** ([src/init/](../src/init/)) registers the operator's own GitHub App through the
