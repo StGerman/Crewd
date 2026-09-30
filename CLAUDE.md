@@ -162,7 +162,7 @@ Reconciliation runs before `preflight()` so a broken config stops *new* dispatch
 stranding runs in flight; do not move it earlier. `sweep_parked` sits behind it on purpose (it
 deletes workspaces); the rest of the reasoning is in [docs/architecture.md](docs/architecture.md).
 
-**Five rules that bind everywhere:**
+**Rules that bind everywhere:**
 
 1. The clock is injected. Nothing outside [src/clock.rs](src/clock.rs) may call
    `Instant::now` or `SystemTime::now`. Monotonic (`Mono`) for every interval — stall, backoff
