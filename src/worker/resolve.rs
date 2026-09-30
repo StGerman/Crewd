@@ -6,8 +6,9 @@
 //! repeating the lookup at spawn. A binary that disappears while running is #216's.
 
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use nix::unistd::{AccessFlags, access};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ResolveError {
@@ -29,9 +30,10 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Result<PathBuf, ResolveEr
         }
         p
     } else {
+        // An empty entry (a leading, trailing or doubled `:`) is the cwd, as it is to `execvp`;
+        // joining it yields the bare name, which `absolute` below anchors there.
         path.into_iter()
             .flat_map(std::env::split_paths)
-            .filter(|dir| !dir.as_os_str().is_empty())
             .map(|dir| dir.join(bin))
             .find(|p| is_executable(p))
             .ok_or_else(|| ResolveError::NotOnPath(bin.to_string()))?
@@ -39,8 +41,10 @@ pub fn resolve_bin(bin: &str, path: Option<&OsStr>) -> Result<PathBuf, ResolveEr
     std::path::absolute(&found).map_err(|_| ResolveError::NotExecutable(found))
 }
 
+/// `access(X_OK)` rather than any execute bit in the mode: a file whose bits deny this user
+/// would pass a mode check here and then fail every spawn with `EACCES`.
 fn is_executable(p: &Path) -> bool {
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    std::fs::metadata(p).is_ok_and(|m| m.is_file()) && access(p, AccessFlags::X_OK).is_ok()
 }
 
 #[cfg(test)]
@@ -74,6 +78,26 @@ mod tests {
         assert_eq!(resolve_bin(&format!("./{rel}"), None), Ok(std::path::absolute(rel).unwrap()));
         let path = std::env::join_paths(["tests/fixtures/fake_grok"]).unwrap();
         assert_eq!(resolve_bin("dump_argv.sh", Some(&path)), Ok(std::path::absolute(rel).unwrap()));
+    }
+
+    #[test]
+    fn a_file_this_user_cannot_execute_is_skipped_for_a_later_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("crew-resolve-{}", std::process::id()));
+        let (first, second) = (dir.join("a"), dir.join("b"));
+        for d in [&first, &second] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("tool"), "#!/bin/sh\n").unwrap();
+        }
+        // Others may execute; the owner, which is us, may not.
+        std::fs::set_permissions(first.join("tool"), std::fs::Permissions::from_mode(0o601))
+            .unwrap();
+        std::fs::set_permissions(second.join("tool"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let got = resolve_bin("tool", Some(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Ok(second.join("tool")));
     }
 
     #[test]

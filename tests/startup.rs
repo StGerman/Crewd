@@ -59,15 +59,18 @@ impl Scratch {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_crewd"))
-            .args(["--config", "crew.toml", "--max-ticks", "1"])
+        self.command(args).output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_crewd"));
+        cmd.args(["--config", "crew.toml", "--max-ticks", "1"])
             .args(args)
             .current_dir(&self.dir)
             .env("CREW_DB", self.dir.join("crew.db"))
             .env("CREW_TASKS_ROOT", self.dir.join("tasks"))
-            .env("RUST_LOG", "crew=warn")
-            .output()
-            .unwrap()
+            .env("RUST_LOG", "crew=warn");
+        cmd
     }
 }
 
@@ -138,6 +141,38 @@ fn a_component_the_config_leaves_off_is_not_required_to_start() {
     ));
 
     let out = scratch.run(&[]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn a_transcript_root_that_cannot_be_created_stops_startup_naming_it() {
+    let scratch = Scratch::new(&format!(
+        "{BASE}\n[transcripts]\nenabled = true\nroot = \"blocker/transcripts\"\n"
+    ));
+    std::fs::write(scratch.dir.join("blocker"), "a file where a directory has to go").unwrap();
+
+    let out = scratch.run(&[]);
+
+    assert!(!out.status.success(), "crewd started with no transcript root");
+    // Up to the OS's own wording, which differs between macOS and Linux for this errno.
+    let err = stderr(&out);
+    insta::assert_snapshot!(err.split("\n\nCaused by").next().unwrap_or(&err));
+}
+
+#[test]
+fn a_worker_binary_in_the_cwd_is_found_through_an_empty_path_entry() {
+    // Trailing `:` is the cwd to `execvp`, so a check that dropped the empty entry would refuse
+    // a binary every shell finds.
+    let scratch = Scratch::new(&format!(
+        "{BASE}\n[[workers]]\nname = \"here\"\nkind = \"grok\"\nbin = \"crew-tool-218\"\nmax_concurrent = 1\n"
+    ));
+    let tool = scratch.dir.join("crew-tool-218");
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:", std::env::var("PATH").unwrap_or_default());
+
+    let out = scratch.command(&[]).env("PATH", path).output().unwrap();
 
     assert!(out.status.success(), "{}", stderr(&out));
 }

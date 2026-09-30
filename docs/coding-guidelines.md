@@ -187,7 +187,7 @@ this file.
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
-| `nix` (`signal` only) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, without `unsafe` | Replaced `libc` (#50) |
+| `nix` (`signal`, `fs`) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, and the `access(X_OK)` check on a worker's binary in `src/worker/resolve.rs` (#218), without `unsafe` | Replaced `libc` (#50) |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
