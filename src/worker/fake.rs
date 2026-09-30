@@ -35,6 +35,9 @@ pub struct Script {
     /// ever answers once the process has exited. `None` by default: most scripted runs were
     /// never handed a rate limit.
     pub rate_limit: Option<RateLimitSignal>,
+    /// Reported from spawn onward, unlike `rate_limit`: the real worker answers a warning
+    /// while the run is still going, which is the whole point of it (#184).
+    pub rate_limit_warning: Option<RateLimitSignal>,
 }
 
 impl Script {
@@ -47,6 +50,7 @@ impl Script {
             silent_after_ms: None,
             verdicts: vec![],
             rate_limit: None,
+            rate_limit_warning: None,
         }
     }
 
@@ -68,6 +72,13 @@ impl Script {
         self
     }
 
+    /// Simulates the CLI warning, mid-run, that this window is past its threshold (#184). The
+    /// run itself goes on to whatever `outcome` says.
+    pub fn with_rate_limit_warning(mut self, sig: RateLimitSignal) -> Self {
+        self.rate_limit_warning = Some(sig);
+        self
+    }
+
     pub fn stalls_after(ms: u64) -> Self {
         Self {
             duration_ms: u64::MAX, // never completes on its own
@@ -77,6 +88,7 @@ impl Script {
             silent_after_ms: Some(ms),
             verdicts: vec![],
             rate_limit: None,
+            rate_limit_warning: None,
         }
     }
 }
@@ -302,6 +314,10 @@ impl RunHandle for FakeRun {
     /// power, mirroring the real worker's stream-driven signal.
     fn rate_limit(&self) -> Option<RateLimitSignal> {
         if self.completed() { self.script.rate_limit.clone() } else { None }
+    }
+
+    fn rate_limit_warning(&self) -> Option<RateLimitSignal> {
+        self.script.rate_limit_warning.clone()
     }
 
     fn finished(&self) -> Option<Outcome> {

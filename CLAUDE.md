@@ -71,6 +71,14 @@ spawns a real `claude` and spends tokens, and only a Cargo default (examples are
 `test = false`) keeps `cargo test` from calling it. `rust-toolchain.toml` pins the compiler and
 CI builds `--locked`, so a drifted `Cargo.lock` fails rather than being quietly rewritten.
 
+On a `crew/` branch a `Stop` hook ([.claude/hooks/lint-before-stop.sh](.claude/hooks/lint-before-stop.sh))
+runs `cargo fmt --check` and clippy when a Claude Code session tries to finish, and blocks the
+stop with their output until they pass and the fix is committed (#187), so a lint failure costs
+a turn rather than a gate round. A stop reporting `continue` or `blocked` is let through, and a
+blocked agent repeats its `CREW_OUTCOME`/`CREW_REVIEW` lines, because crewd reads them from the
+final message only. Its timeout stays under `agent.stall_timeout_ms`. Grok and other branches
+never run it; the gate still decides.
+
 The loop while editing, measured on this tree (an agent runs the command the docs name, so this
 table *is* the loop):
 
@@ -140,7 +148,8 @@ moves it.
 ```
 recover()                                        ← first tick only
                  ↓
-harvest_finished → observe_progress → harvest_gates → detect_stalls → refresh_running
+observe_rate_limit_warnings → harvest_finished → observe_progress → harvest_gates
+                 → detect_stalls → refresh_running
                  ↓
          advance_deliveries                          ← unconditional too
                  ↓
@@ -153,7 +162,7 @@ Reconciliation runs before `preflight()` so a broken config stops *new* dispatch
 stranding runs in flight; do not move it earlier. `sweep_parked` sits behind it on purpose (it
 deletes workspaces); the rest of the reasoning is in [docs/architecture.md](docs/architecture.md).
 
-**Four rules that bind everywhere:**
+**Rules that bind everywhere:**
 
 1. The clock is injected. Nothing outside [src/clock.rs](src/clock.rs) may call
    `Instant::now` or `SystemTime::now`. Monotonic (`Mono`) for every interval — stall, backoff
@@ -175,6 +184,13 @@ deletes workspaces); the rest of the reasoning is in [docs/architecture.md](docs
    scheduler. `TasksProjector` probes one existing task file's shape at startup and disables
    itself with a warning if the keys it depends on are missing; that probe is the one read this
    type performs, and its result only ever flips this type's own on/off switch.
+5. Fail fast. Anything the config turns on either starts or crewd exits non-zero at startup,
+   naming what failed: a listener that cannot bind, a worker binary that cannot be resolved, a
+   store another live daemon holds. Never log it and keep scheduling: a daemon that is up but
+   partial looks healthy to its operator and is not (#218). A failure confined to one run, such
+   as its crash or one flaky API call, stays with that run and is retried; one that disables a
+   whole worker pauses that worker (#216). Rule 4's projection is the one startup exception,
+   because a change in Claude Code's internal store must cost a dashboard, not the scheduler.
 
 **The store is a cache of judgment, not a system of record.** Losing `crew.db` degrades
 to stateless re-polling, never to incorrect behaviour — the session id lives there too, so

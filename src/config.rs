@@ -40,6 +40,9 @@ pub use libcrew::api::{DEFAULT_API_BIND, DEFAULT_MCP_BIND};
 fn d_parked_sweep() -> u64 {
     300_000
 }
+pub(crate) fn d_rate_limit_warn_utilization() -> f64 {
+    0.80
+}
 fn d_broker_enabled() -> bool {
     true
 }
@@ -562,6 +565,12 @@ pub struct AgentConfig {
     /// `polling.interval_ms` — a parked issue is not urgent. `0` disables the sweep.
     #[serde(default = "d_parked_sweep")]
     pub parked_sweep_interval_ms: u64,
+    /// A `five_hour` rate-limit warning at or above this `utilization` pauses new dispatch on
+    /// the run's worker until the window resets (#184). Not the event's own
+    /// `surpassedThreshold`: the `seven_day` window warns from 0.75, which would pause dispatch
+    /// for days.
+    #[serde(default = "d_rate_limit_warn_utilization")]
+    pub rate_limit_warn_utilization: f64,
 }
 
 impl Default for AgentConfig {
@@ -576,6 +585,7 @@ impl Default for AgentConfig {
             quarantine_after_identical: d_quarantine_after(),
             refresh_miss_grace: d_miss_grace(),
             parked_sweep_interval_ms: d_parked_sweep(),
+            rate_limit_warn_utilization: d_rate_limit_warn_utilization(),
         }
     }
 }
@@ -785,6 +795,14 @@ impl Config {
         }
         if self.agent.max_turns_per_session == 0 || self.agent.max_turns_per_issue == 0 {
             return Err(ConfigError::Invalid("turn budgets must be > 0".into()));
+        }
+        // Above 1.0 no warning ever pauses, and at 0 or below every one does, so each is a typo
+        // that silently turns #184 off or into a standing pause.
+        let warn = self.agent.rate_limit_warn_utilization;
+        if !(warn > 0.0 && warn <= 1.0) {
+            return Err(ConfigError::Invalid(
+                "agent.rate_limit_warn_utilization must be in (0, 1]".into(),
+            ));
         }
         if self.polling.interval_ms == 0 {
             return Err(ConfigError::Invalid("polling.interval_ms must be > 0".into()));
@@ -1216,6 +1234,18 @@ mod tests {
         assert!(c.preflight().is_err());
         // Off, the bounds are not consulted, so a stale zero cannot stop dispatch.
         c.delivery.enabled = false;
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_rate_limit_warn_utilization_outside_zero_to_one_is_refused() {
+        let mut c = base();
+        assert_eq!(c.agent.rate_limit_warn_utilization, 0.80);
+        for bad in [0.0, -0.5, 1.5, f64::NAN] {
+            c.agent.rate_limit_warn_utilization = bad;
+            assert!(c.preflight().is_err(), "{bad} must be refused");
+        }
+        c.agent.rate_limit_warn_utilization = 1.0;
         assert!(c.preflight().is_ok());
     }
 

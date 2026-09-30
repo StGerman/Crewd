@@ -272,6 +272,17 @@ scheduler cannot trust — missing, or already behind the clock — degrades to 
 `Failed` path rather than risking a pause nothing ever lifts, the same failure mode a clock skew
 would otherwise turn into a silent, permanent stop.
 
+A `five_hour` warning whose top-level `utilization` is at or above
+`agent.rate_limit_warn_utilization` (default 0.80) pauses the same worker one window earlier
+(#184): runs dispatched into a 0.98 window spent their turns on reconnaissance and then died on
+the rejection with nothing edited. The event's own `surpassedThreshold` is not the threshold,
+because the `seven_day` window warns from 0.75 and resets days away; a `seven_day` warning
+changes nothing, and its rejection still pauses as before. `RunHandle::rate_limit_warning`
+answers mid-run rather than at exit, and `observe_rate_limit_warnings` reads it at the top of
+every tick, before `harvest_finished` can remove a run that warned and ended since the last one;
+the warned run is left to finish, since slowing a running run is out of scope and killing it
+would cost the work it is doing.
+
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
 — so the `system` and tool-call lines it drops, and the lines it could not parse at all, are

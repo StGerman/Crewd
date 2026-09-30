@@ -41,7 +41,7 @@ use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RetryEntry, RunRecord, RunStart, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::transcript::Transcripts;
-use crate::worker::{Progress, RunHandle, Spawn, Worker};
+use crate::worker::{Progress, RateLimitSignal, RunHandle, Spawn, Worker};
 use crate::workspace::Workspace;
 
 /// Continuations holding a concurrency slot through their delay (#86), by issue id.
@@ -308,7 +308,10 @@ impl Scheduler {
             self.recover()?;
         }
 
-        // Unconditional: in-flight runs are reconciled even when config is broken.
+        // Unconditional: in-flight runs are reconciled even when config is broken. Warnings are
+        // read before `harvest_finished` removes a run that warned and ended since the last tick,
+        // which would otherwise leave its worker open to dispatch into the closing window.
+        self.observe_rate_limit_warnings();
         self.harvest_finished()?;
         self.observe_progress()?;
         self.harvest_gates()?;
@@ -726,6 +729,38 @@ impl Scheduler {
             r.last_progress_at = now;
         }
         Ok(())
+    }
+
+    /// Pause new dispatch on a worker whose run reports its `five_hour` window past
+    /// `agent.rate_limit_warn_utilization`, one window earlier than the rejection would (#184): a
+    /// run dispatched into a 0.98 window spends its turns and dies on the rejection with nothing
+    /// to show for them. The warning run itself is left alone — it finishes on its own power, and
+    /// only its worker's *next* dispatch waits for `resets_at`. A `resets_at` that overflows or is
+    /// already behind the clock pauses nothing, for the same reason as a rejection's.
+    fn observe_rate_limit_warnings(&mut self) {
+        let now = self.clock.wall().0;
+        let warned: Vec<(String, String, RateLimitSignal)> = self
+            .running
+            .iter()
+            .filter_map(|(id, r)| {
+                r.handle.rate_limit_warning().map(|sig| (id.clone(), r.worker.clone(), sig))
+            })
+            .collect();
+        for (issue_id, worker, sig) in warned {
+            let Some(at) = sig.resets_at.and_then(|secs| secs.checked_mul(1_000)) else {
+                continue;
+            };
+            let covered = self.rate_limit_pauses.get(&worker).is_some_and(|p| p.resets_at >= at);
+            if at <= now || covered {
+                continue;
+            }
+            tracing::warn!(
+                issue_id, worker, kind = %sig.kind, resets_at_ms = at,
+                "rate limit window past its warning threshold; pausing new dispatch on this \
+                 worker until it resets"
+            );
+            self.pause_worker(&worker, sig.kind, at);
+        }
     }
 
     /// Turn finished gates into verdicts, and kill the ones that have run past the timeout.
