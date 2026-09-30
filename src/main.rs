@@ -308,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             base = cfg.gate_base().as_deref().unwrap_or("HEAD"),
             commands = cfg.gate.commands.len(),
-            "handoff gate on: done runs are rebased and re-gated before release"
+            "handoff gate on: done runs are brought onto the base and re-gated before release"
         );
         let mut gate = GitGate::new(repo, cfg.gate_base(), cfg.gate.commands.clone());
         // With delivery on, the base is the remote's: the one the pull request merges into. It

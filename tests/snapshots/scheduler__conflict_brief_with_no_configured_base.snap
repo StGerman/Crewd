@@ -1,0 +1,5 @@
+---
+source: tests/scheduler.rs
+expression: output
+---
+continuation: the handoff gate could not bring the branch onto the repository HEAD (0123456789abcdef0123456789abcdef01234567): it conflicted in CLAUDE.md (failure 1 of 3). It was aborted, so the branch is where you left it. Another branch appended to the same place; resolve it yourself with `git merge 0123456789abcdef0123456789abcdef01234567`, keeping both sides' additions in each conflicted file, and commit the merge. Do not rebase: the gate merges the base into a branch that has merged it, so a merge keeps your resolution. Check the result still builds, and finish again.

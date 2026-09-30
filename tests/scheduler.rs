@@ -1569,12 +1569,7 @@ fn a_conflict_confined_to_agent_resolvable_paths_is_handed_back_to_the_agent() {
     let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
-    assert!(output.contains("CLAUDE.md"), "which paths: {output}");
-    assert!(output.contains("master"), "onto which base: {output}");
-    assert!(output.contains(&format!("git rebase {BASE}")), "by commit, not ref: {output}");
-    assert!(output.contains("aborted") && output.contains("where you left it"), "{output}");
-    assert!(output.contains("1 of 3"), "and how many tries are left: {output}");
-    assert!(!output.contains("RELEASED"), "the migration rule only when schema.rs conflicts");
+    insta::assert_snapshot!("resolvable_conflict_brief", output);
 }
 
 /// A real `GitGate` whose `start` returns only once its verdict is in, so the scheduler sees it
@@ -1654,7 +1649,7 @@ fn a_conflict_resolved_by_merging_the_base_is_not_re_raised_by_the_gate() {
 }
 
 /// With `gate.base` unset the gate rebased onto `workspace.repo`'s HEAD; in the agent's own
-/// worktree `HEAD` is its branch, so a brief saying `git rebase HEAD` is a no-op that leaves
+/// worktree `HEAD` is its branch, so a brief saying `git merge HEAD` is a no-op that leaves
 /// the conflict to recur. The brief names the commit the gate actually tried.
 #[test]
 fn a_conflict_brief_with_no_configured_base_names_the_commit_not_head() {
@@ -1674,8 +1669,8 @@ fn a_conflict_brief_with_no_configured_base_names_the_commit_not_head() {
     let [Feedback::Gate { output }] = &h.worker.feedback_for("iss-1")[1][..] else {
         panic!("the continuation must be told about the conflict");
     };
-    assert!(output.contains(&format!("git rebase {BASE}")), "{output}");
-    assert!(!output.contains("git rebase HEAD"), "{output}");
+    insta::assert_snapshot!("conflict_brief_with_no_configured_base", output);
+    assert!(!output.contains("git merge HEAD"), "{output}");
 }
 
 /// A rebase the gate could not abort leaves the worktree mid-rebase — not the branch the agent
@@ -1771,7 +1766,7 @@ fn repeated_unresolved_docs_conflicts_escalate_to_blocked() {
     assert!(h.sched.store().all_retries().unwrap().is_empty(), "no third try");
     let note = st.last_error.expect("the escalation must say why");
     assert!(note.contains("2 time(s)") && note.contains("docs/coding-guidelines.md"), "{note}");
-    assert!(!note.contains("git rebase --continue"), "the human is not sent the agent's brief");
+    assert!(!note.contains("git merge"), "the human is not sent the agent's brief");
     assert_eq!(gate.starts_for("iss-1").len(), 2);
 }
 

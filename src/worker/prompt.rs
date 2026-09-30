@@ -477,8 +477,9 @@ pub(crate) fn build_prompt(
 /// rather than accepted.
 ///
 /// Each item is rendered in turn, so a conflict brief that interrupted a review hand-back comes
-/// first and the comments follow it in the same prompt (#160): the branch has to rebase before
-/// anything else on it can land, and splitting the two cost a review round on a conflict.
+/// first and the comments follow it in the same prompt (#160): the branch has to be brought
+/// onto the base before anything else on it can land, and splitting the two cost a review
+/// round on a conflict.
 pub(crate) fn feedback_help(feedback: &[Feedback]) -> String {
     let mut s = String::new();
     for fb in feedback {
@@ -492,12 +493,13 @@ pub(crate) fn feedback_help(feedback: &[Feedback]) -> String {
             }
             Feedback::Conflict { base, base_sha, paths } => {
                 s.push_str(&format!(
-                    "\nThe orchestrator could not rebase your branch onto {base} ({base_sha}): \
-                 conflicts in {}. The rebase was aborted, so your branch is exactly as you left \
-                 it. Your job this run is to resolve that yourself — `git rebase {base_sha}`, \
-                 resolve each conflict (the description may say how), `git rebase --continue` — \
-                 then run the project's own gate and commit. Do not report done while the branch \
-                 still conflicts with {base}.\n",
+                    "\nThe orchestrator could not bring your branch onto {base} ({base_sha}): \
+                 conflicts in {}. It was aborted, so your branch is exactly as you left it. Your \
+                 job this run is to resolve that yourself — `git merge {base_sha}`, resolve each \
+                 conflict (the description may say how), commit the merge — then run the \
+                 project's own gate. Do not rebase: the orchestrator merges the base into a \
+                 branch that has merged it, so a merge keeps your resolution. Do not report \
+                 done while the branch still conflicts with {base}.\n",
                     paths.join(", ")
                 ));
             }
