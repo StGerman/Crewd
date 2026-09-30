@@ -12,7 +12,8 @@
 //! `rejected` verdict instead. The only text recognised is the one that says there is nothing:
 //! a body that is "Findings: None" once Copilot's template is set aside — headings, HTML
 //! comments and tags, the "Review effort" line, and its section labels (#201). Any prose left
-//! over is a finding; a template line counted as one spent a delivery round on every review.
+//! over is a finding, except the overview sentence of Copilot's approval (#234); a template line
+//! counted as one spent a delivery round on every review.
 
 use crate::forge::{Review, ReviewComment, SUMMARY_PREFIX, summary_review_id};
 
@@ -40,10 +41,16 @@ pub(super) fn summary_findings(
         .collect()
 }
 
-/// Whether `body` says anything beyond "Findings: None".
+/// Whether `body` says anything beyond "Findings: None". The one prose allowed is the overview
+/// sentence under Copilot's approval (`🟢 Approved`), and only in a summary that also says
+/// "Findings: None": that sentence is on every approval, and handing it back spent a delivery
+/// round on each (#234). Prose under any other status, or in any other section, still counts.
 fn carries_findings(body: &str) -> bool {
     let mut in_html_comment = false;
-    body.lines().any(|line| {
+    let mut under_approval = false;
+    let mut says_none = false;
+    let mut overview = false;
+    for line in body.lines() {
         let mut rest = line.trim();
         // HTML comments are markers for the tool that wrote them, never text for a reader.
         let mut text = String::new();
@@ -71,23 +78,47 @@ fn carries_findings(body: &str) -> bool {
             }
         }
         let text = text.trim();
-        if text.is_empty() || text.starts_with('#') {
-            return false;
+        if text.is_empty() {
+            continue;
         }
-        let bare: String = strip_tags(text)
-            .chars()
-            .filter(|c| !matches!(c, '*' | '_'))
-            .map(|c| if c == '\u{2019}' { '\'' } else { c })
-            .collect::<String>()
-            .to_lowercase();
-        let bare: String = bare.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(heading) = text.strip_prefix('#') {
+            under_approval = bare(heading.trim_start_matches('#')) == "🟢 approved";
+            continue;
+        }
+        let bare = bare(text);
+        if text.starts_with('<') {
+            // A `<details>` block is a section of its own, never the overview.
+            under_approval = false;
+        }
+        if bare == "findings: none" {
+            says_none = true;
+            continue;
+        }
         let template = bare.is_empty()
-            || bare == "findings: none"
             || bare.starts_with("review effort:")
             || bare == "in code that hasn't changed since last review"
             || (text.starts_with('<') && is_section_label(&bare));
-        !template
-    })
+        if template {
+            continue;
+        }
+        if !under_approval {
+            return true;
+        }
+        overview = true;
+    }
+    overview && !says_none
+}
+
+/// `text` as compared against the template: tags and emphasis gone, the curly apostrophe
+/// straightened, whitespace collapsed, lowercase.
+fn bare(text: &str) -> String {
+    let bare: String = strip_tags(text)
+        .chars()
+        .filter(|c| !matches!(c, '*' | '_'))
+        .map(|c| if c == '\u{2019}' { '\'' } else { c })
+        .collect::<String>()
+        .to_lowercase();
+    bare.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Treating comparison prose such as "a < b" as markup would silently drop a finding, so only a
@@ -214,6 +245,33 @@ mod tests {
         let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
         assert_eq!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).len(), 1);
         assert!(carries_findings("a < b is <b>still</b> said"));
+    }
+
+    /// PR #229's round 3 of 3 was spent on this summary (#234).
+    #[test]
+    fn an_approving_copilot_summary_with_no_findings_is_not_a_finding() {
+        let body = "### 🟢 Approved\nThe fail-fast paths are consistently propagated, documented, \
+            and covered by focused startup tests.\n**Findings:** None";
+        assert!(!carries_findings(body));
+        let with_template = TEMPLATE.replace(
+            "### 🟢 Approved\n\n",
+            "### 🟢 Approved\n\nThe fail-fast paths are consistently propagated.\n\n",
+        );
+        let reviews = [review("1", COPILOT, "COMMENTED", "head", &with_template)];
+        assert!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).is_empty());
+    }
+
+    #[test]
+    fn an_approval_is_still_a_finding_without_findings_none_or_with_another_section() {
+        assert!(carries_findings("### 🟢 Approved\nLooks good.\n**Findings:** 1"));
+        assert!(carries_findings("### 🟢 Approved\nLooks good."));
+        assert!(carries_findings(
+            "### 🟢 Approved\nLooks good.\n**Findings:** None\n### Notes\nRename the guard."
+        ));
+        assert!(carries_findings(
+            "### 🟢 Approved\nLooks good.\n**Findings:** None\n<details>\n\
+             <summary>Open (1)</summary>\nRename the guard.\n</details>"
+        ));
     }
 
     #[test]
