@@ -81,8 +81,8 @@ pub(crate) fn extract_usage(v: &serde_json::Value) -> Option<TokenUsage> {
 }
 
 /// Reads `rate_limit_info` off a `rate_limit_event` line, when its `status` is `"rejected"`.
-/// Every other status is the CLI reporting where it stands, not that it stopped, and is not
-/// this module's to act on (#37 is scoped to a rejection).
+/// An `allowed_warning` is [`parse_rate_limit_warning`]'s; every other status is the CLI
+/// reporting where it stands, not that it stopped.
 ///
 /// `rateLimitType` is kept as whatever string the CLI sent rather than matched against a known
 /// set: a window name this crate has never seen must still carry its own `resetsAt` forward
@@ -95,6 +95,30 @@ pub(crate) fn parse_rate_limit_event(v: &serde_json::Value) -> Option<RateLimitS
         return None;
     }
     let kind = info.get("rateLimitType").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+    let resets_at = info.get("resetsAt").and_then(|r| r.as_i64());
+    Some(RateLimitSignal { kind, resets_at })
+}
+
+/// Reads an `allowed_warning` off a `rate_limit_event` line, when its window's `utilization` is
+/// at or above the event's own `surpassedThreshold` (#184). The threshold is the CLI's rather
+/// than a config key, so an event without one is not a warning this crate can judge and yields
+/// `None`. `utilization` is read off `rate_limit_info` itself, else off the named window in
+/// `unifiedWindows`: `rateLimitType` names the window that crossed, and that is the one whose
+/// `resetsAt` the pause must wait for, the same window a rejection pauses on.
+pub(crate) fn parse_rate_limit_warning(v: &serde_json::Value) -> Option<RateLimitSignal> {
+    let info = v.get("rate_limit_info")?;
+    if info.get("status").and_then(|s| s.as_str()) != Some("allowed_warning") {
+        return None;
+    }
+    let kind = info.get("rateLimitType").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+    let threshold = info.get("surpassedThreshold").and_then(|t| t.as_f64())?;
+    let utilization = info
+        .get("utilization")
+        .or_else(|| info.pointer(&format!("/unifiedWindows/{kind}/utilization")))
+        .and_then(|u| u.as_f64())?;
+    if utilization < threshold {
+        return None;
+    }
     let resets_at = info.get("resetsAt").and_then(|r| r.as_i64());
     Some(RateLimitSignal { kind, resets_at })
 }

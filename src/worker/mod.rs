@@ -96,7 +96,7 @@ impl Session {
 }
 
 /// What a run's stream reported about an account-wide rate limit, read off a `rate_limit_event`
-/// whose `status` is `"rejected"` (#37). Orthogonal to [`Outcome`]: the CLI still reports its
+/// whose `status` is `"rejected"` (#37), or `"allowed_warning"` past its threshold (#184). Orthogonal to [`Outcome`]: the CLI still reports its
 /// ordinary verdict for a run cut short this way — typically [`Outcome::Failed`], since the
 /// process exits with no explicit marker — and this is the separate signal that tells the
 /// scheduler *why*, so it can treat the interruption as account-wide rather than as this issue's
@@ -167,6 +167,14 @@ pub trait RunHandle: Send + Sync {
     /// shown this event. The grok 1.0.41 probe did not emit one, so [`crate::worker::grok`]
     /// is correct reporting nothing until a rejection is recorded.
     fn rate_limit(&self) -> Option<RateLimitSignal> {
+        None
+    }
+    /// Set, while the run is still going, once its stream reported an `allowed_warning` at or
+    /// past the CLI's own threshold (#184): the window is about to close, so the scheduler stops
+    /// *new* dispatch on this worker and lets this run finish. Answered mid-run, unlike
+    /// `rate_limit`, because a warning read only at exit would pause nothing earlier than the
+    /// rejection it is meant to get ahead of.
+    fn rate_limit_warning(&self) -> Option<RateLimitSignal> {
         None
     }
     /// Request termination and wait, bounded, for the run to actually stop.

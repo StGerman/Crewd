@@ -272,6 +272,14 @@ scheduler cannot trust — missing, or already behind the clock — degrades to 
 `Failed` path rather than risking a pause nothing ever lifts, the same failure mode a clock skew
 would otherwise turn into a silent, permanent stop.
 
+An `allowed_warning` whose `utilization` is at or above the event's own `surpassedThreshold`
+pauses the same worker one window earlier (#184): runs dispatched into a 0.98 window spent their
+turns on reconnaissance and then died on the rejection with nothing edited. The threshold is the
+CLI's, not a config key, so an event without one pauses nothing. `RunHandle::rate_limit_warning`
+answers mid-run rather than at exit, and `observe_rate_limit_warnings` reads it every tick
+alongside `observe_progress`; the warned run is left to finish, since slowing a running run is
+out of scope and killing it would cost the work it is doing.
+
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
 — so the `system` and tool-call lines it drops, and the lines it could not parse at all, are

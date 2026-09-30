@@ -90,7 +90,8 @@
 //!
 //! `rate_limit_event` is the one exception: a rejected one is not a per-run detail but the
 //! scheduler's cue that the whole account is throttled, so [`parse_rate_limit_event`] reads it
-//! here rather than leaving it for a post-mortem (#37). It is still copied to the transcript
+//! here rather than leaving it for a post-mortem (#37); a warning past the CLI's own threshold
+//! is read the same way, so dispatch can pause before the rejection arrives (#184). It is still copied to the transcript
 //! like every other line.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -111,7 +112,7 @@ use crate::transcript::TranscriptWriter;
 
 use super::prompt::{
     build_continuation_prompt, build_prompt, extract_marker, extract_text, extract_usage,
-    extract_verdicts, parse_rate_limit_event, truncate,
+    extract_verdicts, parse_rate_limit_event, parse_rate_limit_warning, truncate,
 };
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
@@ -185,6 +186,8 @@ struct Inner {
     /// Independent of `outcome`: the CLI still reports its own verdict (ordinarily `Failed`,
     /// since the process exits with no explicit marker) alongside this.
     rate_limit: Option<RateLimitSignal>,
+    /// The latest `allowed_warning` past its threshold — see [`parse_rate_limit_warning`].
+    rate_limit_warning: Option<RateLimitSignal>,
     /// Set only once the child has been reaped (`Child::wait` returned). `kill` must not
     /// return before this is true — the caller deletes the workspace next.
     reaped: bool,
@@ -221,6 +224,10 @@ impl RunHandle for ClaudeRun {
 
     fn rate_limit(&self) -> Option<RateLimitSignal> {
         self.state.0.lock().unwrap().rate_limit.clone()
+    }
+
+    fn rate_limit_warning(&self) -> Option<RateLimitSignal> {
+        self.state.0.lock().unwrap().rate_limit_warning.clone()
     }
 
     fn kill(&self, grace_ms: u64) -> KillResult {
@@ -515,6 +522,8 @@ fn run_reader(
             Some("rate_limit_event") => {
                 if let Some(sig) = parse_rate_limit_event(&value) {
                     state.0.lock().unwrap().rate_limit = Some(sig);
+                } else if let Some(sig) = parse_rate_limit_warning(&value) {
+                    state.0.lock().unwrap().rate_limit_warning = Some(sig);
                 }
             }
             Some("result") => {
@@ -1053,6 +1062,74 @@ mod tests {
             parse_rate_limit_event(&v),
             Some(RateLimitSignal { kind: "five_hour".into(), resets_at: None })
         );
+    }
+
+    /// #184: a warning past its threshold is reported alongside a run that still finishes on
+    /// its own, and is never mistaken for the rejection that `rate_limit()` carries.
+    #[test]
+    fn a_rate_limit_warning_is_reported_without_ending_the_run() {
+        let ws = tmp_workspace("rate-limit-warning");
+        let w = ClaudeWorker::new(fixture("rate_limit_warning.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+
+        let outcome = wait_for_finish(&h);
+        assert_eq!(outcome, Outcome::Done);
+        assert_eq!(h.rate_limit(), None);
+        assert_eq!(
+            h.rate_limit_warning(),
+            Some(RateLimitSignal { kind: "five_hour".into(), resets_at: Some(1_789_981_200) })
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    fn warning(info: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "rate_limit_event", "rate_limit_info": info})
+    }
+
+    #[test]
+    fn a_warning_below_threshold_changes_nothing() {
+        let v = warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
+            "utilization": 0.89, "surpassedThreshold": 0.9,
+        }));
+        assert_eq!(parse_rate_limit_warning(&v), None);
+        assert_eq!(parse_rate_limit_event(&v), None);
+    }
+
+    #[test]
+    fn a_warning_at_its_threshold_names_the_window_that_crossed_it() {
+        let v = warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "seven_day", "resetsAt": 42,
+            "utilization": 0.9, "surpassedThreshold": 0.9,
+            "unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": 7}},
+        }));
+        assert_eq!(
+            parse_rate_limit_warning(&v),
+            Some(RateLimitSignal { kind: "seven_day".into(), resets_at: Some(42) })
+        );
+    }
+
+    #[test]
+    fn a_warning_reads_utilization_off_its_own_window_when_the_top_level_has_none() {
+        let v = warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
+            "surpassedThreshold": 0.9,
+            "unifiedWindows": {"five_hour": {"utilization": 0.98}, "seven_day": {"utilization": 0.1}},
+        }));
+        assert_eq!(
+            parse_rate_limit_warning(&v),
+            Some(RateLimitSignal { kind: "five_hour".into(), resets_at: Some(42) })
+        );
+    }
+
+    #[test]
+    fn a_warning_without_a_surpassed_threshold_changes_nothing() {
+        let v = warning(serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
+            "utilization": 0.99,
+        }));
+        assert_eq!(parse_rate_limit_warning(&v), None);
     }
 
     #[test]
