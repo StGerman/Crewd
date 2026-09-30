@@ -41,7 +41,7 @@ fn d_parked_sweep() -> u64 {
     300_000
 }
 pub(crate) fn d_rate_limit_warn_utilization() -> f64 {
-    0.95
+    0.80
 }
 fn d_broker_enabled() -> bool {
     true
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn a_rate_limit_warn_utilization_outside_zero_to_one_is_refused() {
         let mut c = base();
-        assert_eq!(c.agent.rate_limit_warn_utilization, 0.95);
+        assert_eq!(c.agent.rate_limit_warn_utilization, 0.80);
         for bad in [0.0, -0.5, 1.5, f64::NAN] {
             c.agent.rate_limit_warn_utilization = bad;
             assert!(c.preflight().is_err(), "{bad} must be refused");

@@ -1119,8 +1119,8 @@ mod tests {
 
     #[test]
     fn a_warning_below_threshold_changes_nothing() {
-        let v = five_hour_warning(0.94);
-        assert_eq!(parse_rate_limit_warning(&v, 0.95), None);
+        let v = five_hour_warning(0.79);
+        assert_eq!(parse_rate_limit_warning(&v, 0.80), None);
         assert_eq!(parse_rate_limit_event(&v), None);
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
     #[test]
     fn a_five_hour_warning_at_threshold_names_its_window_and_reset() {
         assert_eq!(
-            parse_rate_limit_warning(&five_hour_warning(0.95), 0.95),
+            parse_rate_limit_warning(&five_hour_warning(0.80), 0.80),
             Some(RateLimitSignal { kind: "five_hour".into(), resets_at: Some(42) })
         );
     }
@@ -1143,7 +1143,7 @@ mod tests {
             "status": "allowed_warning", "rateLimitType": "seven_day", "resetsAt": 42,
             "utilization": 0.99, "surpassedThreshold": 0.75,
         }));
-        assert_eq!(parse_rate_limit_warning(&v, 0.95), None);
+        assert_eq!(parse_rate_limit_warning(&v, 0.80), None);
     }
 
     /// Only the top-level `utilization` and `resetsAt` are read; `unifiedWindows` is not a
@@ -1154,11 +1154,11 @@ mod tests {
             "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": 42,
             "unifiedWindows": {"five_hour": {"utilization": 0.98}},
         }));
-        assert_eq!(parse_rate_limit_warning(&no_utilization, 0.95), None);
+        assert_eq!(parse_rate_limit_warning(&no_utilization, 0.80), None);
         let no_reset = warning(serde_json::json!({
             "status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.99,
         }));
-        assert_eq!(parse_rate_limit_warning(&no_reset, 0.95), None);
+        assert_eq!(parse_rate_limit_warning(&no_reset, 0.80), None);
     }
 
     #[test]
