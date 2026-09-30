@@ -60,8 +60,7 @@
 //! `api.mcp_enabled`, or `--mcp <addr>` for one run; loopback unless `api.allow_public` says
 //! otherwise, through the same [`resolve_bind`](super::resolve_bind) the HTTP API uses, because
 //! the two surfaces carry the same two write actions and one flag should govern both. A bind
-//! failure costs this server alone — `main` logs it and schedules on — matching how
-//! [`super::bind`] already fails.
+//! failure stops crewd at startup naming the address, as [`super::bind`]'s does (#218).
 //!
 //! `allow_public` is what makes the transport's own bounds load-bearing here, and it is the
 //! reason they exist: the broker's listener is always loopback and serves a handful of workers,
@@ -105,8 +104,8 @@ pub const TOOLS: &[&str] =
 /// Synchronous, unlike [`super::bind`], because the transport it feeds is the broker's
 /// thread-per-connection server rather than a tokio task — which is also why a public bind
 /// here is bounded by [`Limits`](crate::broker::server::Limits) rather than by the address
-/// being loopback. Separate from serving for the same reason as the HTTP one: `main` reports
-/// a failure and carries on scheduling.
+/// being loopback. Separate from serving for the same reason as the HTTP one: `main` binds at
+/// startup, before anything else is opened, and exits naming the address on a failure (#218).
 pub fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
     let addr = super::resolve_bind("api.mcp_bind", &cfg.mcp_bind, cfg.allow_public)?;
     TcpListener::bind(addr).with_context(|| format!("binding the ops MCP server to {addr}"))

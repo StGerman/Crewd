@@ -182,8 +182,7 @@ fn a_dispatched_run_is_handed_a_broker_endpoint_scoped_to_its_own_issue() {
 
 #[test]
 fn dispatch_without_a_broker_still_runs_the_agent_just_without_tools() {
-    // The degrade the whole design turns on: a broker that could not start costs the agent a
-    // capability, never a dispatch.
+    // With the broker off, an agent runs without tracker tools rather than not running.
     let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
 
     h.sched.tick().unwrap();

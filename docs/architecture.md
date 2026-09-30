@@ -323,8 +323,9 @@ per-run cap alone bounds nothing, because the continuation loop opens a fresh ru
 the same gap `max_turns_per_issue` closes for turns — and a budget only spent on successes
 would leave a loop of failing writes free. A session is an RAII guard held inside the run's own
 record, so the token is revoked and its config file deleted on every path that ends a run,
-including ones not yet written. A broker that cannot bind, or a session that cannot open,
-degrades to an agent without tools and never to a failed dispatch.
+including ones not yet written. A session that cannot open degrades to an agent without tools
+and never to a failed dispatch; a broker that `broker.enabled` turns on and that cannot bind or
+set up stops startup instead (#218).
 
 The transport is hand-rolled rather than built on `rmcp`, and
 [src/broker/server.rs](../src/broker/server.rs)'s module doc is the write-up — the short version
@@ -388,7 +389,7 @@ site for "why this attempt exists" — where the real worker puts it in the prom
 `Blocked`, because a gate that can be failed forever is the continuation runaway wearing a new
 name. A `Blocked` reason now also lands in the store's `last_error`, so the dashboard shows why
 an issue is parked instead of only the log. Setting no gate is a decision, not a degrade — unlike
-the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
+the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
 empty command list, which makes the default bringing the branch onto the base and nothing more) and the scheduler tests
 attach `FakeGate` explicitly. `crew.github.toml` sets the commit-gate commands from **Commands**
@@ -402,10 +403,11 @@ snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v
 than by discipline — and the `POST`s can express nothing the dashboard's `r`, `u` and `b`
 keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
-because the `POST` routes control agent execution. Deliberately *not* validated in
-`Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
-must not be what stops it — `api::bind` parses it once, and a failure there is logged and
-costs the API alone. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
+because the `POST` routes control agent execution. The address is validated once, at startup,
+rather than in `Config::preflight`, which runs before every dispatch: `api::bind` parses and
+binds it before anything else is opened, only when the API is on, and any failure there, a
+taken port included, exits crewd naming the address (#218). A daemon scheduling with no ops API
+looks healthy and cannot be queried or unquarantined. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
 which is what keeps a hung client off the tick: the scheduler answers into a channel whose
 receiver may already be gone and never waits to find out. The HTTP is hand-rolled (~200 lines,
 no keep-alive, one response type) for the same reason the rest of this crate is small; the

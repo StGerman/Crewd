@@ -157,15 +157,13 @@ pub struct Scheduler {
     workers: Vec<WorkerPool>,
     workspace: Arc<dyn Workspace>,
     projector: Arc<dyn Projector>,
-    /// `None` when the broker could not start, or the operator turned it off. Dispatch carries
-    /// on either way — an agent without tracker tools is a degrade, not a failure.
+    /// `None` when the operator turned it off; one that is on and cannot start stops startup
+    /// in `main.rs` (#218).
     broker: Option<Arc<Broker>>,
-    /// `None` when transcripts are off or their root could not be created. Same contract as
-    /// the broker and the projector: a run with no record on disk, never a run that did not
-    /// happen.
+    /// `None` when transcripts are off. A run whose own file cannot be opened still runs: a run
+    /// with no record on disk, never a run that did not happen.
     transcripts: Option<Transcripts>,
-    /// `None` when the operator turned the gate off. Unlike the broker and the transcripts this
-    /// is not a degrade: with no gate a `Done` verdict is applied as the agent reported it,
+    /// `None` when the operator turned the gate off, which is a decision with a cost: with no gate a `Done` verdict is applied as the agent reported it,
     /// which is the exact handoff issue #21 is about, so `main.rs` sets one whenever
     /// `gate.enabled` is true and the tests say so explicitly when they want it.
     gate: Option<Arc<dyn Gate>>,
