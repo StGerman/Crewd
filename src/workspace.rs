@@ -90,8 +90,8 @@ pub struct WipSnapshot {
 pub struct Removed {
     /// True only when this call deleted the branch along with the directory. `false` covers
     /// every case a caller must treat alike: the branch outlived cleanup because it holds
-    /// commits `repo`'s HEAD does not, there was never a branch for this issue, or this impl
-    /// has no branches at all. A caller that persisted the branch at `prepare` time clears that
+    /// commits the base does not (or, with no base configured, `repo`'s HEAD), there was never
+    /// a branch for this issue, or this impl has no branches at all. A caller that persisted the branch at `prepare` time clears that
     /// record exactly when this is `true`, and leaves it alone otherwise.
     pub branch_deleted: bool,
 }
@@ -942,19 +942,17 @@ impl Workspace for GitWorktreeWorkspace {
         let path_str = path.to_string_lossy().into_owned();
         Self::git(&self.repo, &["worktree", "remove", "--force", &path_str])?;
 
-        // `-d` rather than `-D`: git's own merged check is the test for whether this branch
-        // still holds the run's work. One carrying nothing HEAD does not already have is
-        // deleted exactly as before, so an issue that produced no commit leaves no litter; one
-        // carrying commits outlives its worktree.
+        // A branch carrying nothing the base does not already hold is deleted, so an issue that
+        // produced no commit leaves no litter; one carrying commits outlives its worktree.
+        // With a base configured (#170) the base alone decides, as in `branch_carries_work`,
+        // and the delete is `-D` once `merge-base --is-ancestor` has shown the base holds it:
+        // `-d` would ask the operator's checkout instead, and a checkout that merged the
+        // agent's commits locally would let them go while the base still lacks them (review on
+        // #194). With no base, `-d` against `HEAD` is the test, git's own merged check.
         //
         // Best-effort either way: a branch that was already deleted, or never created because
         // `prepare` failed before reaching it, must not turn a successful worktree removal into
         // an error — it just means `branch_deleted` reads `false`, same as "kept".
-        //
-        // With a base configured (#170) the base alone decides, as in `branch_carries_work`:
-        // `-d` asks whether the operator's checkout holds the branch, and a checkout that
-        // merged the agent's commits locally would let them go while the base still lacks them
-        // (review on #194). Without one, `-d` against `HEAD` is the test, as before.
         let branch = Self::branch_name(issue_id, identifier);
         let branch_deleted = match self.known_base() {
             Some(base) => {
