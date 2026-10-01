@@ -25,7 +25,11 @@ const NONE: &str = "-";
 pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!("crewd @ {addr}  —  {} running", snap.running));
+    out.push_str("crewd");
+    if !snap.build.is_empty() {
+        out.push_str(&format!(" {}", snap.build));
+    }
+    out.push_str(&format!(" @ {addr}  —  {} running", snap.running));
     if snap.reserved > 0 {
         out.push_str(&format!(" + {} reserved", snap.reserved));
     }
@@ -401,6 +405,7 @@ mod tests {
             last_error: None,
             rate_limit_pauses: vec![],
             halted_workers: vec![],
+            build: String::new(),
         };
 
         let out = snapshot(&snap, "127.0.0.1:8787");
@@ -484,6 +489,20 @@ mod tests {
         let out = snapshot(&snap, "x");
         assert!(out.contains("not reported by any of 28 finished runs"), "{out}");
         assert!(!out.contains("0 in / 0 out"), "{out}");
+    }
+
+    /// #244: a restart that kept the old binary reads as a build string that did not change,
+    /// and a daemon from before #244 sends none, which prints as no build rather than a blank.
+    #[test]
+    fn the_status_header_names_the_daemon_build() {
+        let snap =
+            Snapshot { build: "0.1.0 (be41670-dirty)".into(), limit: 3, ..Default::default() };
+        let older = Snapshot { limit: 3, ..Default::default() };
+        insta::assert_snapshot!(format!(
+            "{}\n{}",
+            snapshot(&snap, "127.0.0.1:8787"),
+            snapshot(&older, "127.0.0.1:8787")
+        ));
     }
 
     #[test]

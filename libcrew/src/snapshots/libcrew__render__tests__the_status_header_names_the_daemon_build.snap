@@ -1,0 +1,15 @@
+---
+source: libcrew/src/render.rs
+expression: "format!(\"{}\\n{}\", snapshot(&snap, \"127.0.0.1:8787\"),\nsnapshot(&older, \"127.0.0.1:8787\"))"
+---
+crewd 0.1.0 (be41670-dirty) @ 127.0.0.1:8787  —  0 running / 3 limit
+tick 0
+tokens 0 in / 0 out
+
+no issues tracked yet
+
+crewd @ 127.0.0.1:8787  —  0 running / 3 limit
+tick 0
+tokens 0 in / 0 out
+
+no issues tracked yet
