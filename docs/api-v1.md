@@ -42,8 +42,8 @@ Off unless `[api] enabled` or `--api <addr>`, and loopback unless `api.allow_pub
 | `GET /api/v1/snapshot` | `200` with a `Snapshot` |
 | `GET /api/v1/issues/:identifier` | `200` with one `Row`; `404` when nothing matches; `409` when the identifier names more than one issue |
 | `POST /api/v1/refresh` | runs one tick, then `200` with the `Snapshot` after it; `500` when the tick failed, `503` when the scheduler stopped first |
-| `POST /api/v1/unquarantine/:identifier` | `200` with an action answer; `404`/`409` as for `issues` |
-| `POST /api/v1/unblock/:identifier` | `200` with an action answer; `404`/`409` as for `issues` |
+| `POST /api/v1/unquarantine/:identifier` | `200` with an action answer; `404`/`409` as for `issues`; `500` when the action failed, `503` when the scheduler stopped first |
+| `POST /api/v1/unblock/:identifier` | `200` with an action answer; `404`/`409` as for `issues`; `500` when the action failed, `503` when the scheduler stopped first |
 
 `:identifier` is a dispatch id (`issue_id`), tried first and exactly, else a tracker identifier.
 A wrong method on a known path is `405` with an `Allow` header; any other path is `404`.
@@ -89,7 +89,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `tracker_state` | string | The tracker's state for it |
 | `phase` | string | The claim state: `queued`, `running`, `retry`, `quarantine` or `released` |
 | `attempt` | integer | Attempts charged to it |
-| `turns` | integer | Turns of the current or latest run |
+| `turns` | integer | Turns of the running run; with none running, the issue's total across its runs |
 | `tokens` | optional `TokenUsage` | The current run's totals, once it reported them |
 | `age_ms` | integer | Time since its current run started; `0` when none is running |
 | `retry_in_ms` | optional integer | Time until its retry is due; negative once overdue |
@@ -97,7 +97,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `quarantined` | bool | Whether it is quarantined |
 | `last_error` | optional string | Its last failure, or why it is parked |
 | `last_event` | optional string | The last event its run reported |
-| `workspace` | optional string | Its worktree path, while one exists |
+| `workspace` | optional string | Its worktree path while a run or gate holds it; `null` otherwise, even if the worktree is still on disk |
 | `branch` | optional string | The branch its latest dispatch checked out; `null` once cleanup deleted a branch that carried nothing |
 | `runs` | array of `RunRecord` | Its most recent runs, newest first |
 | `transcript` | optional string | The latest run's transcript path |
