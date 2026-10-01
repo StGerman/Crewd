@@ -89,6 +89,21 @@ pub struct Snapshot {
     /// and a daemon on either side of #119 still see a pause while the API marker says `1`.
     #[serde(flatten, with = "pauses_wire")]
     pub rate_limit_pauses: Vec<RateLimitPause>,
+    /// One entry per worker whose binary could not be spawned, in dispatch order (#216). The
+    /// pause lasts until the daemon restarts; empty when every worker can start. Defaulted so a
+    /// client still reads a daemon from before this field existed.
+    #[serde(default)]
+    pub missing_binaries: Vec<MissingBinary>,
+}
+
+/// A worker that cannot start, published so `status` says which binary is missing rather than
+/// showing that worker as idle (#216). Unlike [`RateLimitPause`], nothing here lifts the pause:
+/// the binary is not re-resolved while the daemon runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingBinary {
+    pub worker: String,
+    /// The path the worker was spawned with.
+    pub binary: String,
 }
 
 /// The pause list plus the pre-#119 singleton. Without the singleton an older client reads no
@@ -277,5 +292,14 @@ mod tests {
         );
         let read: Snapshot = serde_json::from_value(old).unwrap();
         assert_eq!(read.rate_limit_pauses, vec![pause("")], "an older daemon's pause is read");
+    }
+
+    /// A client newer than the daemon must not refuse a snapshot that predates the field (#216).
+    #[test]
+    fn a_snapshot_without_missing_binaries_reads_as_no_worker_paused_for_that() {
+        let mut old = serde_json::to_value(Snapshot::default()).unwrap();
+        old.as_object_mut().unwrap().remove("missing_binaries");
+        let read: Snapshot = serde_json::from_value(old).unwrap();
+        assert!(read.missing_binaries.is_empty());
     }
 }

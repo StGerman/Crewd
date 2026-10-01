@@ -128,7 +128,16 @@ struct Running {
     verdicts: Vec<ReviewVerdict>,
     /// The delivery hand-back this run was dispatched to answer, kept so a gate that sends the
     /// run back can queue it again rather than delivery charging a second round for it (#160).
+    /// Also what a spawn that never started puts back: `launch` had already taken it (#216).
     handed_back: Option<Feedback>,
+    /// Issue-level feedback `launch` took for this run — a queued conflict or gate brief, or
+    /// the retry reason when that was the prompt's only item. Put back if the process never
+    /// started, because nothing read it (#216).
+    queued_feedback: Option<Feedback>,
+    /// This run named a new session the CLI has never created. A spawn that fails before the
+    /// process exists must drop that id: the next attempt would `--resume` a conversation that
+    /// does not exist. A resumed session is one the CLI already has, and stays (#216).
+    fresh_session: bool,
     /// This run's authority to write to the tracker, held for exactly as long as the run is in
     /// the `running` map. Never read — dropping it is the point. Every path that ends a run
     /// removes the entry, so every path revokes the token and deletes the config file without
@@ -146,7 +155,7 @@ struct Gating {
     started: Mono,
 }
 
-pub use libcrew::{RateLimitPause, Row, Snapshot};
+pub use libcrew::{MissingBinary, RateLimitPause, Row, Snapshot};
 
 pub struct Scheduler {
     pub cfg: Config,
@@ -198,6 +207,10 @@ pub struct Scheduler {
     /// that run still charges no attempt, the same as the one that set the pause in the first
     /// place (#37).
     rate_limit_pauses: HashMap<String, RateLimitPause>,
+    /// Keyed by worker name: the binary a spawn failed to exec (`agent_not_found`). Never
+    /// cleared and never re-resolved — the pause lasts until this process exits, and a restart
+    /// is what looks for the binary again (#216, #218).
+    missing_binaries: HashMap<String, String>,
     /// Set when a `prepare` in this tick's dispatch could not fetch the base, and read by both
     /// dispatch loops to stop there: every later `prepare` would wait out the same bounded
     /// fetch against the same remote, a minute each, and a tick has to end (review on #194).
@@ -248,6 +261,7 @@ impl Scheduler {
             recovered: false,
             last_parked_sweep: None,
             rate_limit_pauses: HashMap::new(),
+            missing_binaries: HashMap::new(),
             base_unreachable: false,
             ticks: 0,
             last_error: None,
@@ -329,10 +343,10 @@ impl Scheduler {
         self.sweep_parked()?;
 
         // Checked after the housekeeping above and before the two dispatch steps it guards:
-        // reclaiming a closed parked issue's workspace has nothing to do with the account being
-        // throttled, but starting a new agent does (#37). Only when every worker is paused;
+        // reclaiming a closed parked issue's workspace has nothing to do with a worker being
+        // paused, but starting a new agent does (#37, #216). Only when every worker is paused;
         // otherwise `pick_worker` skips the paused ones and the rest keep dispatching (#119).
-        if self.all_rate_limited() {
+        if self.all_paused() {
             self.publish()?;
             return Ok(());
         }
@@ -478,6 +492,15 @@ impl Scheduler {
                 }
             }
 
+            // A binary that cannot be found is the worker's failure, not this issue's: the
+            // same release as a rate limit, and a pause that lasts until restart (#216).
+            // Only `ErrorKind::NotFound` is classified this way; a permission or resource
+            // error stays on the ordinary path below. `model_not_found` does too.
+            if matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }) {
+                self.pause_for_missing_binary(&issue_id, &r)?;
+                continue;
+            }
+
             if outcome == Outcome::Done {
                 // Now, and not when delivery applies them: the gate below rebases the branch,
                 // and a rebase rewrites the very shas these verdicts name. Checked against the
@@ -553,6 +576,61 @@ impl Scheduler {
             "account-wide rate limit; pausing this worker's dispatch until it resets"
         );
         self.pause_worker(&r.worker, kind, resets_at_ms);
+        Ok(())
+    }
+
+    /// The worker's binary could not be spawned. The claim is released uncharged
+    /// (`Store::release_for_rate_limit`), and dispatch to this worker stays paused for the
+    /// rest of the process: the path is not looked up again on a later tick (#216).
+    ///
+    /// `launch` has already taken this run's feedback and named its session. Nothing read
+    /// either: the feedback goes back, and a session minted for this spawn is dropped. A
+    /// session the run was resuming is one the CLI already has, and stays.
+    fn pause_for_missing_binary(&mut self, issue_id: &str, r: &Running) -> anyhow::Result<()> {
+        let p = r.handle.progress();
+        self.store.finish_run(
+            self.clock.as_ref(),
+            &r.run_id,
+            "agent_not_found",
+            p.turns,
+            p.tokens,
+        )?;
+        self.store.add_turns(issue_id, p.turns)?;
+        // A sync brief is absent here: the next `sync_before_run` writes it again.
+        if let Some(fb) = &r.queued_feedback {
+            self.store.set_pending_feedback(
+                self.clock.as_ref(),
+                issue_id,
+                &serde_json::to_string(fb)?,
+            )?;
+        }
+        if let Some(fb) = &r.handed_back {
+            self.store.requeue_delivery_feedback(
+                self.clock.as_ref(),
+                issue_id,
+                &serde_json::to_string(fb)?,
+            )?;
+        }
+        if r.fresh_session {
+            // Minted for this spawn. The CLI never created the conversation, and a later
+            // `--resume` of it fails with no turns and charges a retry that did not need to happen.
+            self.store.set_session(self.clock.as_ref(), issue_id, None)?;
+        }
+        self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
+
+        let binary = self
+            .pool(&r.worker)
+            .and_then(|pool| pool.worker.bin())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::error!(
+            issue_id,
+            identifier = %r.issue.identifier,
+            worker = %r.worker,
+            %binary,
+            "worker binary cannot be spawned; pausing this worker's dispatch until restart"
+        );
+        self.missing_binaries.entry(r.worker.clone()).or_insert(binary);
         Ok(())
     }
 
@@ -1461,11 +1539,11 @@ impl Scheduler {
             }
 
             // `st.attempt`, not a literal 0. For a genuinely new issue these are the same,
-            // but a rate-limit pause releases the claim with the attempt preserved
-            // (`release_for_rate_limit`) and sends the issue back through here — so a hard 0
-            // would tell the worker and the transcript this is a first attempt while the store
-            // still says it is the Nth, which is exactly the disagreement the pause exists to
-            // avoid.
+            // but a rate-limit pause, and a worker whose binary cannot be spawned, release the
+            // claim with the attempt preserved (`release_for_rate_limit`) and send the issue
+            // back through here — so a hard 0 would tell the worker and the transcript this is
+            // a first attempt while the store still says it is the Nth, which is exactly the
+            // disagreement the pause exists to avoid.
             //
             // An issue holding a session — one a rate limit or a human's unblock sent back
             // through here — is pinned to its worker like a continuation, and skipped while
@@ -1656,6 +1734,15 @@ impl Scheduler {
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
             .and_then(|j| parse(j, "delivery"));
+        // Kept on the run, not only copied into the prompt: a spawn that never starts has to
+        // put these back, and the retry reason is only in the prompt when nothing else was.
+        let queued_feedback = match &queued {
+            Some(fb) => Some(fb.clone()),
+            None if synced.is_none() && delivery.is_none() => {
+                brief.map(|b| Feedback::Gate { output: b.to_string() })
+            }
+            None => None,
+        };
         let mut feedback: Vec<Feedback> =
             synced.into_iter().chain(queued).chain(delivery.clone()).collect();
         if feedback.is_empty()
@@ -1721,6 +1808,8 @@ impl Scheduler {
                 last_progress_at: now,
                 verdicts: Vec::new(),
                 handed_back: delivery,
+                queued_feedback,
+                fresh_session: matches!(session, crate::worker::Session::New(_)),
                 _broker: broker_session,
             },
         );
@@ -1831,6 +1920,7 @@ impl Scheduler {
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
             rate_limit_pauses: self.published_pauses(),
+            missing_binaries: self.published_missing(),
             rows,
         })
     }

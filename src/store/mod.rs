@@ -298,14 +298,14 @@ impl Store {
         Ok(())
     }
 
-    /// Release a claim exactly as an account-wide rate limit found it: `phase` back to
+    /// Release a claim whose failure belongs to the worker, not the issue: `phase` back to
     /// `released`, but `attempt`, `consecutive_fail` and `last_fail_class` all left alone.
     ///
     /// [`Store::release`] zeroes those columns, which is right after a `Done` or `Blocked`
-    /// verdict but wrong here — the run this interrupted did not fail on its own account, so
-    /// the next attempt must not look like a fresh start (#37). No retry row to clear either:
-    /// this is only ever called on an issue the claim just found `running`, which cannot also
-    /// hold one.
+    /// verdict but wrong here — an account-wide rate limit (#37) and a binary that cannot be
+    /// spawned (#216) did not fail on the issue's account, so the next attempt must not look
+    /// like a fresh start. No retry row to clear either: this is only ever called on an issue
+    /// the claim just found `running`, which cannot also hold one.
     pub fn release_for_rate_limit(
         &self,
         clock: &dyn Clock,

@@ -319,6 +319,10 @@ impl RunHandle for ClaudeRun {
 }
 
 impl Worker for ClaudeWorker {
+    fn bin(&self) -> Option<PathBuf> {
+        Some(self.bin.clone())
+    }
+
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
         let Spawn {
             issue,
@@ -421,7 +425,7 @@ impl Worker for ClaudeWorker {
                 let state: SharedState = Arc::new((
                     Mutex::new(Inner {
                         outcome: Some(Outcome::Failed {
-                            class: ErrorClass::AgentNotFound,
+                            class: super::spawn_failure_class(&e),
                             msg: format!("spawning {}: {e}", self.bin.display()),
                         }),
                         reaped: true,
@@ -1620,6 +1624,28 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("crew_run_start"));
         assert!(text.contains("spawn failed"), "got: {text}");
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// The missing-binary pause lasts until restart (#216). A binary that is present but cannot
+    /// be executed — permission, not absence — must stay a per-run failure, or one `EACCES`
+    /// takes the worker out for the life of the process.
+    #[test]
+    fn a_binary_that_exists_but_cannot_be_executed_is_not_a_missing_binary() {
+        let ws = tmp_workspace("not-exec");
+        let bin = ws.join("claude");
+        std::fs::write(&bin, b"#!/bin/sh\necho hi\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let w = ClaudeWorker::new(&bin, vec![], 0);
+        let outcome = wait_for_finish(&w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session())));
+        assert!(
+            matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }),
+            "got {outcome:?}"
+        );
 
         std::fs::remove_dir_all(&ws).ok();
     }
