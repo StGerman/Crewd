@@ -1144,6 +1144,82 @@ mod tests {
         assert_eq!(w[0].2, json!({ "reviewers": ["alice"] }));
     }
 
+    /// GETT-174120: REST drops a bot reviewer and answers success, so a `[bot]` login goes
+    /// through GraphQL, spelled without the suffix `botLogins` does not take (#222).
+    #[test]
+    fn a_bot_reviewer_is_requested_through_graphql_by_its_bare_login() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "data": { "repository": { "pullRequest": { "id": "PR_node" } } } })));
+        http.push(ok(
+            json!({ "data": { "requestReviewsByLogin": { "pullRequest": { "id": "PR_node" } } } }),
+        ));
+        let f = forge(http);
+
+        f.request_review(7, "copilot-pull-request-reviewer[bot]").unwrap();
+
+        let w = f.http.writes();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().all(|(m, u, _)| m == "POST" && u == "https://api.github.com/graphql"));
+        assert_eq!(w[0].2["variables"]["number"], 7);
+        let mutation = &w[1].2;
+        assert!(mutation["query"].as_str().unwrap().contains("requestReviewsByLogin"));
+        assert!(mutation["query"].as_str().unwrap().contains("union: true"));
+        assert_eq!(mutation["variables"]["id"], "PR_node");
+        assert_eq!(mutation["variables"]["bots"], json!(["copilot-pull-request-reviewer"]));
+    }
+
+    /// A refusal GraphQL reports in a `200` is the operator's to see, not a request that took.
+    #[test]
+    fn a_bot_review_request_graphql_refuses_is_permanent() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "data": { "repository": { "pullRequest": { "id": "PR_node" } } } })));
+        http.push(ok(json!({ "errors": [{ "type": "FORBIDDEN", "message": "Resource not accessible by integration" }] })));
+        let err = forge(http).request_review(7, "copilot-pull-request-reviewer[bot]").unwrap_err();
+        assert!(
+            matches!(&err, ForgeError::Permanent(m) if m.contains("not accessible")),
+            "{err:?}"
+        );
+    }
+
+    /// GraphQL spells a bot without `[bot]`; the reviews endpoint, and the config, with it.
+    #[test]
+    fn review_requests_spell_a_bot_as_its_reviews_do() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "data": { "repository": { "pullRequest": {
+            "id": "PR_node",
+            "reviewRequests": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [
+                    { "requestedReviewer": { "__typename": "User", "login": "alice" } },
+                    { "requestedReviewer": { "__typename": "Bot", "login": "copilot-pull-request-reviewer" } },
+                    { "requestedReviewer": { "__typename": "Team", "slug": "core" } },
+                    { "requestedReviewer": null }
+                ]
+            }
+        } } } })));
+        let got = forge(http).review_requests(7).unwrap();
+        assert_eq!(got, vec!["alice", "copilot-pull-request-reviewer[bot]", "core"]);
+    }
+
+    #[test]
+    fn review_requests_read_every_page() {
+        let page = |login: &str, next: Option<&str>| {
+            ok(json!({ "data": { "repository": { "pullRequest": {
+                "id": "PR_node",
+                "reviewRequests": {
+                    "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+                    "nodes": [{ "requestedReviewer": { "__typename": "User", "login": login } }]
+                }
+            } } } }))
+        };
+        let http = FakeHttp::new();
+        http.push(page("alice", Some("c1")));
+        http.push(page("bob", None));
+        let f = forge(http);
+        assert_eq!(f.review_requests(7).unwrap(), vec!["alice", "bob"]);
+        assert_eq!(f.http.writes()[1].2["variables"]["after"], "c1");
+    }
+
     fn gh_check_run(
         name: &str,
         status: &str,

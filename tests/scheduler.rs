@@ -3929,6 +3929,161 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
     assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
 }
 
+const REVIEW_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+fn copilot_expected(c: &mut Config) {
+    c.delivery.reviewers = vec![COPILOT.into()];
+}
+
+/// #222: five pull requests crewd opened were called ready with green CI and no comments, because
+/// nobody had reviewed them at all. The review delivery requested is what it waits for.
+#[test]
+fn a_pull_request_with_no_review_yet_is_not_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    assert_eq!(forge.requested(pr), vec![COPILOT.to_string()], "requested and attached");
+
+    for _ in 0..5 {
+        h.clock.advance_ms(60_000);
+        h.sched.tick().unwrap();
+        assert_eq!(
+            delivery_of(&h, "iss-1").stage,
+            crew::store::DeliveryStage::Awaiting,
+            "green CI and no comments, but nobody has reviewed it"
+        );
+    }
+
+    forge.add_review(pr, COPILOT, "COMMENTED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+}
+
+/// #222: a review that never arrives is the operator's, with the reviewer named, and the pull
+/// request is never marked ready on the way there.
+#[test]
+fn a_pull_request_whose_review_never_arrives_is_handed_off_naming_the_reviewer() {
+    let (mut h, _forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS - 1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+
+    h.clock.advance_ms(2_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains(COPILOT), "names the reviewer: {why}");
+    assert!(why.contains(&FakeForge::head_after_publish(1)), "and the head: {why}");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(row.last_error.as_deref().is_some_and(|e| e.contains(COPILOT)), "{row:?}");
+}
+
+/// #222: only a review of the current head counts. A head someone else pushed onto a ready pull
+/// request is asked about again, and the approval of the head before it does not keep it ready.
+#[test]
+fn a_review_of_an_earlier_head_does_not_make_the_pull_request_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let requests = |forge: &FakeForge| {
+        forge.ops().iter().filter(|o| matches!(o, Op::RequestReview { .. })).count()
+    };
+    assert_eq!(requests(&forge), 1);
+
+    forge.push_head(pr, "sha-operator");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(requests(&forge), 2, "the new head is asked about: {:?}", forge.ops());
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the approval was of the head before"
+    );
+
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(requests(&forge), 2, "a reviewed head is not asked about again");
+}
+
+/// The review wait is the CI wait's shape (#105): a restart resumes it rather than forgiving it.
+#[test]
+fn a_restart_does_not_forgive_the_review_wait_already_spent() {
+    let dir = tmp_dir("review-wait-restart");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            copilot_expected,
+        );
+        run_once(&mut h);
+        h.clock.advance_ms(REVIEW_TIMEOUT_MS * 3 / 4);
+        h.sched.tick().unwrap();
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    }
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        copilot_expected,
+    );
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS * 3 / 4 + 5_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::HandedOff,
+        "the wait spent before the restart still counts"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #222: whether crew-bot may request Copilot at all is unknown until a live pull request asks,
+/// so a refusal has to reach the operator with the reviewer it was for.
+#[test]
+fn a_refused_review_request_is_handed_off_naming_the_reviewer() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    forge.refuse_review_requests(Some(ForgeError::Permanent(
+        "graphql: Resource not accessible by integration".into(),
+    )));
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains(COPILOT) && why.contains("not accessible"), "{why}");
+}
+
 #[test]
 fn each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and_is_not_re_argued()
 {

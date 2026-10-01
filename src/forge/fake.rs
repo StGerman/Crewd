@@ -91,6 +91,8 @@ struct Inner {
     fail_reply: Option<ForgeError>,
     /// Makes `resolve_threads` alone fail.
     fail_resolve: Option<ForgeError>,
+    /// Makes `request_review` alone fail: the credential refused the request outright.
+    fail_request: Option<ForgeError>,
     /// `(number, comment_id)` of every thread resolved.
     resolved: HashSet<(u64, String)>,
     ops: Vec<Op>,
@@ -230,6 +232,11 @@ impl FakeForge {
     /// Make only `resolve_threads` fail until cleared.
     pub fn fail_resolve_with(&self, e: Option<ForgeError>) {
         self.inner.lock().unwrap().fail_resolve = e;
+    }
+
+    /// Make only `request_review` fail until cleared.
+    pub fn refuse_review_requests(&self, e: Option<ForgeError>) {
+        self.inner.lock().unwrap().fail_request = e;
     }
 
     pub fn is_resolved(&self, number: u64, comment_id: &str) -> bool {
@@ -588,6 +595,9 @@ impl Forge for FakeForge {
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError> {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
+        if let Some(e) = &g.fail_request {
+            return Err(e.clone());
+        }
         g.ops.push(Op::RequestReview { number, reviewer: reviewer.into() });
         let attach = g.attach_reviewers;
         let rec = g
