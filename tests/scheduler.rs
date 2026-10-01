@@ -1456,6 +1456,39 @@ fn an_exhausted_account_pauses_its_worker_and_charges_the_issue_nothing() {
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "still paused an hour later");
 }
 
+/// A 402 after a turn cut short a run that did act on its brief and did create its session:
+/// neither is given back, unlike a run that never took a turn (#237).
+#[test]
+fn a_run_cut_short_by_an_exhausted_account_after_a_turn_keeps_its_session_and_brief() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script { turns: 2, ..account_exhausted() });
+    let clock = Arc::clone(&h.clock);
+    h.sched
+        .store()
+        .ensure(clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1"))
+        .unwrap();
+    let gate = Feedback::Gate { output: "conflict in CLAUDE.md".into() };
+    h.sched
+        .store()
+        .set_pending_feedback(clock.as_ref(), "iss-1", &serde_json::to_string(&gate).unwrap())
+        .unwrap();
+
+    h.sched.tick().unwrap();
+    let named = h.worker.sessions_for("iss-1")[0].id().to_string();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(!st.is_quarantined());
+    assert_eq!(st.session_id.as_deref(), Some(named.as_str()), "the CLI created this session");
+    assert_eq!(
+        h.sched.store().take_pending_feedback(clock.as_ref(), "iss-1").unwrap(),
+        None,
+        "the run acted on its brief; it is not queued twice"
+    );
+    assert_eq!(h.sched.snapshot().unwrap().halted_workers.len(), 1);
+}
+
 /// `status` has to say why an exhausted worker takes nothing, or it reads as idle (#237).
 #[test]
 fn the_snapshot_names_a_worker_paused_for_an_exhausted_account() {
