@@ -5152,3 +5152,140 @@ fn a_foreign_push_is_taken_in_before_delivery_pushes_again() {
     assert_ne!(d.stage, crew::store::DeliveryStage::HandedOff, "{:?}", d.handoff_reason);
     assert_eq!(forge.pr(number).unwrap().head_sha, FakeForge::head_after_publish(2));
 }
+
+/// Delivery runs before the first poll after a restart (#223).
+#[test]
+fn a_pull_request_opened_on_the_first_tick_after_a_restart_is_titled_after_its_issue_and_closes_it()
+{
+    let dir = tmp_dir("pr-spec-restart");
+    let db = dir.join("crew.db");
+    let github_issue = || Issue {
+        url: Some("https://github.com/StGerman/crewd/issues/99".into()),
+        ..issue(1, "In Progress", Some(1))
+    };
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![github_issue()],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+        run_once(&mut h);
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+    }
+    forge.fail_with(None);
+
+    let (mut h, _) = delivery_harness_with(
+        vec![github_issue()],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    // The new harness has its own workspace root; the worktree the push reads is still there.
+    std::fs::create_dir_all(DirWorkspace::new(&h.root).unwrap().path_for("iss-1", "MT-1")).unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "the first tick opens the pull request: {:?}", forge.ops());
+    let spec = forge.spec_of(prs[0].number).unwrap();
+    assert_eq!(spec.title, "MT-1: issue 1");
+    assert!(
+        spec.body.starts_with("Closes https://github.com/StGerman/crewd/issues/99\n"),
+        "{}",
+        spec.body
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of #223: an issue the tracker cannot read right now waits for a later poll
+/// rather than opening a pull request without its title and link.
+#[test]
+fn a_pull_request_waits_while_its_issue_cannot_be_read() {
+    let dir = tmp_dir("pr-spec-unread");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+        run_once(&mut h);
+    }
+    forge.fail_with(None);
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    std::fs::create_dir_all(DirWorkspace::new(&h.root).unwrap().path_for("iss-1", "MT-1")).unwrap();
+    h.tracker.fail_by_ids(Some(TrackerError::Request("tracker down".into())));
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert!(forge.open_prs().is_empty(), "no pull request without its issue: {:?}", forge.ops());
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+
+    h.tracker.fail_by_ids(None);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "{:?}", forge.ops());
+    assert_eq!(forge.spec_of(prs[0].number).unwrap().title, "MT-1: issue 1");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The empty-read half of #223: an issue the tracker omits waits rather than opening a pull
+/// request without its title and link, and delivers once it is returned again.
+#[test]
+fn a_pull_request_waits_while_the_tracker_omits_its_issue() {
+    let dir = tmp_dir("pr-spec-omitted");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+        run_once(&mut h);
+    }
+    forge.fail_with(None);
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    std::fs::create_dir_all(DirWorkspace::new(&h.root).unwrap().path_for("iss-1", "MT-1")).unwrap();
+    h.tracker.hide("iss-1");
+    for _ in 0..2 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+    assert!(forge.open_prs().is_empty(), "no pull request without its issue: {:?}", forge.ops());
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+
+    h.tracker.unhide("iss-1");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "{:?}", forge.ops());
+    assert_eq!(forge.spec_of(prs[0].number).unwrap().title, "MT-1: issue 1");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
