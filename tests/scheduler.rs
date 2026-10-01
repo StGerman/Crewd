@@ -1271,7 +1271,8 @@ fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
     assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "claude is paused and takes nothing more");
     assert_eq!(grok.sessions_for("iss-1").len(), 1, "grok takes the issue claude could not start");
     // A first spawn names a session the CLI never created, so there is no conversation to
-    // hand over and nothing was queued for the run that never started.
+    // hand over and nothing was queued for the run that never started. A resumed session
+    // still carries the missing-binary handoff; that case is the test below.
     assert!(matches!(&grok.sessions_for("iss-1")[0], Session::New(_)));
     assert!(
         grok.feedback_for("iss-1")[0].is_empty(),
