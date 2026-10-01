@@ -108,10 +108,11 @@ issue.
 
 **crewd.** `ErrorClass` ([src/model.rs](../src/model.rs)) partitions every failure the
 scheduler can see, and `ErrorClass::retryable()` is an exhaustive `match`, so a new class does
-not compile until it is placed on one side. A non-retryable class (`TemplateRender`,
-`ConfigInvalid`, `ModelNotFound`, `WorkspaceOutsideRoot`, `AuthFailed` and the rest) quarantines
-the issue on its first occurrence, with no retry row. It stays out of rotation until an operator
-clears it.
+not compile until it is placed on one side. A non-retryable class such as `TemplateRender`,
+`ConfigInvalid`, `ModelNotFound`, `WorkspaceOutsideRoot` or `AuthFailed` quarantines the issue
+on its first occurrence, with no retry row, and it stays out of rotation until an operator
+clears it. A failure that disables a whole worker rather than one issue, a missing binary or an
+exhausted account, pauses that worker instead and charges the issue nothing.
 
 **Invariant:** "Permanent failures stop". **Guard test:**
 `a_permanent_failure_quarantines_immediately_rather_than_retrying_forever`
