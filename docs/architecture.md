@@ -603,9 +603,9 @@ resets — not for a new run and not for a new pull request — because a review
 on every push, answered by an agent that pushes, is a loop with no bound of its own, and one
 that reset with the pull request would bound nothing (the same gap `max_calls_per_issue`
 closes for the broker). At either bound the pull request is handed to the operator with the
-outstanding items named. A review request is followed by a read of the pull request and its
-reviews, because GitHub answers a request for a bot reviewer with `200` and attaches nobody
-(GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
+outstanding items named. A review request is followed by a read of the outstanding review
+requests (`Forge::review_requests`, GraphQL `reviewRequests` on GitHub) and the reviews, because
+GitHub answers a REST request for a bot reviewer with `200` and attaches nobody (GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
 issue's row, not a success. `Forge` has no `merge` method, and must not grow one — merging is
 the operator's, and the trait's shape is what enforces it. And a delivery step only runs for an
 issue nothing else owns (phase `released`, no live run), so a push cannot land under a running

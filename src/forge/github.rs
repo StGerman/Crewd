@@ -691,9 +691,16 @@ impl<H: Http> Forge for GithubForge<H> {
                     .filter_map(|n| n.requested_reviewer)
                     .filter_map(|r| r.login()),
             );
-            match page.page_info.end_cursor {
-                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
-                _ => return Ok(logins),
+            // A next page with no cursor to reach it is an incomplete list, and a reviewer on
+            // that page would read as attaching nobody.
+            match (page.page_info.has_next_page, page.page_info.end_cursor) {
+                (false, _) => return Ok(logins),
+                (true, Some(cursor)) => after = Some(cursor),
+                (true, None) => {
+                    return Err(ForgeError::Permanent(format!(
+                        "graphql: review requests on #{number} report a next page and no cursor"
+                    )));
+                }
             }
         }
     }
@@ -1199,6 +1206,19 @@ mod tests {
         } } } })));
         let got = forge(http).review_requests(7).unwrap();
         assert_eq!(got, vec!["alice", "copilot-pull-request-reviewer[bot]", "core"]);
+    }
+
+    #[test]
+    fn review_requests_with_a_next_page_and_no_cursor_fail_rather_than_return_a_prefix() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "data": { "repository": { "pullRequest": {
+            "id": "PR_node",
+            "reviewRequests": {
+                "pageInfo": { "hasNextPage": true, "endCursor": null },
+                "nodes": [{ "requestedReviewer": { "__typename": "User", "login": "alice" } }]
+            }
+        } } } })));
+        assert!(forge(http).review_requests(7).is_err());
     }
 
     #[test]
