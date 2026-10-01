@@ -307,7 +307,8 @@ binary went missing while the daemon was running, and treating it as the issue's
 failure quarantines a ticket nothing is wrong with. `harvest_finished` releases that claim with
 `Store::release_for_rate_limit` and pauses only that worker. The pause is not lifted on a later
 tick and the binary is not re-resolved; a restart is what #218's startup check is for.
-`Snapshot::missing_binaries` names the worker and the path, beside
+`Snapshot::halted_workers` (on the wire, still `missing_binaries`) names the worker, the path
+and the reason, beside
 `rate_limit_pauses`, so `status` reads "grok paused: binary not found (/path/to/grok)" rather
 than an idle worker. `model_not_found` stays on the ordinary per-run path. Only
 `ErrorKind::NotFound` is classified `agent_not_found`: a permission or resource error on spawn
@@ -316,6 +317,13 @@ gone. A `Session::New` written before the failed spawn is cleared — the CLI ne
 conversation — and a session the run was resuming is kept. Feedback `launch` had already taken
 is put back for the next run. A sync brief is left for the next `sync_before_run`, which
 writes it again.
+
+A Grok `error` event reporting HTTP 402 is the same pause for an account with no balance
+(#237): `ErrorClass::AccountExhausted`, released uncharged, that worker halted until restart
+with reason `account_exhausted`. There is no reset time to wait for, and the balance is not
+probed while running: a restart is the operator saying it was topped up. The session and the
+feedback are given back only when the run took no turn; a run the 402 cut short later keeps
+both, and the handoff carries where it stopped.
 
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it

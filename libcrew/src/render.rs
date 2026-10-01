@@ -15,7 +15,7 @@
 //! looks its best in a wide window.
 
 use crate::fmt::{fmt_count, fmt_ms, timestamp};
-use crate::{Phase, Row, RunRecord, Snapshot, TokenUsage};
+use crate::{HaltReason, Phase, Row, RunRecord, Snapshot, TokenUsage};
 
 /// What a missing value prints as, everywhere. The same mark the dashboard's table uses, and
 /// never `0` — an unreported cost is unknown, not free.
@@ -39,8 +39,8 @@ pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
     out.push('\n');
 
     // Named so an idle daemon reads as waiting on something an operator can act on — a limit
-    // (#37) or a worker whose binary cannot be spawned (#216) — rather than as broken with no
-    // explanation. Its own line, ahead of the tick line: an operator deciding whether to restart
+    // (#37), a worker whose binary cannot be spawned (#216) or whose account is out of balance
+    // (#237) — rather than as broken with no explanation. Its own line, ahead of the tick line: an operator deciding whether to restart
     // needs this before anything else here. One line per worker, because a pause on one leaves
     // the others dispatching (#119).
     for p in &snap.rate_limit_pauses {
@@ -51,11 +51,12 @@ pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
             timestamp(p.resets_at)
         ));
     }
-    for m in &snap.missing_binaries {
-        out.push_str(&format!(
-            "{} paused: binary not found ({}); dispatch stays paused until restart\n",
-            m.worker, m.binary
-        ));
+    for h in &snap.halted_workers {
+        let why = match h.reason {
+            HaltReason::BinaryNotFound => format!("binary not found ({})", h.binary),
+            HaltReason::AccountExhausted => "account balance exhausted".to_string(),
+        };
+        out.push_str(&format!("{} paused: {why}; dispatch stays paused until restart\n", h.worker));
     }
 
     out.push_str(&format!("tick {}", snap.ticks));
@@ -340,7 +341,7 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MissingBinary, RateLimitPause};
+    use crate::{HaltedWorker, RateLimitPause};
 
     /// The whole point of a transcript is that it is readable after the run is over, so the
     /// surface an operator actually types has to name it — a path that only reaches `--json`
@@ -399,7 +400,7 @@ mod tests {
             rows: vec![row("MT-601", Phase::Running)],
             last_error: None,
             rate_limit_pauses: vec![],
-            missing_binaries: vec![],
+            halted_workers: vec![],
         };
 
         let out = snapshot(&snap, "127.0.0.1:8787");
@@ -433,9 +434,25 @@ mod tests {
     #[test]
     fn a_missing_binary_names_the_worker_and_the_path() {
         let snap = Snapshot {
-            missing_binaries: vec![MissingBinary {
+            halted_workers: vec![HaltedWorker {
                 worker: "grok".into(),
                 binary: "/no/such/grok".into(),
+                reason: HaltReason::BinaryNotFound,
+            }],
+            ..Default::default()
+        };
+        insta::assert_snapshot!(snapshot(&snap, "x"));
+    }
+
+    /// #237: a worker out of balance takes nothing until restart, and `status` has to say that
+    /// is the account, not the binary, or the operator reinstalls instead of topping up.
+    #[test]
+    fn an_exhausted_account_names_the_worker_and_the_reason() {
+        let snap = Snapshot {
+            halted_workers: vec![HaltedWorker {
+                worker: "grok".into(),
+                binary: "grok".into(),
+                reason: HaltReason::AccountExhausted,
             }],
             ..Default::default()
         };

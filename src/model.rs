@@ -99,6 +99,10 @@ pub enum ErrorClass {
     ModelNotFound,
     WorkspaceOutsideRoot,
     AuthFailed,
+    /// The provider refused the account with HTTP 402 (#237). Never charged to the issue: the
+    /// scheduler pauses the worker until restart, as for `AgentNotFound`. Permanent so that, if it
+    /// ever reached the per-issue path, every retry would not pay for the same refusal.
+    AccountExhausted,
 }
 
 impl ErrorClass {
@@ -118,7 +122,8 @@ impl ErrorClass {
             | ErrorClass::AgentNotFound
             | ErrorClass::ModelNotFound
             | ErrorClass::WorkspaceOutsideRoot
-            | ErrorClass::AuthFailed => false,
+            | ErrorClass::AuthFailed
+            | ErrorClass::AccountExhausted => false,
         }
     }
 
@@ -137,6 +142,7 @@ impl ErrorClass {
             ErrorClass::ModelNotFound => "model_not_found",
             ErrorClass::WorkspaceOutsideRoot => "workspace_outside_root",
             ErrorClass::AuthFailed => "auth_failed",
+            ErrorClass::AccountExhausted => "account_exhausted",
         }
     }
 
@@ -155,6 +161,7 @@ impl ErrorClass {
             "model_not_found" => ErrorClass::ModelNotFound,
             "workspace_outside_root" => ErrorClass::WorkspaceOutsideRoot,
             "auth_failed" => ErrorClass::AuthFailed,
+            "account_exhausted" => ErrorClass::AccountExhausted,
             _ => return None,
         })
     }
