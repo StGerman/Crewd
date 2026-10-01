@@ -87,11 +87,12 @@ this file.
   per-branch head on #174 did (#190). Check: review; a case is never skipped for one backend.
 - **MUST** move time through `FakeClock` in scheduler and API tests. `std::thread::sleep` and
   `Instant::now` are allowed only in the tests that drive a real child process or a real
-  socket, in [src/worker/claude.rs](../src/worker/claude.rs) and
-  [src/broker/server.rs](../src/broker/server.rs). Why: a test that waits on the wall clock is
+  socket, in [src/worker/claude.rs](../src/worker/claude.rs),
+  [src/broker/server.rs](../src/broker/server.rs) and
+  [tests/lifecycle.rs](../tests/lifecycle.rs). Why: a test that waits on the wall clock is
   a test that flakes on a slow runner. Check: `clippy::disallowed_methods` on
   `std::thread::sleep`, `std::time::Instant::now` and `std::time::SystemTime::now` in
-  `clippy.toml`, with `#[allow]` in the two named files and in `src/clock.rs`.
+  `clippy.toml`, with `#[allow]` in those files and in `src/clock.rs`.
   `Not yet enforced: #52`.
 - **MUST** pair every row in the invariant table (`docs/invariants.md`) with a named guard test. A change
   that weakens a mechanism must first make its guard test fail. Why: several guard tests fail
