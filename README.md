@@ -117,6 +117,24 @@ cargo run -p crewctl -- status
 Steps 4 and 5 are separate switches on purpose. Turning this from "watch my backlog" into
 "work my backlog" should be a decision you make twice.
 
+### Running it as a service
+
+Once a config does what you want, let launchd (macOS) or systemd (Linux) run it rather than a
+terminal:
+
+```bash
+cargo install --path .
+crewd service install --config ~/.crewd/acme-api/crewd.toml
+```
+
+The service starts at login, restarts after a crash, and stays down after a clean shutdown. It
+runs in the config's directory, which names it (`dev.crewd.acme-api`), so two deployments on
+one host do not collide. Your shell's `PATH` and `SSL_CERT_FILE` are copied into it, because
+neither service manager reads your shell; reinstall after changing them. The install prints
+where the logs go: `crewd.log` beside the config on macOS, the user journal on Linux, where it
+also tells you if `loginctl enable-linger` is needed to keep the service up after you log out.
+`crewd service uninstall --config <same path>` removes it.
+
 ### Using Jira
 
 `tracker.kind = "jira"` polls a Jira Cloud project instead of GitHub Issues: Jira Cloud only,

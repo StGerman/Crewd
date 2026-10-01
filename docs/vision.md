@@ -24,7 +24,7 @@ closes it; milestones are worked in `M<n>` order.
 | A pluggable runtime (runc) | The `Worker` trait: Claude Code, Grok |
 | A versioned API a higher layer drives (CRI) | The ops API at `/api/v1`. **Not yet:** a promise of what v1 keeps stable ([#245]), in [M7] |
 | Sandboxing | **Not yet** ([#135], in [M8]). Agents run as you |
-| Packaged, started by the init system | **Not yet** ([#90], in [M7]). Built from source, run by hand |
+| Packaged, started by the init system | `crewd service install`: a launchd or systemd `--user` service that starts at login and restarts after a crash. **Not yet:** packaged ([#90], in [M7]); built from source |
 | Drain and restart | **Not yet** ([#107], in [M11]) |
 
 One row has no counterpart. A service manager believes a process's exit status; crewd does not

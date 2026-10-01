@@ -195,9 +195,11 @@ this file.
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
 | `rustls` (dev) | The TLS listener the CA-bundle test (#150) serves a real handshake from | Already in the tree under `ureq`; `default-features = false` with only the `ring` and `std` features, never `aws-lc-rs`, which needs a C toolchain |
 | `rustls-pki-types` | PEM parsing of the GitHub App private key | Already in the tree under `rustls` |
+| `plist` | The launchd plist `crewd service install` writes (#246) | Already in the tree under `service-manager` |
 | `serde`, `serde_json` | Config, `stream-json`, MCP framing, GitHub payloads | |
 | `thiserror` | Typed errors in library modules | |
 | `time` | RFC 3339 parsing of GitHub timestamps, and Jira's colonless-offset timestamps (e.g. `+0300`, #99) | The only date parsing in the crate |
+| `service-manager` (no default features) | Installing, starting and removing the per-user launchd agent or systemd unit in `src/service.rs` (#246) | Its `ServiceManager` trait is the seam the tests fake |
 | `tokio` | Ops API listener, `watch`/`mpsc`/`oneshot` channels, the main loop, signals | Not used by the domain traits |
 | `toml` | Config file | |
 | `tracing`, `tracing-subscriber` | Logs, always to stderr | stdout belongs to the TUI |
@@ -208,6 +210,15 @@ the key GitHub hands back to read the new App as itself. The first two were alre
 the tree by `ureq`'s TLS, so they add nothing to the build; `jsonwebtoken` was the alternative, and
 its crypto backends would add a second RSA implementation for one signature. #64 adds the same
 three for the same reason, and whichever lands second keeps one JWT signer.
+
+`service-manager` and `plist` arrived with `crewd service install` (#246). The crate replaces
+writing a launchd plist and a systemd unit by hand and driving `launchctl` and `systemctl`
+directly, which is a second copy of each manager's load, enable and remove quirks; Homebrew's
+`service do` block was the alternative, and it covers neither a crates.io nor a tarball install.
+Its `encoding` default only decodes Windows command output and is off. It adds `plist`,
+`xml-rs`, `quick-xml`, `which` and `dirs` to the tree. `plist` is named directly because the
+crate's own plist has no `StandardOutPath`, so the agent's definition is written here and
+passed through the crate's `contents` override.
 
 ### Approved to add
 

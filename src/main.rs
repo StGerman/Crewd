@@ -34,6 +34,7 @@ use crew::http::UreqHttp;
 use crew::init;
 use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use crew::sched::{Scheduler, Snapshot, WorkerPool};
+use crew::service;
 use crew::store::{Store, StoreLock};
 use crew::tracker::Tracker;
 use crew::tracker::fake::FakeTracker;
@@ -96,6 +97,29 @@ enum Cmd {
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
     },
+    /// Run one deployment as a per-user service (launchd on macOS, systemd `--user` on Linux)
+    /// that starts at login and restarts after a crash.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCmd {
+    /// Write the service definition for the deployment this config sits in, then load and
+    /// start it. The config must load; the service runs in its directory.
+    Install {
+        /// The deployment's config. Its directory names the service and is its working
+        /// directory.
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Stop and remove the service for the deployment this config sits in.
+    Uninstall {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -115,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
     // not need one to exist.
     if let Some(Cmd::Init { app_name, org, dir }) = args.command {
         return tokio::task::spawn_blocking(move || run_init(app_name, org, dir)).await?;
+    }
+    if let Some(Cmd::Service { action }) = args.command {
+        return tokio::task::spawn_blocking(move || run_service(action)).await?;
     }
 
     let cfg = Config::load(&args.config)
@@ -717,6 +744,55 @@ fn run_init(
         registered.settings.display(),
         registered.settings.display(),
     );
+    Ok(())
+}
+
+fn run_service(action: ServiceCmd) -> anyhow::Result<()> {
+    let platform = service::Platform::native()?;
+    let manager = platform.manager();
+    let host = service::Host::from_env().context("reading the installing environment")?;
+    match action {
+        ServiceCmd::Install { config } => {
+            let done = service::install(manager.as_ref(), &config, &host, platform)?;
+            let plan = &done.plan;
+            let argv: Vec<_> = std::iter::once(plan.program.as_os_str())
+                .chain(plan.args.iter().map(|a| a.as_os_str()))
+                .map(|a| a.to_string_lossy())
+                .collect();
+            let env: Vec<_> = plan.environment.iter().map(|(k, _)| k.as_str()).collect();
+            println!(
+                "Installed and started {}.\n  definition: {}\n  runs:       {}\n  in:         {}\n  \
+                 captured:   {} (from this shell; reinstall after changing them)\n  logs:       {}\n\n\
+                 It starts at login and restarts after a crash; a clean shutdown stays down.\n\
+                 A worker binary the captured PATH cannot resolve stops the daemon at startup, \
+                 naming it, in the logs above.",
+                plan.deployment.label,
+                done.definition.display(),
+                argv.join(" "),
+                plan.deployment.dir.display(),
+                env.join(", "),
+                plan.logs(),
+            );
+            if platform == service::Platform::Systemd
+                && let Some(advice) = service::linger_advice()
+            {
+                println!("\n{advice}");
+            }
+        }
+        ServiceCmd::Uninstall { config } => {
+            match service::uninstall(manager.as_ref(), &config, &host, platform)? {
+                service::Uninstalled::Removed { label, definition } => {
+                    println!("Stopped and removed {label} ({}).", definition.display());
+                }
+                service::Uninstalled::NeverInstalled { label, definition } => {
+                    println!(
+                        "{label} is not installed ({} does not exist); nothing to do.",
+                        definition.display()
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
