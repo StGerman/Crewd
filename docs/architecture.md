@@ -557,7 +557,7 @@ before; delivery is then a row in the store advanced on the tick — after recon
 before the dispatch gate, at `delivery.poll_interval_ms` — through: push the branch
 (`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
 request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
-reviewers *and read back whether they attached*, read CI, read the review threads — and the
+reviewers on the current head *and read back whether they attached*, read CI, read the review threads — and the
 reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
 current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
 `CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" and Copilot's template
@@ -572,6 +572,14 @@ due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 A pull request the provider reports unable to merge is not waited on at all, since GitHub runs no
 CI on it: delivery charges a round and re-gates the branch as if its `Done` were new, so the
 gate's rebase or merge and its conflict rule decide what follows (#159).
+A pull request is ready only once each of `delivery.reviewers` has reviewed its current head
+(#222): green CI and no open comment say nothing about one nobody has looked at, and GitHub's
+automatic Copilot review never runs on a pull request the app opens. A head the last request
+was not made on is requested again, a `[bot]` login through GraphQL `requestReviewsByLogin`
+and verified through `reviewRequests`, since REST drops a bot and answers success
+(GETT-174120). A review that has not arrived within `delivery.review_timeout_ms` is handed off
+naming the reviewer, timed like the CI wait: on `Mono`, resumed across a restart from the
+wall-clock start on the row.
 The handoff gate's failing output travels the same way, as `Feedback::Gate`: `launch` builds one
 `Feedback` from delivery's structured row when there is one and from the retry reason otherwise,
 so `Worker::spawn` has a single parameter for the question and `feedback_help` in the worker is

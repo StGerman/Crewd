@@ -160,17 +160,16 @@ timeout_ms = 1800000
 # reason `max_calls_per_run` alone bounds no broker. At either bound the pull request goes to
 # the operator with the outstanding items named.
 #
-# `reviewers` is empty on purpose. This repository has automatic Copilot review on, and its
-# comments are read and worked whether or not anyone requested them. Requesting Copilot over
-# REST is the case GETT-174120 describes — the provider says yes and attaches nobody — and the
-# verification that follows every request would then hand off every pull request at once, before
-# the automatic review has had its minute to post. Name a human login here to have a review
-# requested and verified; leave it empty to rely on what the repository already does.
+# `reviewers` are requested on every head delivery pushes and waited for: a pull request is
+# ready only once each has reviewed its current head (#222). The repository's automatic Copilot
+# review never runs on a pull request the app opens, so delivery requests Copilot itself — a
+# `[bot]` login through GraphQL, since REST drops a bot and answers success (GETT-174120) — and
+# a request that attaches nobody, or is refused, is handed off naming the reviewer.
 [delivery]
 enabled = true
 base = "master"
 remote = "origin"
-reviewers = []
+reviewers = ["copilot-pull-request-reviewer[bot]"]
 # Whose `COMMENTED` review summaries are read for findings as well as their inline comments; a
 # `CHANGES_REQUESTED` summary is read whoever wrote it. The default, spelled out (#126).
 summary_reviewers = ["copilot-pull-request-reviewer[bot]"]
@@ -180,3 +179,6 @@ max_rounds_per_issue = 6
 poll_interval_ms = 120000
 # A head CI never reports on is handed off after this long rather than waited on forever.
 ci_timeout_ms = 3600000
+# A requested review that has not arrived on the current head after this long is handed off
+# naming the reviewer, never called ready. Copilot usually answers in two to five minutes.
+review_timeout_ms = 1800000
