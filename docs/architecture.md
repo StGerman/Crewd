@@ -448,7 +448,9 @@ because the `POST` routes control agent execution. The address is validated once
 rather than in `Config::preflight`, which runs before every dispatch: `api::bind` parses and
 binds it before anything else is opened, only when the API is on, and any failure there, a
 taken port included, exits crewd naming the address (#218). A daemon scheduling with no ops API
-looks healthy and cannot be queried or unquarantined. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
+looks healthy and cannot be queried or unquarantined. What `/api/v1` keeps stable, field by
+field, and the rule that a breaking change opens `/api/v2` instead, is [api-v1.md](api-v1.md) (#245).
+The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
 which is what keeps a hung client off the tick: the scheduler answers into a channel whose
 receiver may already be gone and never waits to find out. The HTTP is hand-rolled (~200 lines,
 no keep-alive, one response type) for the same reason the rest of this crate is small; the

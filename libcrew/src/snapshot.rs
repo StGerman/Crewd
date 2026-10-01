@@ -316,6 +316,181 @@ mod tests {
         assert!(read.halted_workers.is_empty());
     }
 
+    /// Every field set: each `Option` is `Some` and each list holds one entry, so the walk below
+    /// reaches every key path a v1 client can read. `fully_populated_leaves_no_path_unpinned`
+    /// refuses a `null` or an empty list, which is how a new field left at its default fails here
+    /// instead of slipping past the shape snapshot.
+    fn fully_populated() -> Snapshot {
+        let run = RunRecord {
+            run_id: "r".into(),
+            issue_id: "i".into(),
+            started_at: 1,
+            ended_at: Some(2),
+            outcome: Some("done".into()),
+            session_id: Some("s".into()),
+            turns: 3,
+            in_tok: Some(4),
+            out_tok: Some(5),
+            transcript: Some("t.jsonl".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            worker: Some("claude".into()),
+        };
+        let row = Row {
+            issue_id: "i".into(),
+            identifier: "#1".into(),
+            title: "t".into(),
+            url: Some("u".into()),
+            tracker_state: "open".into(),
+            phase: Phase::Running,
+            attempt: 1,
+            turns: 2,
+            tokens: Some(TokenUsage { input: 1, output: 2 }),
+            age_ms: 3,
+            retry_in_ms: Some(4),
+            holds_slot: true,
+            quarantined: false,
+            last_error: Some("e".into()),
+            last_event: Some("ev".into()),
+            workspace: Some("w".into()),
+            branch: Some("b".into()),
+            runs: vec![run],
+            transcript: Some("t.jsonl".into()),
+            delivery: Some(DeliveryView {
+                stage: "awaiting".into(),
+                pr_number: Some(1),
+                pr_url: Some("p".into()),
+                base: Some("master".into()),
+                rounds_pr: 1,
+                rounds_issue: 2,
+                review_error: Some("r".into()),
+                handoff_reason: Some("h".into()),
+            }),
+            worker: Some("claude".into()),
+        };
+        Snapshot {
+            generated_at: 1,
+            rows: vec![row],
+            running: 1,
+            reserved: 1,
+            limit: 2,
+            retrying: 0,
+            quarantined: 0,
+            tokens: TokenUsage { input: 1, output: 2 },
+            uncounted_runs: 0,
+            ticks: 1,
+            last_tick_at: Some(1),
+            last_error: Some("e".into()),
+            rate_limit_pauses: vec![pause("claude")],
+            halted_workers: vec![HaltedWorker {
+                worker: "grok".into(),
+                binary: "/bin/grok".into(),
+                reason: HaltReason::AccountExhausted,
+            }],
+        }
+    }
+
+    /// One line per key path, `path: type`, sorted; a list's element is the path plus `[]`.
+    fn shape(path: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+        use serde_json::Value;
+        let ty = match v {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(n) if n.is_f64() => "float",
+            Value::Number(_) => "integer",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        if !path.is_empty() {
+            out.push(format!("{path}: {ty}"));
+        }
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                    shape(&p, child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    shape(&format!("{path}[]"), item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot_shape() -> Vec<String> {
+        let mut out = Vec::new();
+        shape("", &serde_json::to_value(fully_populated()).unwrap(), &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The v1 promise (docs/api-v1.md, #245): `/api/v1/snapshot` and `/api/v1/issues/:id` only
+    /// grow. Renaming or removing a field, or changing its JSON type, rewrites a line here, and
+    /// that diff is the review question "does this need `/api/v2`?". A new field adds a line,
+    /// which is allowed only with `#[serde(default)]` and a row in docs/api-v1.md. The enum
+    /// spellings are pinned too, because a client matches on them.
+    #[test]
+    fn the_v1_snapshot_shape_only_grows() {
+        let mut lines = snapshot_shape();
+        let phases = [
+            Phase::Queued,
+            Phase::Running,
+            Phase::RetryQueued,
+            Phase::Quarantined,
+            Phase::Released,
+        ];
+        for p in phases {
+            lines.push(format!("enum phase: {}", serde_json::to_value(p).unwrap()));
+        }
+        for r in [HaltReason::BinaryNotFound, HaltReason::AccountExhausted] {
+            lines.push(format!("enum reason: {}", serde_json::to_value(r).unwrap()));
+        }
+        insta::assert_snapshot!(lines.join("\n"));
+    }
+
+    /// A path the fixture leaves `null` or empty would be pinned as `null`, or not at all, so a
+    /// later rename of it would pass. Every `Option` and list in [`fully_populated`] must be set.
+    #[test]
+    fn fully_populated_leaves_no_path_unpinned() {
+        let lines = snapshot_shape();
+        let unset: Vec<&String> = lines.iter().filter(|l| l.ends_with(": null")).collect();
+        assert!(unset.is_empty(), "set these in fully_populated(): {unset:?}");
+        let mut empty = Vec::new();
+        fn empties(path: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Array(a) if a.is_empty() => out.push(path.into()),
+                serde_json::Value::Array(a) => {
+                    a.iter().for_each(|i| empties(&format!("{path}[]"), i, out))
+                }
+                serde_json::Value::Object(m) => {
+                    m.iter().for_each(|(k, c)| empties(&format!("{path}.{k}"), c, out))
+                }
+                _ => {}
+            }
+        }
+        empties("", &serde_json::to_value(fully_populated()).unwrap(), &mut empty);
+        assert!(empty.is_empty(), "give these lists an entry in fully_populated(): {empty:?}");
+    }
+
+    /// docs/api-v1.md is the contract a client reads, so a field the shape pins and the table
+    /// leaves out is a promise nobody wrote down.
+    #[test]
+    fn api_v1_md_names_every_pinned_field() {
+        let doc = include_str!("../../docs/api-v1.md");
+        let missing: Vec<String> = snapshot_shape()
+            .iter()
+            .filter_map(|l| l.split(':').next()?.rsplit(['.', '[']).find(|s| !s.is_empty()))
+            .map(|k| k.trim_end_matches(']').to_string())
+            .filter(|k| !k.is_empty() && !doc.contains(&format!("| `{k}` |")))
+            .collect();
+        assert!(missing.is_empty(), "add these to docs/api-v1.md: {missing:?}");
+    }
+
     /// A daemon from before #237 sends no `reason`; every worker it halted had a missing binary.
     #[test]
     fn a_halted_worker_without_a_reason_reads_as_a_missing_binary() {
