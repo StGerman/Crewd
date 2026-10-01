@@ -17,6 +17,7 @@ terminal_states = ["closed"]
 # The `agent` label is the dispatch marker (#64): carrying it is what makes an issue ready, and
 # an assignee is neither needed nor sufficient — a teammate taking a ticket does not hand it to
 # an agent. The poll filters on it too, so its cost follows the labelled issues, not the backlog.
+# Area labels on this backlog are not dispatch signals.
 dispatch_label = "agent"
 # Every write — comments, `state:*` labels, pull requests, pushes — authored by the Crew GitHub
 # App (crew-bot[bot]) rather than by whoever's GITHUB_TOKEN this is. The file holds app_id,
@@ -53,8 +54,8 @@ effort = "medium"
 
 [agent]
 # Each concurrent agent brings its own rust-analyzer index and its own `cargo check` — budget
-# 1-2 GB resident apiece, because .mcp.json is committed and so every worktree indexes its own
-# copy of the tree. Time is not the limit here: the wall clock of a dispatch belongs to the
+# 1-2 GB resident apiece, because .claude/settings.json enables the rust-analyzer-lsp plugin and
+# so every worktree indexes its own copy of the tree. Time is not the limit here: the wall clock of a dispatch belongs to the
 # agent, so extra workers are close to free in elapsed time and expensive only in memory. On a
 # machine that cannot hold that many indexes the symptom is swap and a stalled `cargo check`,
 # not an orchestrator error, so lower this before blaming stall_timeout_ms.
@@ -109,9 +110,8 @@ max_calls_per_issue = 40
 enabled = true
 bind = "127.0.0.1:8787"
 # On, for the session supervising this daemon. crewd never hands these tools to a worker (their
-# own listener, never passed to the broker), but a dispatched worker still inherits the
-# operator's MCP config — local scope included, since its worktree is this same project to
-# Claude Code — so on this machine workers can reach them. Accepted: see src/api/mcp.rs.
+# own listener, never passed to the broker), and the worker does not load the operator's MCP
+# config (#191). A same-user process can still call the loopback HTTP API; see src/api/mcp.rs.
 mcp_enabled = true
 mcp_bind = "127.0.0.1:8788"
 # Per-run transcripts (src/transcript.rs). Worth more here than against the demo tracker: this
@@ -160,17 +160,16 @@ timeout_ms = 1800000
 # reason `max_calls_per_run` alone bounds no broker. At either bound the pull request goes to
 # the operator with the outstanding items named.
 #
-# `reviewers` is empty on purpose. This repository has automatic Copilot review on, and its
-# comments are read and worked whether or not anyone requested them. Requesting Copilot over
-# REST is the case GETT-174120 describes — the provider says yes and attaches nobody — and the
-# verification that follows every request would then hand off every pull request at once, before
-# the automatic review has had its minute to post. Name a human login here to have a review
-# requested and verified; leave it empty to rely on what the repository already does.
+# `reviewers` are requested on every head delivery pushes and waited for: a pull request is
+# ready only once each has reviewed its current head (#222). The repository's automatic Copilot
+# review never runs on a pull request the app opens, so delivery requests Copilot itself — a
+# `[bot]` login through GraphQL, since REST drops a bot and answers success (GETT-174120) — and
+# a request that attaches nobody, or is refused, is handed off naming the reviewer.
 [delivery]
 enabled = true
 base = "master"
 remote = "origin"
-reviewers = []
+reviewers = ["copilot-pull-request-reviewer[bot]"]
 # Whose `COMMENTED` review summaries are read for findings as well as their inline comments; a
 # `CHANGES_REQUESTED` summary is read whoever wrote it. The default, spelled out (#126).
 summary_reviewers = ["copilot-pull-request-reviewer[bot]"]
@@ -180,3 +179,6 @@ max_rounds_per_issue = 6
 poll_interval_ms = 120000
 # A head CI never reports on is handed off after this long rather than waited on forever.
 ci_timeout_ms = 3600000
+# A requested review that has not arrived on the current head after this long is handed off
+# naming the reviewer, never called ready. Copilot usually answers in two to five minutes.
+review_timeout_ms = 1800000

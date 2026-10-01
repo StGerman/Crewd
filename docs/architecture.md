@@ -54,7 +54,11 @@ claim stranded by the last process must not stay stranded behind a config typo. 
 `tick()` rather than in `main.rs` on purpose — recovery a second entry point can forget to call
 is recovery that silently does not happen, which is the exact failure it exists to fix. It is
 callable directly (`Scheduler::recover`) and idempotent, so a caller that wants it eagerly can
-have it.
+have it. It releases every unmatched claim, so it is safe only while one process has the store.
+`main` takes that premise before the first tick: an exclusive OS lock beside the canonical path
+of the database, held until the process dies and released by the kernel on a hard kill (#217).
+A symlink and a `./crew.db` spelling of one file share that lock. A second daemon on the same
+store exits at startup, naming the store and the pid that holds it.
 
 ## Subsystems
 
@@ -72,6 +76,14 @@ trusted as an already-prepared worktree. The branch, not the directory, is what 
 behind: `remove` deletes the worktree but only deletes the branch when git's own merged check
 says it carries nothing `repo`'s HEAD (or the base) does not already have, and `prepare` attaches
 to an existing branch that does carry commits rather than `-B`-resetting it.
+
+A new branch is named `crew/<number>-<slug>`: the identifier with one leading `#` dropped, then
+a slug of the title cut at a word boundary. The name is fixed when the branch is created.
+`issue_state.branch` is what delivery pushes, and a symbolic ref `refs/crew/branch/<issue key>`
+is what the next `prepare` finds when the store does not have the name yet — including after a
+title edit, which must not mint a second branch. A pretty name already recorded for another
+dispatch id gains the same dispatch-id suffix as the worktree directory. A branch created under
+the old `crew/<sanitised key>` name is reattached, not renamed (#205).
 
 A new branch starts from
 the base the gate will rebase onto — `<delivery.remote>/<base>` fetched under the gate's lock and
@@ -103,13 +115,15 @@ collects the worktrees registered beneath the path before `worktree remove --for
 their directories, prunes the stale registrations (first — `-d` refuses a branch a registered
 worktree still pins), then gives each nested branch the same `-d` the parent's own gets. A
 nested branch carrying commits is kept and named in a `warn` log line, with what to run once
-its parent is merged; the merged check is not weakened for litter. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and
-`Workspace::branch_for` — pure naming, like `path_for` — answers the same question for the
-snapshot. Naming rather than probing is what lets a *finished* run still report its branch,
-which is when a reviewer wants it; asking git per row per tick would put a subprocess on the
-snapshot path. `Row.branch` is `None` until an issue has been dispatched at least once, because
-before that the name is a prediction and pointing an operator at a ref nobody wrote is worse
-than saying nothing.
+its parent is merged; the merged check is not weakened for litter. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and the scheduler
+stores it on `issue_state.branch`, which is what the snapshot publishes as `Row.branch`.
+`Workspace::branch_for` is the naming `prepare` uses and does look at git — the owner ref, a
+legacy branch, a collision — so a title edit does not mint a second name (#205). The snapshot
+does not call it. A finished run reports the stored branch, which is why that name is still
+there to read after the worktree is gone, and why a tick does not spawn git per row.
+`Row.branch` is `None` until an issue has been dispatched at least once, because before that
+no run has written a ref and pointing an operator at a name nobody created is worse than
+saying nothing.
 
 `Tracker` gets its third implementation in [src/tracker/github.rs](../src/tracker/github.rs):
 `GithubTracker<H: Http>`, generic over the `Http` seam in [src/http.rs](../src/http.rs)
@@ -215,8 +229,9 @@ that silently never worked: there is no `--max-turns` flag, so the per-session t
 self-enforced — the reader thread counts `assistant` events and sends `SIGTERM` once the count
 reaches `max_turns_per_session`, reporting `Outcome::Continue` itself; and `--bare` needs
 `ANTHROPIC_API_KEY`, which an OAuth-authenticated operator (this dev machine included) does not
-have, so it is not passed by default — the worker inherits whatever hooks and MCP servers the
-operator's own `claude` config has until a dedicated API key changes that trade-off. The model is
+have, so it is not passed. Instead `--setting-sources project` and `--strict-mcp-config` keep
+the operator's user- and local-scope settings, plugins and MCP servers out, and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` keeps out their auto memory (#191). The model is
 not inherited that way: `worker.model` and `worker.effort` become `--model` and `--effort` on
 every attempt, a resumed one included, and each run row records what it was given (#36). Both
 unset passes neither flag, which is the old behaviour exactly; `crew.github.toml` pins them.
@@ -228,9 +243,13 @@ spawned with no broker tools. `Outcome`
 beyond done/failed — `Continue`, `Blocked` — has no structural signal from the CLI to key off,
 so the worker's prompt asks the agent to end its final message with `CREW_OUTCOME:
 continue: <reason>` or `CREW_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
-and it is a soft convention by design — an agent that forgets it just reads as `Done`.
+and it is a soft convention by design — an agent that forgets it just reads as `Done`. The
+marker is read from the *last* `result` in the stream, which is read to its end: a resumed
+session whose previous run was killed with a background task running emits an empty `result`
+before the turn it was resumed for, and judging that one read an agent asking for a decision as
+`Done` (#214).
 
-Token totals come from the terminal `result` event and nowhere else (`Progress::tokens`, an
+Token totals come from the last `result` event and nowhere else (`Progress::tokens`, an
 `Option`). The first live dispatch (#7) summed the `usage` block of every streamed `assistant`
 event instead and recorded ten million input tokens and four hundred output tokens over 83
 turns: the CLI emits one `assistant` event per content block, each carrying the whole turn's
@@ -283,6 +302,29 @@ every tick, before `harvest_finished` can remove a run that warned and ended sin
 the warned run is left to finish, since slowing a running run is out of scope and killing it
 would cost the work it is doing.
 
+A spawn that fails `agent_not_found` is the same kind of mistake on the worker (#216): the
+binary went missing while the daemon was running, and treating it as the issue's permanent
+failure quarantines a ticket nothing is wrong with. `harvest_finished` releases that claim with
+`Store::release_for_rate_limit` and pauses only that worker. The pause is not lifted on a later
+tick and the binary is not re-resolved; a restart is what #218's startup check is for.
+`Snapshot::halted_workers` (on the wire, still `missing_binaries`) names the worker, the path
+and the reason, beside
+`rate_limit_pauses`, so `status` reads "grok paused: binary not found (/path/to/grok)" rather
+than an idle worker. `model_not_found` stays on the ordinary per-run path. Only
+`ErrorKind::NotFound` is classified `agent_not_found`: a permission or resource error on spawn
+stays on that ordinary path, because a pause that lasts until restart is for a binary that is
+gone. A `Session::New` written before the failed spawn is cleared — the CLI never created the
+conversation — and a session the run was resuming is kept. Feedback `launch` had already taken
+is put back for the next run. A sync brief is left for the next `sync_before_run`, which
+writes it again.
+
+A Grok `error` event reporting HTTP 402 is the same pause for an account with no balance
+(#237): `ErrorClass::AccountExhausted`, released uncharged, that worker halted until restart
+with reason `account_exhausted`. There is no reset time to wait for, and the balance is not
+probed while running: a restart is the operator saying it was topped up. The session and the
+feedback are given back only when the run took no turn; a run the 402 cut short later keeps
+both, and the handoff carries where it stopped.
+
 **Every run leaves a transcript** ([src/transcript.rs](../src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
 — so the `system` and tool-call lines it drops, and the lines it could not parse at all, are
@@ -316,8 +358,9 @@ per-run cap alone bounds nothing, because the continuation loop opens a fresh ru
 the same gap `max_turns_per_issue` closes for turns — and a budget only spent on successes
 would leave a loop of failing writes free. A session is an RAII guard held inside the run's own
 record, so the token is revoked and its config file deleted on every path that ends a run,
-including ones not yet written. A broker that cannot bind, or a session that cannot open,
-degrades to an agent without tools and never to a failed dispatch.
+including ones not yet written. A session that cannot open degrades to an agent without tools
+and never to a failed dispatch; a broker that `broker.enabled` turns on and that cannot bind or
+set up stops startup instead (#218).
 
 The transport is hand-rolled rather than built on `rmcp`, and
 [src/broker/server.rs](../src/broker/server.rs)'s module doc is the write-up — the short version
@@ -387,7 +430,7 @@ site for "why this attempt exists" — where the real worker puts it in the prom
 `Blocked`, because a gate that can be failed forever is the continuation runaway wearing a new
 name. A `Blocked` reason now also lands in the store's `last_error`, so the dashboard shows why
 an issue is parked instead of only the log. Setting no gate is a decision, not a degrade — unlike
-the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
+the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
 empty command list, which makes the default bringing the branch onto the base and nothing more) and the scheduler tests
 attach `FakeGate` explicitly. `crew.github.toml` sets the commit-gate commands from **Commands**
@@ -401,10 +444,11 @@ snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v
 than by discipline — and the `POST`s can express nothing the dashboard's `r`, `u` and `b`
 keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
-because the `POST` routes control agent execution. Deliberately *not* validated in
-`Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
-must not be what stops it — `api::bind` parses it once, and a failure there is logged and
-costs the API alone. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
+because the `POST` routes control agent execution. The address is validated once, at startup,
+rather than in `Config::preflight`, which runs before every dispatch: `api::bind` parses and
+binds it before anything else is opened, only when the API is on, and any failure there, a
+taken port included, exits crewd naming the address (#218). A daemon scheduling with no ops API
+looks healthy and cannot be queried or unquarantined. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
 which is what keeps a hung client off the tick: the scheduler answers into a channel whose
 receiver may already be gone and never waits to find out. The HTTP is hand-rolled (~200 lines,
 no keep-alive, one response type) for the same reason the rest of this crate is small; the
@@ -436,9 +480,10 @@ answer for hours at the moment diagnosis instead went to a block-buffered log fi
 wrong answer (#24). Nothing was missing server-side — what was missing was something to type.
 So it is a client and nothing else, in its own binary: an operator asking what is running must
 not be able to disturb it, and a second process on `crew.db` while the daemon holds it would be
-exactly that. `crewctl` links no `Store`, worktree or tracker code at all — see the package
-split under **What this is** — and its HTTP is a single `std::net` GET rather than an HTTP
-crate, so its graph stays that small. It shares `Snapshot` and `Row` with the server through
+exactly that — the daemon now refuses that second process at startup (#217). `crewctl` links no
+`Store`, worktree or tracker code at all — see the package split under **What this is** — and
+its HTTP is a single `std::net` GET rather than an HTTP crate, so its graph stays that small.
+It shares `Snapshot` and `Row` with the server through
 `libcrew` instead of re-describing them, so a renamed field fails the build rather than
 rendering a blank column, and it uses the same `fmt_count`/`fmt_ms`/`Phase::label` as the
 dashboard so a duration means the same thing on all three surfaces.
@@ -487,15 +532,12 @@ worker is handed), answers only at `/ops`, and is never passed to `Broker`, whos
 the only `--mcp-config` crewd gives a worker. `a_dispatched_worker_is_not_handed_the_ops_tools`
 reads that file from a real session and connects to what it names.
 
-What wiring cannot control is the operator's own `claude` config. The worker runs without
-`--strict-mcp-config` on purpose, so it inherits the operator's MCP servers — and **local scope
-does not keep this one out**: a worker's cwd is a worktree of the same repository, which Claude
-Code treats as the same project. On 2026-09-26 a dispatched run's `init` event listed `crew_ops`
-connected while it was registered only at local scope. The operator accepted this (2026-09-25,
-"option 2"): workers run as the same user and are trusted as that user, and the ops tools add
-nothing such a process cannot already do by sending a request to the loopback HTTP API the same
-routes live on. The way to actually withhold them is `--strict-mcp-config` with the worker's
-servers passed explicitly (rust-analyzer from `.mcp.json` among them); it was not taken.
+The operator's own `claude` config no longer reaches a worker either (#191): the worker passes
+`--setting-sources project --strict-mcp-config`, so it loads MCP servers only from the broker's
+`--mcp-config`, and user, local, plugin and claude.ai servers — this one among them — never
+start. A live init event with those flags lists no MCP server of source `user`, `local`,
+`plugin` or `claudeai`. What remains is the loopback HTTP API serving the same routes, which a
+same-user process can still call; only OS confinement (#135) closes that.
 
 
 **`crewd init`** ([src/init/](../src/init/)) registers the operator's own GitHub App through the
@@ -521,11 +563,12 @@ before; delivery is then a row in the store advanced on the tick — after recon
 before the dispatch gate, at `delivery.poll_interval_ms` — through: push the branch
 (`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
 request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
-reviewers *and read back whether they attached*, read CI, read the review threads — and the
+reviewers on the current head *and read back whether they attached*, read CI, read the review threads — and the
 reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
 current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
 `CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" and Copilot's template
-(headings, tags, the "Review effort" line, section labels; #201) is handed back whole
+(headings, tags, the "Review effort" line, section labels; #201), or than the overview sentence
+under Copilot's `🟢 Approved` status that also says "Findings: None" (#234), is handed back whole
 as one more comment keyed `review-<id>`: no parser for its sections, whose format is nobody's
 contract, and noise costs one `rejected` verdict, posted as a pull request comment since a
 summary has no thread. A red CI or
@@ -535,6 +578,14 @@ due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 A pull request the provider reports unable to merge is not waited on at all, since GitHub runs no
 CI on it: delivery charges a round and re-gates the branch as if its `Done` were new, so the
 gate's rebase or merge and its conflict rule decide what follows (#159).
+A pull request is ready only once each of `delivery.reviewers` has reviewed its current head
+(#222): green CI and no open comment say nothing about one nobody has looked at, and GitHub's
+automatic Copilot review never runs on a pull request the app opens. A head the last request
+was not made on is requested again, a `[bot]` login through GraphQL `requestReviewsByLogin`
+and verified through `reviewRequests`, since REST drops a bot and answers success
+(GETT-174120). A review that has not arrived within `delivery.review_timeout_ms` is handed off
+naming the reviewer, timed like the CI wait: on `Mono`, resumed across a restart from the
+wall-clock start on the row.
 The handoff gate's failing output travels the same way, as `Feedback::Gate`: `launch` builds one
 `Feedback` from delivery's structured row when there is one and from the retry reason otherwise,
 so `Worker::spawn` has a single parameter for the question and `feedback_help` in the worker is
@@ -558,9 +609,9 @@ resets — not for a new run and not for a new pull request — because a review
 on every push, answered by an agent that pushes, is a loop with no bound of its own, and one
 that reset with the pull request would bound nothing (the same gap `max_calls_per_issue`
 closes for the broker). At either bound the pull request is handed to the operator with the
-outstanding items named. A review request is followed by a read of the pull request and its
-reviews, because GitHub answers a request for a bot reviewer with `200` and attaches nobody
-(GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
+outstanding items named. A review request is followed by a read of the outstanding review
+requests (`Forge::review_requests`, GraphQL `reviewRequests` on GitHub) and the reviews, because
+GitHub answers a REST request for a bot reviewer with `200` and attaches nobody (GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
 issue's row, not a success. `Forge` has no `merge` method, and must not grow one — merging is
 the operator's, and the trait's shape is what enforces it. And a delivery step only runs for an
 issue nothing else owns (phase `released`, no live run), so a push cannot land under a running
@@ -588,8 +639,12 @@ The lease is a ref crewd owns, `refs/crew/lease/<branch>`, written by `Publisher
 `publish` and by nothing else (#163). The bare `--force-with-lease` took it from
 `refs/remotes/<remote>/<branch>`, which any fetch in `workspace.repo` moves onto commits the
 worktree never had, so the push replaced an operator's merge instead of refusing. `sync` runs
-before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch
-into the worktree and fast-forwards, or merges when the worktree has commits of its own. It never
+before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch.
+When the fetched head is the one the lease already names, the remote has not moved since the
+last sync or publish. A divergence is a local rewrite of commits the worktree already held —
+the gate rebasing onto a base that moved — so the worktree
+is left alone and the push replaces that head (#227). Any other head is fast-forwarded, or
+merged when the worktree has commits of its own. It never
 rebases, which would rewrite commits a reviewer saw and drop the operator's merge. A conflict is
 aborted and treated like a gate conflict (#111): a brief when every path is agent-resolvable,
 `Blocked` naming the paths otherwise, with the brief queued for the run an unblock dispatches.

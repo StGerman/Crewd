@@ -8,6 +8,10 @@
 
 pub mod schema;
 
+mod lock;
+
+pub use lock::{StoreLock, StoreLockError};
+
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -294,14 +298,14 @@ impl Store {
         Ok(())
     }
 
-    /// Release a claim exactly as an account-wide rate limit found it: `phase` back to
+    /// Release a claim whose failure belongs to the worker, not the issue: `phase` back to
     /// `released`, but `attempt`, `consecutive_fail` and `last_fail_class` all left alone.
     ///
     /// [`Store::release`] zeroes those columns, which is right after a `Done` or `Blocked`
-    /// verdict but wrong here — the run this interrupted did not fail on its own account, so
-    /// the next attempt must not look like a fresh start (#37). No retry row to clear either:
-    /// this is only ever called on an issue the claim just found `running`, which cannot also
-    /// hold one.
+    /// verdict but wrong here — an account-wide rate limit (#37), a binary that cannot be
+    /// spawned (#216) and an account with no balance (#237) did not fail on the issue's account, so the next attempt must not look
+    /// like a fresh start. No retry row to clear either: this is only ever called on an issue
+    /// the claim just found `running`, which cannot also hold one.
     pub fn release_for_rate_limit(
         &self,
         clock: &dyn Clock,
@@ -1455,6 +1459,11 @@ pub struct DeliveryRecord {
     /// The head the last push replaced, while the provider may still report it. See
     /// [`Store::clear_replaced_head`].
     pub replaced_head: Option<String>,
+    /// The head the expected reviews were last requested on, and when, on the injected wall
+    /// clock. See [`Store::set_review_requested`].
+    pub review_requested_on: Option<(String, i64)>,
+    /// Whom that request asked, sorted; empty when none is recorded.
+    pub review_reviewers: Vec<String>,
 }
 
 /// The head a push left on the remote, and the head it replaced there — `None` when the
@@ -1641,19 +1650,32 @@ impl Store {
         Ok(())
     }
 
-    /// `error` is the verification's finding when the provider accepted the request and
-    /// attached nobody; `None` records a request that verifiably took.
+    /// The expected reviews were requested on `head` from `reviewers`. `error` is the
+    /// verification's finding when the provider accepted the request and attached nobody;
+    /// `None` records a request that verifiably took. The request time is kept for the same
+    /// head and the same reviewers, so asking again does not restart the wait
+    /// `delivery.review_timeout_ms` bounds; a reviewer added since is a new request and starts
+    /// it afresh (#222).
     pub fn set_review_requested(
         &self,
         clock: &dyn Clock,
         issue_id: &str,
+        head: &str,
+        reviewers: &[String],
         error: Option<&str>,
     ) -> rusqlite::Result<()> {
+        let mut sorted = reviewers.to_vec();
+        sorted.sort();
+        let reviewers_json = serde_json::to_string(&sorted).expect("a list of strings serialises");
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE delivery SET review_requested = 1, review_error = ?2, updated_at = ?3
+            "UPDATE delivery SET review_requested = 1, review_error = ?2, updated_at = ?3,
+               review_requested_at = CASE WHEN review_head IS ?4 AND review_reviewers IS ?5
+                                               AND review_requested_at IS NOT NULL
+                                          THEN review_requested_at ELSE ?3 END,
+               review_head = ?4, review_reviewers = ?5
              WHERE issue_id = ?1",
-            params![issue_id, error, clock.wall().0],
+            params![issue_id, error, clock.wall().0, head, reviewers_json],
         )?;
         Ok(())
     }
@@ -1837,7 +1859,8 @@ impl Store {
 const DELIVERY_SELECT: &str = "SELECT issue_id, stage, pr_number, pr_url, base, head_sha,
     head_pushed_at, review_requested, review_error, rounds_pr, rounds_issue, pending_feedback,
     pending_verdicts, handed_comments, handoff_reason, updated_at, ci_pending_head,
-    ci_pending_since, replaced_head FROM delivery";
+    ci_pending_since, replaced_head, review_head, review_requested_at, review_reviewers
+    FROM delivery";
 
 fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
     Ok(DeliveryRecord {
@@ -1862,6 +1885,14 @@ fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
             _ => None,
         },
         replaced_head: r.get(18)?,
+        review_requested_on: match (r.get::<_, Option<String>>(19)?, r.get::<_, Option<i64>>(20)?) {
+            (Some(head), Some(at)) => Some((head, at)),
+            _ => None,
+        },
+        review_reviewers: r
+            .get::<_, Option<String>>(21)?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -1907,7 +1938,7 @@ mod delivery_tests {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
         s.set_delivery_pr(&c, "iss-1", 7, "u", "master", PushedHead::fresh("aaa")).unwrap();
-        s.set_review_requested(&c, "iss-1", None).unwrap();
+        s.set_review_requested(&c, "iss-1", "aaa", &[], None).unwrap();
         assert!(s.delivery("iss-1").unwrap().unwrap().review_requested);
 
         // The same head pushed again — idempotent — keeps the request.

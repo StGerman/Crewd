@@ -16,8 +16,10 @@ needs a reason in the PR description when it is skipped.
 
 Enforcement is deterministic wherever a tool can do it. A rule with a lint or a CI step behind it
 cannot be skipped or drifted from; a rule that only review can check is marked
-`Check: review`, and the reviewing agent verifies it against this file. Repetitive work that a
-lint demands is acceptable here; a rule that depends on judgment is the thing to avoid.
+`Check: review`, and the reviewing agent verifies it against this file. `Check: review
+(crew-reviewer)` is that check for the Failure paths section, verified against the diff before
+the agent reports done. Repetitive work that a lint demands is acceptable here; a rule that
+depends on judgment is the thing to avoid.
 
 Rules describe the target state. A rule that the code does not yet meet carries
 `Not yet enforced: #NN`. The linked issue tracks the fix, and new code follows the rule from now.
@@ -48,7 +50,7 @@ this file.
   missing looks healthy to its operator (#218). A failure confined to one run stays with that
   run and is retried; one that disables a whole worker pauses that worker (#216); the task
   projection keeps its degrade (CLAUDE.md rule 4). Example: `Config::load` refusing a
-  half-written credentials file by name. Check: review. `Not yet enforced: #216, #217, #218`.
+  half-written credentials file by name. Check: review. `Not yet enforced: #216`.
 - **MUST** handle an error once. Either log it and continue, or propagate it with `?`. Never
   both. Why: a double-handled error appears twice in the log and once in the caller, and the
   reader cannot tell how many failures happened. Example: `log_tracker_failure` in
@@ -85,11 +87,12 @@ this file.
   per-branch head on #174 did (#190). Check: review; a case is never skipped for one backend.
 - **MUST** move time through `FakeClock` in scheduler and API tests. `std::thread::sleep` and
   `Instant::now` are allowed only in the tests that drive a real child process or a real
-  socket, in [src/worker/claude.rs](../src/worker/claude.rs) and
-  [src/broker/server.rs](../src/broker/server.rs). Why: a test that waits on the wall clock is
+  socket, in [src/worker/claude.rs](../src/worker/claude.rs),
+  [src/broker/server.rs](../src/broker/server.rs) and
+  [tests/lifecycle.rs](../tests/lifecycle.rs). Why: a test that waits on the wall clock is
   a test that flakes on a slow runner. Check: `clippy::disallowed_methods` on
   `std::thread::sleep`, `std::time::Instant::now` and `std::time::SystemTime::now` in
-  `clippy.toml`, with `#[allow]` in the two named files and in `src/clock.rs`.
+  `clippy.toml`, with `#[allow]` in those files and in `src/clock.rs`.
   `Not yet enforced: #52`.
 - **MUST** pair every row in the invariant table (`docs/invariants.md`) with a named guard test. A change
   that weakens a mechanism must first make its guard test fail. Why: several guard tests fail
@@ -181,11 +184,11 @@ this file.
 | :---- | :---- | :---- |
 | `anyhow` | Error context at the binary boundary: `main.rs`, `tui`, `api`, `sched`, `project` | Never inside a domain trait |
 | `base64` | URL-safe encoding of the GitHub App JWT, standard encoding of Jira's Basic auth header (#99) | Already in the tree under `ureq` |
-| `blake3` | Collision-proof suffix for `worktree_key`, derivation of `session_id` | Deterministic on purpose, see `src/model.rs` |
+| `blake3` | Collision-proof suffix for `worktree_key` and for a branch name another issue already holds, derivation of `session_id` | Deterministic on purpose, see `src/model.rs` |
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
-| `nix` (`signal` only) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, without `unsafe` | Replaced `libc` (#50) |
+| `nix` (`signal`, `fs`) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, the `access(X_OK)` check on a worker's binary in `src/worker/resolve.rs` (#218), and the store's `flock` in `src/store/lock.rs`, without `unsafe` | Replaced `libc` (#50). `fs` is the `flock` wrapper (#217); a separate locking crate would add a second binding to the same call |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
@@ -326,3 +329,58 @@ why they were rejected so far.
   than giving the observer a new source. Why: `Row.branch` was added for the status client
   instead of letting the client ask `git`, and the same choice applies next time.
   Check: the same grep as above, plus review.
+
+## Failure paths
+
+The classes review keeps finding after the commit gate has passed. CLAUDE.md says when the
+diff is checked against this section and against [invariants.md](invariants.md). Each rule
+cites the pull request whose review found the class.
+
+- **MUST** make the writes that establish one fact durable together. Why: a kill between them
+  leaves the first applied and the second gone, and the next start treats that as the truth
+  ([#168](https://github.com/StGerman/crewd/pull/168)). Example: `apply` in
+  [src/store/schema.rs](../src/store/schema.rs), which commits a migration and its
+  `user_version` bump in one transaction. Check: review (crew-reviewer).
+- **MUST** reap a child before publishing its outcome. Why: a published outcome is the signal
+  that the run is over and its workspace is free, and the process can still be running after
+  its last line ([#166](https://github.com/StGerman/crewd/pull/166)). Example: the `terminal`
+  outcome held until `wait` in `run_reader`, in [src/worker/claude.rs](../src/worker/claude.rs)
+  and [src/worker/grok.rs](../src/worker/grok.rs). Check: review (crew-reviewer).
+- **MUST** count a truncation marker toward the byte cap it marks. Why: a marker added on top
+  of the cap makes the result longer than the bound it claims
+  ([#175](https://github.com/StGerman/crewd/pull/175)). Example: `tail` in
+  [src/sched/workers.rs](../src/sched/workers.rs). Check: review (crew-reviewer).
+- **MUST** return from a wait when the run has been stopped. Why: a wait with no stop check
+  keeps working after the scheduler has treated the run as stopped
+  ([#161](https://github.com/StGerman/crewd/pull/161),
+  [#123](https://github.com/StGerman/crewd/pull/123)). Example: `GitGate::hold_fetch_lock` in
+  [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
+- **MUST** check for uncommitted tracked changes and for a rebase or merge in progress before
+  rebasing or merging a worktree, and snapshot a worktree checkout's uncommitted work before
+  removing it. Why: a handoff that looks only at `HEAD` drops that work or misreads the branch,
+  and removal keeps the uncommitted work by the snapshot it takes first
+  ([#123](https://github.com/StGerman/crewd/pull/123)). Example: `uncommitted`,
+  `rebase_in_progress` and `merge_in_progress` on `GitGate` in
+  [src/gate/git.rs](../src/gate/git.rs); `GitWorktreeWorkspace::snapshot`, called from `remove`
+  in [src/workspace.rs](../src/workspace.rs). Check: review (crew-reviewer).
+- **MUST** fail the whole call when a page errors or the response ends before the protocol
+  marks it complete, rather than returning the pages already gathered. Why: that prefix is
+  indistinguishable from the whole result ([#185](https://github.com/StGerman/crewd/pull/185)).
+  Example: `fetch_open_labelled` in [src/tracker/github.rs](../src/tracker/github.rs) and
+  `paginate` in [src/forge/github.rs](../src/forge/github.rs), which propagate a page error
+  instead of a short list. Check: review (crew-reviewer).
+- **MUST** make a git read that needs the repository's credential use the credential the push
+  uses. Why: a host whose only access is that credential cannot read through another remote
+  ([#161](https://github.com/StGerman/crewd/pull/161),
+  [#174](https://github.com/StGerman/crewd/pull/174)). Example: `GitGate::fetch_with_credential`
+  in [src/gate/git.rs](../src/gate/git.rs). Check: review (crew-reviewer).
+- **MUST** make a fake answer what its real adapter answers, on every case both are run
+  against. Why: a test that only drives the fake passes code that fails against the real
+  backend ([#174](https://github.com/StGerman/crewd/pull/174)). Example: a case in
+  [src/forge/contract.rs](../src/forge/contract.rs) runs against `FakeForge` and `GithubForge`,
+  and a divergence is fixed in the fake. Check: review (crew-reviewer).
+- **MUST** change a stated guarantee everywhere it is stated, in the same change. Why: a
+  sentence rewritten in one place and left in the others promises two different things
+  ([#129](https://github.com/StGerman/crewd/pull/129)). Example: the invariant table lives in
+  [invariants.md](invariants.md), and CLAUDE.md points at that file. Check: review
+  (crew-reviewer).

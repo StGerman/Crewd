@@ -64,8 +64,9 @@ Work that fits none of the four goes to the Backlog, not into the core.
 
 ## Consequences
 
-- Triage applies this rule: an issue must name its boundary before it is placed
-  (`.claude/skills/issue-triage/SKILL.md`, "Scope check").
+- An issue names its boundary when it is written
+  (`.claude/skills/issue-authoring/SKILL.md`, "Boundary"). Triage confirms that line before
+  the issue is placed.
 - #84 lands after #57, because the async decision changes the trait signatures. Splitting first
   would mean doing that work twice.
 - External subcommands (#95) and `[hooks]` (#96) are each small and independent of #57. Each is its own

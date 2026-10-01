@@ -16,7 +16,7 @@ use crew::gate::fake::{FakeGate, GateScript};
 use crew::gate::{Gate, GateHandle, GitGate};
 use crew::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
 use crew::project::{NoopProjector, Projector, TasksProjector};
-use crew::sched::{Scheduler, WorkerPool};
+use crew::sched::{HaltReason, HaltedWorker, Scheduler, WorkerPool};
 use crew::store::Store;
 use crew::tracker::TrackerError;
 use crew::tracker::fake::FakeTracker;
@@ -182,8 +182,7 @@ fn a_dispatched_run_is_handed_a_broker_endpoint_scoped_to_its_own_issue() {
 
 #[test]
 fn dispatch_without_a_broker_still_runs_the_agent_just_without_tools() {
-    // The degrade the whole design turns on: a broker that could not start costs the agent a
-    // capability, never a dispatch.
+    // With the broker off, an agent runs without tracker tools rather than not running.
     let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
 
     h.sched.tick().unwrap();
@@ -1176,6 +1175,344 @@ fn a_rate_limit_on_one_worker_does_not_pause_dispatch_to_the_other() {
     assert_eq!(pauses.len(), 1, "{pauses:?}");
     assert_eq!(pauses[0].worker, "claude");
     assert_eq!(pauses[0].kind, "five_hour");
+}
+
+/// What a spawn reports when its binary is not there (#216). Immediate, and with no turns:
+/// the process never started, so there is no conversation and no cost.
+fn agent_not_found() -> Script {
+    Script {
+        turns: 0,
+        outcome: Outcome::Failed {
+            class: ErrorClass::AgentNotFound,
+            msg: format!("spawning {MISSING_BIN}: No such file or directory"),
+        },
+        ..Script::succeeds_in(0)
+    }
+}
+
+const MISSING_BIN: &str = "/no/such/grok";
+
+/// A worker whose binary cannot be spawned stops taking issues. The issues it already took
+/// are released uncharged — not quarantined, and not given a retry of their own — and the
+/// pause stays up however far the clock moves, until the daemon restarts (#216).
+#[test]
+fn a_missing_worker_binary_pauses_that_worker_and_quarantines_nothing() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    h.worker.set_bin(MISSING_BIN);
+    h.worker.set_default(agent_not_found());
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2);
+
+    // Nonzero history, so "untouched" is distinguishable from `release()`, which zeroes both.
+    for id in ["iss-1", "iss-2"] {
+        for _ in 0..2 {
+            h.sched
+                .store()
+                .record_failure(h.clock.as_ref(), id, ErrorClass::AgentCrash, "earlier", 99)
+                .unwrap();
+        }
+    }
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0);
+
+    for id in ["iss-1", "iss-2"] {
+        let st = h.sched.store().get(id).unwrap().unwrap();
+        assert_eq!(st.attempt, 2, "{id} must keep the attempt it was on");
+        assert_eq!(st.consecutive_fail, 2, "{id} must keep the identical-failure streak it had");
+        assert!(!st.is_quarantined(), "{id} must not be quarantined for a missing binary");
+        assert_eq!(st.phase, Phase::Released, "{id} must be dispatchable again, not parked");
+        assert_eq!(st.session_id, None, "{id} drops the session the CLI never created");
+        assert_eq!(h.worker.sessions_for(id).len(), 1, "{id} is not dispatched again");
+    }
+    assert!(
+        h.sched.store().all_retries().unwrap().is_empty(),
+        "no per-issue retry owns this — the worker's dispatch is what pauses"
+    );
+
+    let missing = h.sched.snapshot().unwrap().halted_workers;
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0].worker, "fake");
+    assert_eq!(missing[0].binary, MISSING_BIN);
+    assert!(h.sched.snapshot().unwrap().rate_limit_pauses.is_empty());
+
+    // The pause does not lift on a later tick, and the binary is not re-resolved.
+    h.clock.advance_ms(3_600_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "still paused an hour later");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+    let missing = h.sched.snapshot().unwrap().halted_workers;
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0].binary, MISSING_BIN);
+}
+
+/// One worker's missing binary is that worker's. The other keeps taking issues, including the
+/// one the paused worker had to put down (#216).
+#[test]
+fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_bin(MISSING_BIN);
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script("iss-1", agent_not_found());
+    grok.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "claude is paused and takes nothing more");
+    assert_eq!(grok.sessions_for("iss-1").len(), 1, "grok takes the issue claude could not start");
+    // A first spawn names a session the CLI never created, so there is no conversation to
+    // hand over and nothing was queued for the run that never started. A resumed session
+    // still carries the missing-binary handoff; that case is the test below.
+    assert!(matches!(&grok.sessions_for("iss-1")[0], Session::New(_)));
+    assert!(
+        grok.feedback_for("iss-1")[0].is_empty(),
+        "a first spawn queued nothing and named no conversation to hand off: {:?}",
+        grok.feedback_for("iss-1")
+    );
+    let missing = h.sched.snapshot().unwrap().halted_workers;
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!((missing[0].worker.as_str(), missing[0].binary.as_str()), ("claude", MISSING_BIN));
+    assert!(!h.sched.store().get("iss-1").unwrap().unwrap().is_quarantined());
+
+    // grok finishes iss-1 and is still the one that takes the next issue.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(grok.sessions_for("iss-2").len(), 1, "grok keeps dispatching");
+    assert!(h.worker.sessions_for("iss-2").is_empty());
+    assert_eq!(h.sched.snapshot().unwrap().halted_workers.len(), 1);
+}
+
+/// A session the CLI already created stays across the missing-binary restart, and the brief
+/// the failed spawn never read reaches the worker that takes the issue over (#216).
+#[test]
+fn a_resumed_session_survives_a_missing_binary_and_its_brief_reaches_the_next_worker() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_bin(MISSING_BIN);
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "suite failed".into() }),
+    );
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let session = h
+        .sched
+        .store()
+        .get("iss-1")
+        .unwrap()
+        .unwrap()
+        .session_id
+        .expect("the run started a session");
+    let first = h.worker.sessions_for("iss-1")[0].id().to_string();
+    assert_eq!(session, first);
+
+    h.worker.set_default(agent_not_found());
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert!(
+        matches!(h.worker.sessions_for("iss-1").last(), Some(Session::Resume(id)) if id == &session)
+    );
+
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "claude is paused");
+    let fed = grok.feedback_for("iss-1");
+    assert_eq!(fed.len(), 1, "{fed:?}");
+    let [Feedback::Handoff { from, why, .. }, Feedback::Gate { output }] = fed[0].as_slice() else {
+        panic!("handoff plus the brief the failed spawn never read: {fed:?}");
+    };
+    assert_eq!(from, "claude");
+    assert!(why.contains(MISSING_BIN), "{why}");
+    assert!(output.contains("suite failed"), "{output}");
+    let parked = h.sched.store().take_parked_session("iss-1", "claude").unwrap();
+    assert_eq!(parked.map(|(id, _)| id).as_deref(), Some(session.as_str()));
+}
+
+/// Feedback `launch` took for a spawn that never started is handed to the worker that takes
+/// the issue over: a gate brief and a delivery hand-back, with no conversation to resume (#216).
+#[test]
+fn a_spawn_that_never_started_returns_the_feedback_it_took() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_bin(MISSING_BIN);
+    h.worker.set_default(agent_not_found());
+    grok.set_default(Script::succeeds_in(60_000));
+
+    let clock = Arc::clone(&h.clock);
+    h.sched
+        .store()
+        .ensure(clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1"))
+        .unwrap();
+    let gate = Feedback::Gate { output: "conflict in CLAUDE.md".into() };
+    h.sched
+        .store()
+        .set_pending_feedback(clock.as_ref(), "iss-1", &serde_json::to_string(&gate).unwrap())
+        .unwrap();
+    h.sched.store().begin_delivery(clock.as_ref(), "iss-1", None).unwrap();
+    let review = Feedback::Review {
+        pr_url: "https://example/pr/1".into(),
+        comments: vec![],
+        unanswered_before: vec![],
+    };
+    h.sched
+        .store()
+        .requeue_delivery_feedback(
+            clock.as_ref(),
+            "iss-1",
+            &serde_json::to_string(&review).unwrap(),
+        )
+        .unwrap();
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "claude is paused");
+    assert!(matches!(&grok.sessions_for("iss-1")[0], Session::New(_)));
+    let fed = grok.feedback_for("iss-1");
+    assert_eq!(fed.len(), 1, "{fed:?}");
+    let [Feedback::Gate { output }, Feedback::Review { pr_url, .. }] = fed[0].as_slice() else {
+        panic!("the brief and the hand-back the failed spawn never read: {fed:?}");
+    };
+    assert!(output.contains("conflict in CLAUDE.md"), "{output}");
+    assert_eq!(pr_url, "https://example/pr/1");
+}
+
+fn account_exhausted() -> Script {
+    Script {
+        turns: 0,
+        outcome: Outcome::Failed {
+            class: ErrorClass::AccountExhausted,
+            msg: "API error (status 402 Payment Required): usage balance exhausted".into(),
+        },
+        ..Script::succeeds_in(0)
+    }
+}
+
+/// An empty balance is the account's, not the issue's: on 2026-10-01 each issue Grok touched
+/// was quarantined for it. The claim goes back uncharged, the worker takes nothing more, and the
+/// other worker takes the issue over with a handoff naming why (#237).
+#[test]
+fn an_exhausted_account_pauses_its_worker_and_charges_the_issue_nothing() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    h.worker.set_default(account_exhausted());
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        h.worker.sessions_for("iss-1").len(),
+        2,
+        "claude resumes before its balance runs out"
+    );
+    for _ in 0..2 {
+        h.sched
+            .store()
+            .record_failure(h.clock.as_ref(), "iss-1", ErrorClass::AgentCrash, "earlier", 99)
+            .unwrap();
+    }
+    let before = h.sched.store().get("iss-1").unwrap().unwrap();
+
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.attempt, before.attempt, "the issue keeps the attempt it was on");
+    assert_eq!(st.consecutive_fail, 2, "the identical-failure streak is not charged");
+    assert!(!st.is_quarantined());
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "claude is paused and takes nothing more");
+    let fed = grok.feedback_for("iss-1");
+    assert_eq!(fed.len(), 1, "grok takes the issue over: {fed:?}");
+    let [Feedback::Handoff { from, why, .. }, Feedback::Gate { output }] = fed[0].as_slice() else {
+        panic!("a handoff plus the brief the turnless run never acted on: {fed:?}");
+    };
+    assert_eq!(from, "claude");
+    assert!(why.contains("balance is exhausted"), "{why}");
+    assert!(output.contains("more to do"), "{output}");
+
+    h.clock.advance_ms(3_600_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "still paused an hour later");
+}
+
+/// A 402 after a turn cut short a run that did act on its brief and did create its session:
+/// neither is given back, unlike a run that never took a turn (#237).
+#[test]
+fn a_run_cut_short_by_an_exhausted_account_after_a_turn_keeps_its_session_and_brief() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script { turns: 2, ..account_exhausted() });
+    let clock = Arc::clone(&h.clock);
+    h.sched
+        .store()
+        .ensure(clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1"))
+        .unwrap();
+    let gate = Feedback::Gate { output: "conflict in CLAUDE.md".into() };
+    h.sched
+        .store()
+        .set_pending_feedback(clock.as_ref(), "iss-1", &serde_json::to_string(&gate).unwrap())
+        .unwrap();
+
+    h.sched.tick().unwrap();
+    let named = h.worker.sessions_for("iss-1")[0].id().to_string();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(!st.is_quarantined());
+    assert_eq!(st.session_id.as_deref(), Some(named.as_str()), "the CLI created this session");
+    assert_eq!(
+        h.sched.store().take_pending_feedback(clock.as_ref(), "iss-1").unwrap(),
+        None,
+        "the run acted on its brief; it is not queued twice"
+    );
+    assert_eq!(h.sched.snapshot().unwrap().halted_workers.len(), 1);
+}
+
+/// `status` has to say why an exhausted worker takes nothing, or it reads as idle (#237).
+#[test]
+fn the_snapshot_names_a_worker_paused_for_an_exhausted_account() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_bin("/opt/grok/bin/grok");
+    h.worker.set_default(account_exhausted());
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let snap = h.sched.snapshot().unwrap();
+    assert_eq!(
+        snap.halted_workers,
+        vec![HaltedWorker {
+            worker: "fake".into(),
+            binary: "/opt/grok/bin/grok".into(),
+            reason: HaltReason::AccountExhausted,
+        }]
+    );
+    assert!(snap.rate_limit_pauses.is_empty());
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(!st.is_quarantined());
+    assert_eq!(st.session_id, None, "a run that took no turn drops the session it named");
 }
 
 /// A session id means nothing to another provider, so a continuation goes back to the worker
@@ -3580,9 +3917,237 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
         },
     );
     run_once(&mut h2);
-    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
     assert!(delivery_of(&h2, "iss-1").review_error.is_none());
-    drop(forge2);
+    forge2.add_review(
+        forge2.open_prs()[0].number,
+        "copilot-pull-request-reviewer[bot]",
+        "COMMENTED",
+    );
+    h2.clock.advance_ms(1_000);
+    h2.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
+}
+
+const REVIEW_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+fn copilot_expected(c: &mut Config) {
+    c.delivery.reviewers = vec![COPILOT.into()];
+}
+
+/// #222: five pull requests crewd opened were called ready with green CI and no comments, because
+/// nobody had reviewed them at all. The review delivery requested is what it waits for.
+#[test]
+fn a_pull_request_with_no_review_yet_is_not_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    assert_eq!(forge.requested(pr), vec![COPILOT.to_string()], "requested and attached");
+
+    for _ in 0..5 {
+        h.clock.advance_ms(60_000);
+        h.sched.tick().unwrap();
+        assert_eq!(
+            delivery_of(&h, "iss-1").stage,
+            crew::store::DeliveryStage::Awaiting,
+            "green CI and no comments, but nobody has reviewed it"
+        );
+    }
+
+    forge.add_review(pr, COPILOT, "COMMENTED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+}
+
+/// #222: a review that never arrives is the operator's, with the reviewer named, and the pull
+/// request is never marked ready on the way there.
+#[test]
+fn a_pull_request_whose_review_never_arrives_is_handed_off_naming_the_reviewer() {
+    let (mut h, _forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS - 1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+
+    h.clock.advance_ms(2_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains(COPILOT), "names the reviewer: {why}");
+    assert!(why.contains(&FakeForge::head_after_publish(1)), "and the head: {why}");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(row.last_error.as_deref().is_some_and(|e| e.contains(COPILOT)), "{row:?}");
+}
+
+/// #222: only a review of the current head counts. A head someone else pushed onto a ready pull
+/// request is asked about again, and the approval of the head before it does not keep it ready.
+#[test]
+fn a_review_of_an_earlier_head_does_not_make_the_pull_request_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let requests = |forge: &FakeForge| {
+        forge.ops().iter().filter(|o| matches!(o, Op::RequestReview { .. })).count()
+    };
+    assert_eq!(requests(&forge), 1);
+
+    forge.push_head(pr, "sha-operator");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(requests(&forge), 2, "the new head is asked about: {:?}", forge.ops());
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the approval was of the head before"
+    );
+
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(requests(&forge), 2, "a reviewed head is not asked about again");
+}
+
+/// Copilot on #240: a ready pull request moved to a head whose CI is still running stayed
+/// `Ready`, because the CI wait ended the step before the unreviewed head was looked at.
+#[test]
+fn a_ready_pull_request_moved_to_a_head_still_in_ci_is_no_longer_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    forge.set_ci("sha-operator", CiStatus::Pending { running: vec!["test".into()] });
+    forge.push_head(pr, "sha-operator");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "an unreviewed head is not ready while its CI runs"
+    );
+}
+
+/// Copilot on #240: a reviewer added to `delivery.reviewers` across a restart, on a head already
+/// requested, was never asked, and the wait then handed off for a review nobody requested.
+#[test]
+fn a_reviewer_added_to_the_config_is_requested_on_a_head_already_requested() {
+    let dir = tmp_dir("review-added");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            copilot_expected,
+        );
+        run_once(&mut h);
+    }
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |c| c.delivery.reviewers = vec![COPILOT.into(), "alice".into()],
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let pr = forge.open_prs()[0].number;
+    assert!(
+        forge
+            .ops()
+            .iter()
+            .any(|o| matches!(o, Op::RequestReview { reviewer, .. } if reviewer == "alice")),
+        "the added reviewer is asked: {:?}",
+        forge.ops()
+    );
+    assert!(forge.requested(pr).contains(&"alice".to_string()));
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The review wait is the CI wait's shape (#105): a restart resumes it rather than forgiving it.
+#[test]
+fn a_restart_does_not_forgive_the_review_wait_already_spent() {
+    let dir = tmp_dir("review-wait-restart");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            copilot_expected,
+        );
+        run_once(&mut h);
+        h.clock.advance_ms(REVIEW_TIMEOUT_MS * 3 / 4);
+        h.sched.tick().unwrap();
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    }
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        copilot_expected,
+    );
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS * 3 / 4 + 5_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::HandedOff,
+        "the wait spent before the restart still counts"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #222: whether crew-bot may request Copilot at all is unknown until a live pull request asks,
+/// so a refusal has to reach the operator with the reviewer it was for.
+#[test]
+fn a_refused_review_request_is_handed_off_naming_the_reviewer() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    forge.refuse_review_requests(Some(ForgeError::Permanent(
+        "graphql: Resource not accessible by integration".into(),
+    )));
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains(COPILOT) && why.contains("not accessible"), "{why}");
 }
 
 #[test]
@@ -4042,11 +4607,17 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
     let d = delivery_of(&h, "iss-1");
     assert_eq!(d.head_sha.as_deref(), Some(FakeForge::head_after_publish(2).as_str()));
     assert_eq!(requests(&forge), 2, "a new head is a new request: {:?}", forge.ops());
-    assert!(
-        forge.pr(pr).unwrap().requested_reviewers.contains(&"reviewer".to_string()),
-        "and it verifiably attached"
+    assert!(forge.requested(pr).contains(&"reviewer".to_string()), "and it verifiably attached");
+    assert_eq!(
+        d.stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the approval was of the first head, not this one"
     );
-    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+
+    forge.add_review(pr, "reviewer", "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
 }
 
 /// A review round on a ready pull request whose first head is green, with the fix's push
@@ -5152,4 +5723,141 @@ fn a_foreign_push_is_taken_in_before_delivery_pushes_again() {
     let d = delivery_of(&h, "iss-1");
     assert_ne!(d.stage, crew::store::DeliveryStage::HandedOff, "{:?}", d.handoff_reason);
     assert_eq!(forge.pr(number).unwrap().head_sha, FakeForge::head_after_publish(2));
+}
+
+/// Delivery runs before the first poll after a restart (#223).
+#[test]
+fn a_pull_request_opened_on_the_first_tick_after_a_restart_is_titled_after_its_issue_and_closes_it()
+{
+    let dir = tmp_dir("pr-spec-restart");
+    let db = dir.join("crew.db");
+    let github_issue = || Issue {
+        url: Some("https://github.com/StGerman/crewd/issues/99".into()),
+        ..issue(1, "In Progress", Some(1))
+    };
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![github_issue()],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+        run_once(&mut h);
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+    }
+    forge.fail_with(None);
+
+    let (mut h, _) = delivery_harness_with(
+        vec![github_issue()],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    // The new harness has its own workspace root; the worktree the push reads is still there.
+    std::fs::create_dir_all(DirWorkspace::new(&h.root).unwrap().path_for("iss-1", "MT-1")).unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "the first tick opens the pull request: {:?}", forge.ops());
+    let spec = forge.spec_of(prs[0].number).unwrap();
+    assert_eq!(spec.title, "MT-1: issue 1");
+    assert!(
+        spec.body.starts_with("Closes https://github.com/StGerman/crewd/issues/99\n"),
+        "{}",
+        spec.body
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of #223: an issue the tracker cannot read right now waits for a later poll
+/// rather than opening a pull request without its title and link.
+#[test]
+fn a_pull_request_waits_while_its_issue_cannot_be_read() {
+    let dir = tmp_dir("pr-spec-unread");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+        run_once(&mut h);
+    }
+    forge.fail_with(None);
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    std::fs::create_dir_all(DirWorkspace::new(&h.root).unwrap().path_for("iss-1", "MT-1")).unwrap();
+    h.tracker.fail_by_ids(Some(TrackerError::Request("tracker down".into())));
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert!(forge.open_prs().is_empty(), "no pull request without its issue: {:?}", forge.ops());
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+
+    h.tracker.fail_by_ids(None);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "{:?}", forge.ops());
+    assert_eq!(forge.spec_of(prs[0].number).unwrap().title, "MT-1: issue 1");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The empty-read half of #223: an issue the tracker omits waits rather than opening a pull
+/// request without its title and link, and delivers once it is returned again.
+#[test]
+fn a_pull_request_waits_while_the_tracker_omits_its_issue() {
+    let dir = tmp_dir("pr-spec-omitted");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+        run_once(&mut h);
+    }
+    forge.fail_with(None);
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    std::fs::create_dir_all(DirWorkspace::new(&h.root).unwrap().path_for("iss-1", "MT-1")).unwrap();
+    h.tracker.hide("iss-1");
+    for _ in 0..2 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+    assert!(forge.open_prs().is_empty(), "no pull request without its issue: {:?}", forge.ops());
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+
+    h.tracker.unhide("iss-1");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "{:?}", forge.ops());
+    assert_eq!(forge.spec_of(prs[0].number).unwrap().title, "MT-1: issue 1");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
 }

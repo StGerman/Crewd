@@ -7,6 +7,7 @@
 //! [`FakeClock`]: crate::clock::FakeClock
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -121,6 +122,8 @@ pub struct FakeWorker {
     /// Mutable so a test can change it between dispatches, which is how a config change looks
     /// to the scheduler across a restart.
     model: Mutex<ModelChoice>,
+    /// The path a test stands in for `Command::new` having failed on (#216).
+    bin: Mutex<Option<PathBuf>>,
 }
 
 impl FakeWorker {
@@ -135,7 +138,13 @@ impl FakeWorker {
             wips: Mutex::new(HashMap::new()),
             body_changed: Mutex::new(HashMap::new()),
             model: Mutex::new(ModelChoice::default()),
+            bin: Mutex::new(None),
         }
+    }
+
+    /// The binary a scripted `agent_not_found` is treated as having failed to spawn (#216).
+    pub fn set_bin(&self, bin: impl Into<PathBuf>) {
+        *self.bin.lock().unwrap() = Some(bin.into());
     }
 
     /// Script a specific issue. Later spawns for the same issue reuse it unless replaced.
@@ -178,6 +187,10 @@ impl FakeWorker {
 }
 
 impl Worker for FakeWorker {
+    fn bin(&self) -> Option<PathBuf> {
+        self.bin.lock().unwrap().clone()
+    }
+
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
         let Spawn { issue, session, tools, transcript, feedback, wip, body_changed, .. } = req;
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());

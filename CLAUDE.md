@@ -35,7 +35,10 @@ daemon's store.
 
 Where new work lands is decided by [ADR 1](docs/adr/0001-extension-boundaries.md): a trait
 implementation, an external `crewctl-<name>` command, a hook, or a core change that protects an
-invariant.
+invariant. Whether it belongs at all is [docs/vision.md](docs/vision.md): crewd is the runner
+for agent sessions, what a service manager is to processes, and its Scope section names what is
+out (deciding what to work on, planning, merging, editing). Read it before filing or taking work
+that widens what crewd does.
 
 ## Commands
 
@@ -56,7 +59,7 @@ cargo run -p crewctl -- status             # what a running daemon is doing, rea
 cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
 cargo run -- --mcp 127.0.0.1:8788          # the ops API's routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
-                                           # ...and how that agent gets them; workers inherit it too
+                                           # ...and how that agent gets them; workers do not (#191)
 cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
@@ -78,6 +81,17 @@ a turn rather than a gate round. A stop reporting `continue` or `blocked` is let
 blocked agent repeats its `CREW_OUTCOME`/`CREW_REVIEW` lines, because crewd reads them from the
 final message only. Its timeout stays under `agent.stall_timeout_ms`. Grok and other branches
 never run it; the gate still decides.
+
+**Before reporting done,** check `git diff <base>...HEAD` against the Failure paths section of
+[docs/coding-guidelines.md](docs/coding-guidelines.md) and against
+[docs/invariants.md](docs/invariants.md). `<base>` is the branch the pull request merges into
+(`master` on this repo). Fix each finding, or answer it with the line and why the rule does not
+apply.
+
+- A Claude Code session runs the `crew-reviewer` subagent
+  ([.claude/agents/crew-reviewer.md](.claude/agents/crew-reviewer.md)) and passes it that diff.
+- A session that cannot run a subagent reads those two texts and checks the diff itself. Grok
+  is started with `--no-subagents` ([src/worker/grok.rs](src/worker/grok.rs)).
 
 The loop while editing, measured on this tree (an agent runs the command the docs name, so this
 table *is* the loop):
@@ -197,9 +211,15 @@ to stateless re-polling, never to incorrect behaviour — the session id lives t
 losing it costs cold continuations rather than a wrong conversation. The claim is the one entry
 that could invert that, because *keeping* it across a hard kill is what went wrong: an issue
 marked `running` with nothing running is refused by `claim()` forever, is invisible to
-`detect_stalls`, and has no retry row to bring it back. `Scheduler::recover` is what holds the
-contract — it releases those claims at startup and reconciles their worktrees, so the worst a
-surviving database can do is still cost a re-poll.
+`detect_stalls`, and has no retry row to bring it back. `Scheduler::recover` releases those
+claims at startup and reconciles their worktrees, so the worst a surviving database can do is
+still cost a re-poll. It is safe only while one process
+has the store: `main` holds an exclusive OS lock on the canonical store's `<store>.lock` for the
+life of the process, and a second daemon exits at startup naming the store and the pid that
+holds it (#217). A second spelling of the same file, a symlink or `./crew.db`, takes that same
+lock. The
+kernel releases that lock when the process dies, including a hard kill, and the next start
+proceeds.
 
 **Independent brakes on the same runaway** — the `Outcome` verdict, the per-issue turn budget,
 `parked_state` and the gate's `max_failures` — cover different paths; removing one looks safe
@@ -211,11 +231,10 @@ budgets: a continuation opens a fresh run, so the per-run cap alone bounds nothi
 The backlog is GitHub Issues on this repository; an open issue labelled `agent` is work a real
 agent will pick up, and the `issue-triage` skill decides which carry it.
 
-**Filing an issue.** Write the body from
-[.github/ISSUE_TEMPLATE/work.md](.github/ISSUE_TEMPLATE/work.md). The title is one sentence
-naming the outcome we want. The issue body is the durable work specification; tracker comments
-do not reach the prompt, so a decision, a scope cut and an acceptance criterion go there.
-HTML comments in the body are stripped before dispatch. File it with no milestone and no `agent` label.
+**Filing an issue** is the `issue-authoring` skill. The issue body is the work specification
+a dispatched agent receives: tracker comments do not reach that prompt, and HTML comments
+are stripped before dispatch, so a decision, a scope cut and an acceptance criterion go in
+the body.
 
 `crew.github.toml` turns on every real seam: the GitHub tracker, the `claude` worker, the tool
 broker, transcripts, the handoff gate (naming the commit-gate commands) and delivery. `crew.toml`,
@@ -226,13 +245,21 @@ a *scoped, logged* way to do what it could otherwise do ambiently. When you chan
 behaviour, ask whether the change would still be correct when the agent running it is working
 on this repo.
 
-[.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so whether a guard is still
-reached from both call sites is a find-references question. `.claude/skills/setup-rust-analyzer`
-installs it and a `SessionStart` hook names any missing piece. Each worktree indexes its own
-copy: budget roughly 1-2 GB and one `cargo check` per concurrent run. **Trap:** `references`,
-`definition` and `hover` answer from whatever is indexed *so far*, so during the first load
-they come back empty — indistinguishable from *no callers*. Ask again until an answer is
-non-empty before concluding anything from one.
+`.claude/settings.json` enables Claude Code's `rust-analyzer-lsp` plugin (#192). The `LSP`
+tool answers definition, references and hover, so whether a guard is still reached from both
+call sites is a find-references question. On the #192 run a warm server published E0308 over
+LSP about a second after the save, and the dispatched turn after the edit still contained no
+diagnostic; that gap is #228, so an edit's compile result stays `cargo check`. The server is
+the pinned toolchain's `rust-analyzer` component, so rustup installs it;
+`.claude/skills/setup-rust-analyzer` covers a machine without rustup and a `SessionStart` hook
+names any missing piece. Each worktree indexes its own copy: budget roughly 1-2 GB and one
+`cargo check` per concurrent run. **Trap:** `references`, `definition` and `hover` answer from
+whatever is indexed *so far*, so during the first load they come back empty — indistinguishable
+from *no callers*. Ask again until an answer is non-empty before concluding anything from one.
+The plugin passes the server no options, and a root `rust-analyzer.toml` cannot stand in:
+rust-analyzer reads its flycheck and cargo settings with no source root, which skips that file.
+The per-edit check is `cargo check` (not clippy), built in `target/`, where it can hold Cargo's
+lock against the agent's own build for a moment.
 
 ## Skills
 
@@ -262,7 +289,9 @@ Decisions already taken that are expensive to rediscover. The first two are impl
   (`DEFAULT_ENV_ALLOWLIST`) — not inherit-and-scrub. A denylist is fragile, and one missed
   variable leaks a tracker credential into a coding agent. Notably absent by default: any
   tracker credential and any API key — an operator on API-key auth adds `ANTHROPIC_API_KEY`
-  deliberately, it is not there by default.
+  deliberately, it is not there by default. `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` is written
+  after that copy, so an allowlisted value of the same name cannot turn auto memory back on
+  (#191).
 - The worker execs the `claude` binary directly (`Command::new`, never a shell). **No `bash
   -lc`.** A login shell re-imports from the operator's dotfiles exactly the secrets that were
   just scrubbed.

@@ -13,4 +13,7 @@ pub mod fmt;
 pub mod render;
 pub mod snapshot;
 
-pub use snapshot::{DeliveryView, Phase, RateLimitPause, Row, RunRecord, Snapshot, TokenUsage};
+pub use snapshot::{
+    DeliveryView, HaltReason, HaltedWorker, Phase, RateLimitPause, Row, RunRecord, Snapshot,
+    TokenUsage,
+};

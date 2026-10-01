@@ -44,24 +44,18 @@
 //!   The path `/ops` is accepted and every other path is refused, so a worker's `/mcp/<token>`
 //!   URL pointed here by mistake answers no tools.
 //!
-//! What the crate cannot control is the operator's own `claude` configuration. The worker
-//! deliberately runs without `--strict-mcp-config`, so it inherits the operator's MCP servers
-//! (see [`crate::worker::claude`]'s module doc for why) — and local scope does not keep this one
-//! out, because a worker's worktree is the same project to Claude Code: a dispatched run on
-//! 2026-09-26 listed `crew_ops` connected while it was registered only at local scope. The
-//! operator accepted that (2026-09-25): workers run as the same user and are trusted as that
-//! user, and these tools add nothing a same-user process cannot already do against the
-//! loopback HTTP API that serves the same routes. Withholding them for real would take
-//! `--strict-mcp-config` with the worker's servers passed explicitly. Off by default for the same
-//! reason the HTTP API is: a daemon must not grow a control plane by being upgraded.
+//! A worker never loads this server from the operator's `claude` configuration either: it runs
+//! with `--strict-mcp-config`, so only the broker's `--mcp-config` starts (#191). A same-user
+//! process can still call the loopback HTTP API serving the same routes; only OS confinement
+//! (#135) closes that. Off by default for the same reason the HTTP API is: a daemon must not
+//! grow a control plane by being upgraded.
 //!
 //! ## Exposure
 //!
 //! `api.mcp_enabled`, or `--mcp <addr>` for one run; loopback unless `api.allow_public` says
 //! otherwise, through the same [`resolve_bind`](super::resolve_bind) the HTTP API uses, because
 //! the two surfaces carry the same two write actions and one flag should govern both. A bind
-//! failure costs this server alone — `main` logs it and schedules on — matching how
-//! [`super::bind`] already fails.
+//! failure stops crewd at startup naming the address, as [`super::bind`]'s does (#218).
 //!
 //! `allow_public` is what makes the transport's own bounds load-bearing here, and it is the
 //! reason they exist: the broker's listener is always loopback and serves a handful of workers,
@@ -105,8 +99,8 @@ pub const TOOLS: &[&str] =
 /// Synchronous, unlike [`super::bind`], because the transport it feeds is the broker's
 /// thread-per-connection server rather than a tokio task — which is also why a public bind
 /// here is bounded by [`Limits`](crate::broker::server::Limits) rather than by the address
-/// being loopback. Separate from serving for the same reason as the HTTP one: `main` reports
-/// a failure and carries on scheduling.
+/// being loopback. Separate from serving for the same reason as the HTTP one: `main` binds at
+/// startup, before anything else is opened, and exits naming the address on a failure (#218).
 pub fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
     let addr = super::resolve_bind("api.mcp_bind", &cfg.mcp_bind, cfg.allow_public)?;
     TcpListener::bind(addr).with_context(|| format!("binding the ops MCP server to {addr}"))

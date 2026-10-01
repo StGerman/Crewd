@@ -12,8 +12,10 @@
 //! `rejected` verdict instead. The only text recognised is the one that says there is nothing:
 //! a body that is "Findings: None" once Copilot's template is set aside — headings, HTML
 //! comments and tags, the "Review effort" line, and its section labels (#201). Any prose left
-//! over is a finding; a template line counted as one spent a delivery round on every review.
+//! over is a finding, except the overview sentence of Copilot's approval (#234); a template line
+//! counted as one spent a delivery round on every review.
 
+use crate::config::COPILOT_REVIEWER;
 use crate::forge::{Review, ReviewComment, SUMMARY_PREFIX, summary_review_id};
 
 /// The summaries on `head` that carry a finding, oldest first: from a login in
@@ -28,7 +30,7 @@ pub(super) fn summary_findings(
         .iter()
         .filter(|r| r.commit_sha == head)
         .filter(|r| r.state == "CHANGES_REQUESTED" || summary_reviewers.contains(&r.reviewer))
-        .filter(|r| carries_findings(&r.body))
+        .filter(|r| carries_findings(&r.body, r.reviewer == COPILOT_REVIEWER))
         .map(|r| ReviewComment {
             id: format!("{SUMMARY_PREFIX}{}", r.id),
             author: r.reviewer.clone(),
@@ -40,10 +42,17 @@ pub(super) fn summary_findings(
         .collect()
 }
 
-/// Whether `body` says anything beyond "Findings: None".
-fn carries_findings(body: &str) -> bool {
+/// Whether `body` says anything beyond "Findings: None". The one prose allowed is the overview
+/// sentence under Copilot's approval (`🟢 Approved`), before a "Findings: None" line, and only
+/// when `from_copilot`: that sentence is on every approval, and handing it back spent a delivery
+/// round on each (#234). A second line of prose, prose under any other status or after the
+/// count, anything in another section, and the same heading from any other reviewer still count.
+fn carries_findings(body: &str, from_copilot: bool) -> bool {
     let mut in_html_comment = false;
-    body.lines().any(|line| {
+    let mut under_approval = false;
+    let mut says_none = false;
+    let mut overview = false;
+    for line in body.lines() {
         let mut rest = line.trim();
         // HTML comments are markers for the tool that wrote them, never text for a reader.
         let mut text = String::new();
@@ -71,23 +80,50 @@ fn carries_findings(body: &str) -> bool {
             }
         }
         let text = text.trim();
-        if text.is_empty() || text.starts_with('#') {
-            return false;
+        if text.is_empty() {
+            continue;
         }
-        let bare: String = strip_tags(text)
-            .chars()
-            .filter(|c| !matches!(c, '*' | '_'))
-            .map(|c| if c == '\u{2019}' { '\'' } else { c })
-            .collect::<String>()
-            .to_lowercase();
-        let bare: String = bare.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(heading) = text.strip_prefix('#') {
+            under_approval = from_copilot && bare(heading.trim_start_matches('#')) == "🟢 approved";
+            continue;
+        }
+        let bare = bare(text);
+        if text.starts_with('<') {
+            // A `<details>` block is a section of its own, never the overview.
+            under_approval = false;
+        }
+        if bare == "findings: none" {
+            says_none = true;
+            // The overview precedes the count; prose after it is something else.
+            under_approval = false;
+            continue;
+        }
         let template = bare.is_empty()
-            || bare == "findings: none"
             || bare.starts_with("review effort:")
             || bare == "in code that hasn't changed since last review"
             || (text.starts_with('<') && is_section_label(&bare));
-        !template
-    })
+        if template {
+            continue;
+        }
+        // The overview is one sentence; a second line is something else.
+        if !under_approval || overview {
+            return true;
+        }
+        overview = true;
+    }
+    overview && !says_none
+}
+
+/// `text` as compared against the template: tags and emphasis gone, the curly apostrophe
+/// straightened, whitespace collapsed, lowercase.
+fn bare(text: &str) -> String {
+    let bare: String = strip_tags(text)
+        .chars()
+        .filter(|c| !matches!(c, '*' | '_'))
+        .map(|c| if c == '\u{2019}' { '\'' } else { c })
+        .collect::<String>()
+        .to_lowercase();
+    bare.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Treating comparison prose such as "a < b" as markup would silently drop a finding, so only a
@@ -168,26 +204,31 @@ mod tests {
         }
     }
 
-    const COPILOT: &str = "copilot-pull-request-reviewer[bot]";
+    const COPILOT: &str = COPILOT_REVIEWER;
 
     #[test]
     fn a_summary_that_is_only_findings_none_carries_no_finding() {
-        assert!(!carries_findings(""));
-        assert!(!carries_findings("  \n\n"));
-        assert!(!carries_findings("**Findings:** None"));
+        assert!(!carries_findings("", true));
+        assert!(!carries_findings("  \n\n", true));
+        assert!(!carries_findings("**Findings:** None", true));
         assert!(!carries_findings(
-            "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n**Findings:** None\n"
+            "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n**Findings:** None\n",
+            true
         ));
-        assert!(!carries_findings("<!-- a\nmultiline marker -->\nFindings:   none"));
+        assert!(!carries_findings("<!-- a\nmultiline marker -->\nFindings:   none", true));
     }
 
     #[test]
     fn a_summary_with_anything_beside_findings_none_is_a_finding() {
         assert!(carries_findings(
             "## Copilot review overview\n\n### Needs a closer look\n\nCorrect the dirty-tree \
-             no-rebase status.\n\n**Findings:** None"
+             no-rebase status.\n\n**Findings:** None",
+            true
         ));
-        assert!(carries_findings("Previously missed: src/gate/git.rs:325 reports on_base: false"));
+        assert!(carries_findings(
+            "Previously missed: src/gate/git.rs:325 reports on_base: false",
+            true
+        ));
     }
 
     /// Counting this template as a finding spent a delivery round on every Copilot review (#201):
@@ -199,8 +240,8 @@ mod tests {
 
     #[test]
     fn a_copilot_summary_that_is_only_its_template_is_not_a_finding() {
-        assert!(!carries_findings(TEMPLATE));
-        assert!(!carries_findings("*Review effort:* Lite\n<details open>\n</details>"));
+        assert!(!carries_findings(TEMPLATE, true));
+        assert!(!carries_findings("*Review effort:* Lite\n<details open>\n</details>", true));
         let reviews = [review("1", COPILOT, "COMMENTED", "head", TEMPLATE)];
         assert!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).is_empty());
     }
@@ -213,7 +254,48 @@ mod tests {
         );
         let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
         assert_eq!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).len(), 1);
-        assert!(carries_findings("a < b is <b>still</b> said"));
+        assert!(carries_findings("a < b is <b>still</b> said", true));
+    }
+
+    /// PR #229's round 3 of 3 was spent on this summary (#234).
+    #[test]
+    fn an_approving_copilot_summary_with_no_findings_is_not_a_finding() {
+        let body = "### 🟢 Approved\nThe fail-fast paths are consistently propagated, documented, \
+            and covered by focused startup tests.\n**Findings:** None";
+        assert!(!carries_findings(body, true));
+        let with_template = TEMPLATE.replace(
+            "### 🟢 Approved\n\n",
+            "### 🟢 Approved\n\nThe fail-fast paths are consistently propagated.\n\n",
+        );
+        let reviews = [review("1", COPILOT, "COMMENTED", "head", &with_template)];
+        assert!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).is_empty());
+    }
+
+    #[test]
+    fn an_approval_is_still_a_finding_without_findings_none_or_with_another_section() {
+        assert!(carries_findings("### 🟢 Approved\nLooks good.\n**Findings:** 1", true));
+        assert!(carries_findings("### 🟢 Approved\nLooks good.", true));
+        assert!(carries_findings(
+            "### 🟢 Approved\nLooks good.\n**Findings:** None\n### Notes\nRename the guard.",
+            true
+        ));
+        assert!(carries_findings(
+            "### 🟢 Approved\nLooks good.\n**Findings:** None\nRename it.",
+            true
+        ));
+        assert!(carries_findings(
+            "### 🟢 Approved\nLooks good.\nRename it.\n**Findings:** None",
+            true
+        ));
+        let approval = "### 🟢 Approved\nLooks good.\n**Findings:** None";
+        assert!(carries_findings(approval, false));
+        let reviews = [review("1", "alice", "COMMENTED", "head", approval)];
+        assert_eq!(summary_findings(&reviews, "head", &["alice".to_string()]).len(), 1);
+        assert!(carries_findings(
+            "### 🟢 Approved\nLooks good.\n**Findings:** None\n<details>\n\
+             <summary>Open (1)</summary>\nRename the guard.\n</details>",
+            true
+        ));
     }
 
     #[test]

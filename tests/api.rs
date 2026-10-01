@@ -120,7 +120,8 @@ impl Harness {
         // the two are provably one view rather than two that happen to agree today.
         let mcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mcp_addr = mcp_listener.local_addr().unwrap();
-        broker::server::serve(Arc::new(OpsMcp::new(Api::new(snap_rx, cmd_tx))), mcp_listener);
+        broker::server::serve(Arc::new(OpsMcp::new(Api::new(snap_rx, cmd_tx))), mcp_listener)
+            .unwrap();
 
         Harness { addr, mcp_addr, sched, clock, worker, snap_tx, commands, root }
     }
@@ -805,8 +806,8 @@ async fn a_dispatched_worker_is_not_handed_the_ops_tools() {
     // way `main` does, open a real broker session, read the file a worker would be handed, and
     // connect to whatever it names. A version that only asked the ops server to refuse an
     // unknown caller would pass just as well if crewd handed the worker the ops address after
-    // all. What a worker inherits from the operator's own MCP config is outside this test, and
-    // accepted (see `api::mcp`).
+    // all. The worker's `--strict-mcp-config` is what keeps the operator's registration from
+    // loading (#191); this test covers only the file crewd writes (see `api::mcp`).
     let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
     h.tick();
 
@@ -825,7 +826,7 @@ async fn a_dispatched_worker_is_not_handed_the_ops_tools() {
         )
         .unwrap(),
     );
-    broker::server::serve(Arc::clone(&broker), listener);
+    broker::server::serve(Arc::clone(&broker), listener).unwrap();
     assert_ne!(broker_addr, h.mcp_addr, "the two servers are two listeners");
 
     let session = broker.open(&issue(1, "In Progress"), "run-1").unwrap();

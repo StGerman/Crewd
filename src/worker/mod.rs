@@ -8,6 +8,7 @@ pub mod claude;
 pub mod fake;
 pub mod grok;
 pub(crate) mod prompt;
+pub mod resolve;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -205,9 +206,9 @@ pub struct Spawn<'a> {
     pub workspace: &'a Path,
     pub attempt: u32,
     pub session: &'a Session,
-    /// `None` when the broker is unavailable. That is a degrade, not an error: the run proceeds
-    /// without tracker tools rather than failing, so a broker that cannot bind costs the agent a
-    /// capability and nothing else.
+    /// `None` when the broker is off or this run's session could not be opened. That is a
+    /// degrade, not an error: the run proceeds without tracker tools rather than failing, so a
+    /// session that cannot open costs the agent a capability and nothing else.
     pub tools: Option<&'a ToolEndpoint>,
     /// Owned rather than borrowed because the implementation that matters hands it to a reader
     /// thread that outlives the call; `None` means transcripts are off or the file could not be
@@ -251,6 +252,18 @@ impl<'a> Spawn<'a> {
     }
 }
 
+/// What a failed `Command::spawn` is. `NotFound` is the binary missing (#216), which pauses
+/// that worker until the daemon restarts. Anything else — permission, a full process table —
+/// is this run's failure: treating it as a missing binary would pause the worker for the life
+/// of the process over an error that is not one.
+pub(crate) fn spawn_failure_class(err: &std::io::Error) -> crate::model::ErrorClass {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        crate::model::ErrorClass::AgentNotFound
+    } else {
+        crate::model::ErrorClass::AgentCrash
+    }
+}
+
 pub trait Worker: Send + Sync {
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle>;
 
@@ -266,6 +279,13 @@ pub trait Worker: Send + Sync {
     /// tracker tools (#120); the default keeps Claude's path unchanged.
     fn uses_tools(&self) -> bool {
         true
+    }
+
+    /// The binary [`Worker::spawn`] executes, when this worker has one. Published when a spawn
+    /// fails [`crate::model::ErrorClass::AgentNotFound`], so an operator sees which path was
+    /// missing (#216). Defaulted for a worker that does not exec a binary.
+    fn bin(&self) -> Option<PathBuf> {
+        None
     }
 
     /// The last message this worker's agent wrote in a run, read back from that run's

@@ -76,9 +76,11 @@ fn d_delivery_base() -> String {
 fn d_delivery_remote() -> String {
     "origin".into()
 }
+/// The login the reviews endpoint reports for Copilot's automatic review.
+pub const COPILOT_REVIEWER: &str = "copilot-pull-request-reviewer[bot]";
+
 fn d_summary_reviewers() -> Vec<String> {
-    // The login the reviews endpoint reports for Copilot's automatic review.
-    vec!["copilot-pull-request-reviewer[bot]".into()]
+    vec![COPILOT_REVIEWER.into()]
 }
 fn d_rounds_per_pr() -> u32 {
     3
@@ -91,6 +93,9 @@ fn d_delivery_poll() -> u64 {
 }
 fn d_ci_timeout() -> u64 {
     60 * 60 * 1000
+}
+fn d_review_timeout() -> u64 {
+    30 * 60 * 1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,14 +207,17 @@ pub struct DeliveryConfig {
     /// The git remote the branch is pushed to.
     #[serde(default = "d_delivery_remote")]
     pub remote: String,
-    /// Logins to request a review from once the pull request is open. Each request is verified
-    /// afterwards: a provider that accepts the request and attaches nobody is reported as a
-    /// failure, not a success. Empty means no review is requested and none is waited for.
+    /// Logins to request a review from on every head delivery pushes, and to wait for: the pull
+    /// request is ready only once each has reviewed its current head (#222). Each request is
+    /// verified afterwards: a provider that accepts the request and attaches nobody is reported
+    /// as a failure, not a success. A bot is spelled as reviews report it, `<name>[bot]`. Empty
+    /// means no review is requested and none is waited for.
     #[serde(default)]
     pub reviewers: Vec<String>,
     /// Logins whose review *summary* is read for findings as well as their inline comments
     /// (#126): any of their reviews on the current head whose body says more than
-    /// "Findings: None" is handed to an agent whole. A review in the `CHANGES_REQUESTED` state
+    /// "Findings: None", Copilot's template (#201) and its approval's overview sentence (#234) is
+    /// handed to an agent whole. A review in the `CHANGES_REQUESTED` state
     /// is read the same way whoever wrote it, so this names only the reviewers whose
     /// `COMMENTED` summaries count too. Defaults to the Copilot reviewer, which puts findings
     /// there that it leaves on no line.
@@ -230,6 +238,10 @@ pub struct DeliveryConfig {
     /// with no CI configured would otherwise wait forever, looking healthy.
     #[serde(default = "d_ci_timeout")]
     pub ci_timeout_ms: u64,
+    /// How long a requested review may take to arrive on the current head before the pull
+    /// request is handed off naming the reviewer, rather than waited on or called ready (#222).
+    #[serde(default = "d_review_timeout")]
+    pub review_timeout_ms: u64,
 }
 
 impl Default for DeliveryConfig {
@@ -244,6 +256,7 @@ impl Default for DeliveryConfig {
             max_rounds_per_issue: d_rounds_per_issue(),
             poll_interval_ms: d_delivery_poll(),
             ci_timeout_ms: d_ci_timeout(),
+            review_timeout_ms: d_review_timeout(),
         }
     }
 }
@@ -877,7 +890,10 @@ impl Config {
                     "delivery.base and delivery.remote are required".into(),
                 ));
             }
-            if self.delivery.poll_interval_ms == 0 || self.delivery.ci_timeout_ms == 0 {
+            if self.delivery.poll_interval_ms == 0
+                || self.delivery.ci_timeout_ms == 0
+                || self.delivery.review_timeout_ms == 0
+            {
                 return Err(ConfigError::Invalid("delivery intervals must be > 0".into()));
             }
         }

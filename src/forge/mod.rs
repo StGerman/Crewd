@@ -15,10 +15,10 @@
 //! Two things a caller must know about the contract:
 //!
 //! * `request_review` performs the request and nothing else. Whether a reviewer actually
-//!   attached is answered by [`Forge::pull_request`] and [`Forge::reviews`] afterwards, and the
-//!   scheduler is what asks — because the provider's own answer cannot be trusted here: GitHub
-//!   answers a request for a bot reviewer with `200` and attaches nobody (GETT-174120), and the
-//!   only way to notice is to look.
+//!   attached is answered by [`Forge::review_requests`] and [`Forge::reviews`] afterwards, and
+//!   the scheduler is what asks — because the provider's own answer cannot be trusted here:
+//!   GitHub answers a REST request for a bot reviewer with `200` and attaches nobody
+//!   (GETT-174120), and the only way to notice is to look.
 //! * `ci_status` reports [`CiStatus::Pending`] for a head with no check runs yet as well as for
 //!   one still running. A repository with no CI at all therefore reads as pending forever; the
 //!   scheduler bounds that with a timeout rather than this trait guessing.
@@ -85,9 +85,6 @@ pub struct PullRequest {
     pub base: String,
     /// `open`, `closed` or `merged`. A merged pull request also reads as not open.
     pub state: PrState,
-    /// Logins with a review request outstanding. A reviewer who has already posted a review is
-    /// no longer in this list — check [`Forge::reviews`] too before concluding nobody attached.
-    pub requested_reviewers: Vec<String>,
     /// Whether the pull request can merge into its base: `Some(false)` for a conflict, `None`
     /// while the provider is still computing it — which GitHub does after every push, and which
     /// is not a conflict. A list endpoint never carries it, so only [`Forge::pull_request`] does.
@@ -183,6 +180,14 @@ pub trait Forge: Send + Sync {
     /// caller, not this method, decides whether it worked.
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError>;
 
+    /// Logins with a review request outstanding, bots included and spelled as
+    /// [`Forge::reviews`] spells them (`<name>[bot]`). Not a field of [`PullRequest`]: GitHub's
+    /// REST read of a pull request omits a requested bot (#222), so a request verified there
+    /// reads as attaching nobody whether it took or not. A reviewer who has already posted a
+    /// review is no longer listed — check [`Forge::reviews`] too before concluding nobody
+    /// attached.
+    fn review_requests(&self, number: u64) -> Result<Vec<String>, ForgeError>;
+
     fn reviews(&self, number: u64) -> Result<Vec<Review>, ForgeError>;
 
     fn ci_status(&self, head_sha: &str) -> Result<CiStatus, ForgeError>;
@@ -221,7 +226,10 @@ pub struct Published {
 pub enum Synced {
     /// The remote has no such branch: nothing has been pushed to it yet.
     Absent,
-    /// The worktree already holds every commit the remote's branch does.
+    /// Nothing on the remote to take in. The worktree already holds every commit the remote's
+    /// branch does, or the fetched head equals the lease: it has not moved since the last sync
+    /// or publish, whoever pushed it. A rebase since then rewrote commits the worktree already
+    /// held, and the next push replaces that head (#227).
     Current { remote_head: String },
     /// The worktree took the remote's commits: fast-forwarded when it had none of its own,
     /// merged when it had (`merged`). Never rebased, which would rewrite the agent's commits and
@@ -251,9 +259,13 @@ impl Synced {
 /// workspace has to be able to say "no branch here" rather than fake one.
 pub trait Publisher: Send + Sync {
     /// Bring into `worktree` whatever someone else pushed to `branch` on `remote` (#163): fetch
-    /// it, fast-forward or merge it in, and record the head taken in as the lease the next
-    /// [`Publisher::publish`] pushes against. Called before every agent run and every re-gate,
-    /// so the branch those build on is the one the pull request shows.
+    /// it, fast-forward or merge a head the lease does not name, and record the head taken in
+    /// as the lease the next [`Publisher::publish`] pushes against. A fetched head the lease
+    /// already names has not moved since that sync or publish. The worktree's divergence is a
+    /// local rewrite of commits it already held — the gate rebasing onto a base that moved
+    /// (#227) — and is left for that push to replace. Called before every agent run, every
+    /// re-gate and every delivery push, so the branch those build on is the one the pull request
+    /// shows.
     fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError>;
 
     /// Push `branch` from `worktree` to `remote`, and list its commits over `base`.

@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         addr,
         &dir,
     )?);
-    broker::server::serve(Arc::clone(&broker), listener);
+    broker::server::serve(Arc::clone(&broker), listener)?;
     println!("broker listening on {addr}");
 
     // The prompt is the issue, so the instruction to call the tool goes in the body the worker

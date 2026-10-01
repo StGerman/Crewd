@@ -99,6 +99,10 @@ pub enum ErrorClass {
     ModelNotFound,
     WorkspaceOutsideRoot,
     AuthFailed,
+    /// The provider refused the account with HTTP 402 (#237). Never charged to the issue: the
+    /// scheduler pauses the worker until restart, as for `AgentNotFound`. Permanent so that, if it
+    /// ever reached the per-issue path, every retry would not pay for the same refusal.
+    AccountExhausted,
 }
 
 impl ErrorClass {
@@ -118,7 +122,8 @@ impl ErrorClass {
             | ErrorClass::AgentNotFound
             | ErrorClass::ModelNotFound
             | ErrorClass::WorkspaceOutsideRoot
-            | ErrorClass::AuthFailed => false,
+            | ErrorClass::AuthFailed
+            | ErrorClass::AccountExhausted => false,
         }
     }
 
@@ -137,6 +142,7 @@ impl ErrorClass {
             ErrorClass::ModelNotFound => "model_not_found",
             ErrorClass::WorkspaceOutsideRoot => "workspace_outside_root",
             ErrorClass::AuthFailed => "auth_failed",
+            ErrorClass::AccountExhausted => "account_exhausted",
         }
     }
 
@@ -155,6 +161,7 @@ impl ErrorClass {
             "model_not_found" => ErrorClass::ModelNotFound,
             "workspace_outside_root" => ErrorClass::WorkspaceOutsideRoot,
             "auth_failed" => ErrorClass::AuthFailed,
+            "account_exhausted" => ErrorClass::AccountExhausted,
             _ => return None,
         })
     }
@@ -273,11 +280,17 @@ pub fn worktree_key(issue_id: &str, identifier: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
         .collect();
 
-    let digest = blake3::hash(issue_id.as_bytes());
-    let suffix: String = digest.to_hex().chars().take(12).collect();
-
     let stem = if sanitized.is_empty() { "issue" } else { sanitized.as_str() };
-    format!("{stem}-{suffix}")
+    format!("{stem}-{}", dispatch_suffix(issue_id))
+}
+
+/// Twelve hex digits of the dispatch id.
+///
+/// Two issues whose identifiers — or whose issue number and title slug — sanitise to the same
+/// text would otherwise share a directory or a branch. The same length everywhere it is
+/// appended, so the branch collision form cannot be weaker than the directory name (#205).
+pub(crate) fn dispatch_suffix(issue_id: &str) -> String {
+    blake3::hash(issue_id.as_bytes()).to_hex().chars().take(12).collect()
 }
 
 /// A UUID-shaped name for a `claude` conversation, derived rather than random so this crate
@@ -346,6 +359,7 @@ mod tests {
             ErrorClass::ModelNotFound,
             ErrorClass::WorkspaceOutsideRoot,
             ErrorClass::AuthFailed,
+            ErrorClass::AccountExhausted,
         ];
         for c in all {
             let _ = c.retryable();
@@ -353,6 +367,7 @@ mod tests {
         }
         assert!(!ErrorClass::TemplateRender.retryable());
         assert!(ErrorClass::RateLimited.retryable());
+        assert!(!ErrorClass::AccountExhausted.retryable(), "a retry pays for the same refusal");
     }
 
     #[test]

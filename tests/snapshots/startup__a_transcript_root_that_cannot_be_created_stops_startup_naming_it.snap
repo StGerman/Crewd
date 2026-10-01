@@ -1,0 +1,5 @@
+---
+source: tests/startup.rs
+expression: "err.split(\"\\n\\nCaused by\").next().unwrap_or(&err)"
+---
+Error: creating the transcript root blocker/transcripts

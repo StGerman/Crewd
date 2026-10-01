@@ -3,9 +3,13 @@
 //! The worktree used to never read its own remote branch: a continuation resumed on the branch
 //! as it was left, the gate rebased that, and the push, leased against a remote-tracking ref any
 //! fetch in `workspace.repo` moves, replaced the operator's commit. So an agent run, a re-gate
-//! and a push each start from [`Publisher::sync`](crate::forge::Publisher::sync): fast-forward,
-//! else merge, never rebase. A merge conflict is a gate conflict by #111's rule: a brief to the
-//! agent when every path is agent-resolvable, `Blocked` naming the paths otherwise.
+//! and a push each start from [`Publisher::sync`](crate::forge::Publisher::sync). A head the
+//! lease does not name is fast-forwarded or merged, never rebased. A head the lease already
+//! names has not moved since the last sync or publish: the worktree already held it, whoever
+//! pushed it, the gate rewrote it (#227), and merging it back is the conflict delivery was
+//! reporting, so the push replaces it instead. A merge conflict is a gate
+//! conflict by #111's rule: a brief to the agent when every path is agent-resolvable, `Blocked`
+//! naming the paths otherwise.
 //!
 //! A sync that fails outright does not withhold a run: the lease names only heads the worktree
 //! took in, so the push after it refuses rather than overwrites, and the next sync tries again.

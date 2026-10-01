@@ -39,20 +39,25 @@
 //! success that leaves a pull request nobody will look at.
 //!
 //! And it is per head. A fix round pushes a new head to the same pull request, and a reviewer
-//! verified against the old one has not seen it; so the push resets `review_requested`, and
-//! the request-then-read runs again before the pull request can read as ready (#47).
+//! verified against the old one has not seen it; so a head the request was not made on is
+//! requested again, and the request-then-read runs before the pull request can read as ready
+//! (#47).
+//!
+//! A request that attached is still not a review. The pull request is ready only once each of
+//! `delivery.reviewers` has reviewed its current head, and one whose review has not arrived
+//! within `delivery.review_timeout_ms` is handed off naming the reviewer (#222).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::review_summary::{summary_findings, verdict_comment};
-use super::{Gating, Running, Scheduler};
-use crate::clock::{Mono, Wall};
+use super::{Gating, Running, Scheduler, log_tracker_failure};
+use crate::clock::{Clock, Mono, Wall};
 use crate::forge::{
     CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, Synced,
     summary_review_id,
 };
-use crate::model::{Feedback, Outcome, ReviewVerdict, Verdict};
+use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState, PushedHead};
 use crate::worker::{KillResult, Progress, RunHandle};
 
@@ -315,6 +320,11 @@ impl Scheduler {
         }
 
         if d.stage == DeliveryStage::Pending {
+            // Before the push, so a pull request is never opened without its issue's title and
+            // link: the push is idempotent and the next poll repeats it at no cost.
+            let Some(issue) = self.delivery_issue(issue_id) else {
+                return Ok(());
+            };
             let branch = st
                 .branch
                 .clone()
@@ -375,7 +385,7 @@ impl Scheduler {
                 self.store.note_replaced_head(clock.as_ref(), issue_id, old)?;
             }
 
-            let spec = self.pr_spec(issue_id, st, &branch, &base, &published.commits)?;
+            let spec = self.pr_spec(&issue, st, &branch, &base, &published.commits)?;
             let opened = match forge.open_pull_request(&spec) {
                 Err(ForgeError::NothingToDeliver(why)) => {
                     tracing::info!(issue_id, why, "nothing to deliver");
@@ -453,38 +463,28 @@ impl Scheduler {
             return self.regate(issue_id, st, &d, &pr);
         }
 
-        if !d.review_requested && !self.cfg.delivery.reviewers.is_empty() {
-            for r in &self.cfg.delivery.reviewers {
-                forge.request_review(number, r)?;
+        // Keyed on the head rather than reset only by crewd's own push, so a head the operator
+        // pushed is asked about too: a review of an earlier head does not make this one ready.
+        // The reviewers compared too, so one added to `delivery.reviewers` since is asked.
+        let mut expected = self.cfg.delivery.reviewers.clone();
+        expected.sort();
+        let requested_here = d.review_requested
+            && d.review_requested_on.as_ref().is_some_and(|(head, _)| *head == pr.head_sha)
+            && d.review_reviewers == expected;
+        if !requested_here && !expected.is_empty() {
+            // Before the request and the CI read, either of which can end this step: a head
+            // nobody was asked about is not ready while CI runs on it or the request is retried.
+            if d.stage == DeliveryStage::Ready {
+                tracing::info!(issue_id, pr = number, head = %pr.head_sha, "no longer ready: its head has not been put to review");
+                self.store.set_delivery_stage(
+                    clock.as_ref(),
+                    issue_id,
+                    DeliveryStage::Awaiting,
+                    None,
+                )?;
+                d.stage = DeliveryStage::Awaiting;
             }
-            // The read that makes the request mean something. Attached is either still
-            // requested, or already answered on this head.
-            let after = forge.pull_request(number)?;
-            let reviews = forge.reviews(number)?;
-            let missing: Vec<&str> = self
-                .cfg
-                .delivery
-                .reviewers
-                .iter()
-                .filter(|r| {
-                    !after.requested_reviewers.iter().any(|x| x == *r)
-                        && !reviews
-                            .iter()
-                            .any(|rv| rv.reviewer == **r && rv.commit_sha == after.head_sha)
-                })
-                .map(String::as_str)
-                .collect();
-            if missing.is_empty() {
-                tracing::info!(issue_id, pr = number, reviewers = ?self.cfg.delivery.reviewers, "review requested and verified attached");
-                self.store.set_review_requested(clock.as_ref(), issue_id, None)?;
-            } else {
-                let reason = format!(
-                    "review request accepted by the provider but attached nobody: {}",
-                    missing.join(", ")
-                );
-                tracing::error!(issue_id, pr = number, missing = ?missing, "review request did not attach; handing off");
-                self.store.set_review_requested(clock.as_ref(), issue_id, Some(&reason))?;
-                self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+            if self.request_reviews(issue_id, &pr)? {
                 return Ok(());
             }
         }
@@ -518,12 +518,9 @@ impl Scheduler {
         // both are settled by the same verdict table, so a summary is handed back once and a
         // review arriving after `ready` takes the pull request out of it.
         let settled = self.store.verdicts_for(issue_id)?;
+        let reviews = forge.reviews(number)?;
         let mut open = forge.review_comments(number)?;
-        open.extend(summary_findings(
-            &forge.reviews(number)?,
-            &pr.head_sha,
-            &self.cfg.delivery.summary_reviewers,
-        ));
+        open.extend(summary_findings(&reviews, &pr.head_sha, &self.cfg.delivery.summary_reviewers));
         open.retain(|c| !settled.contains_key(&c.id));
         if !open.is_empty() {
             let handed_before: Vec<String> = d
@@ -555,6 +552,21 @@ impl Scheduler {
             );
         }
 
+        // Green CI and no open comment say nothing about a pull request nobody has reviewed: an
+        // app-opened one gets no automatic review, and five were called ready with none (#222).
+        let unreviewed: Vec<String> = self
+            .cfg
+            .delivery
+            .reviewers
+            .iter()
+            .filter(|r| !reviewed_head(&reviews, r, &pr.head_sha))
+            .cloned()
+            .collect();
+        if !unreviewed.is_empty() {
+            return self.await_review(issue_id, &d, &pr, &unreviewed);
+        }
+        self.review_waits.remove(issue_id);
+
         if d.stage != DeliveryStage::Ready {
             tracing::info!(issue_id, pr = number, url = %pr.url, "ready to merge; the rest is the operator's");
             self.store.set_delivery_stage(clock.as_ref(), issue_id, DeliveryStage::Ready, None)?;
@@ -575,24 +587,18 @@ impl Scheduler {
     ) -> Result<(), StepError> {
         let clock = self.clock.clone();
         let now = clock.mono();
-        let since = match self.ci_waits.get(issue_id) {
-            Some((head, since)) if *head == pr.head_sha => *since,
-            _ => {
-                // A record for this head that is not in memory is one a restart left: wall time
-                // is all that crosses a restart, so it alone decides how much of the wait is
-                // already spent — the same trust `retry.due_at` places in it.
-                let spent = match &d.ci_pending {
-                    Some((head, at)) if *head == pr.head_sha => {
-                        clock.wall().0.saturating_sub(*at).max(0) as u64
-                    }
-                    _ => {
-                        self.store.set_ci_pending(clock.as_ref(), issue_id, Some(&pr.head_sha))?;
-                        0
-                    }
-                };
-                let since = Mono(now.0.saturating_sub(spent));
-                self.ci_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), since));
-                since
+        let since = match resume_wait(
+            &mut self.ci_waits,
+            clock.as_ref(),
+            issue_id,
+            &pr.head_sha,
+            d.ci_pending.as_ref(),
+        ) {
+            Some(since) => since,
+            None => {
+                self.store.set_ci_pending(clock.as_ref(), issue_id, Some(&pr.head_sha))?;
+                self.ci_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), now));
+                now
             }
         };
         let timeout = self.cfg.delivery.ci_timeout_ms;
@@ -608,6 +614,111 @@ impl Scheduler {
         };
         let reason = format!(
             "no check run completed on {} within {} of {}; {what}",
+            pr.head_sha,
+            fmt_ms(timeout),
+            timestamp(clock.wall().0 - waited as i64)
+        );
+        tracing::warn!(issue_id, pr = pr.number, "{reason}; handing off");
+        self.hand_off(issue_id, &reason).map_err(StepError::Other)
+    }
+
+    /// Request a review of `pr`'s head from every expected reviewer who has not already given
+    /// one, then read back whether each attached; `true` when one did not and the pull request
+    /// was handed off for it. A refused request names its reviewer in the error, so the handoff
+    /// it becomes says who could not be asked (#222).
+    fn request_reviews(&mut self, issue_id: &str, pr: &PullRequest) -> Result<bool, StepError> {
+        let forge = self.forge.clone().expect("checked by delivery_on");
+        let clock = self.clock.clone();
+        let reviewers = self.cfg.delivery.reviewers.clone();
+        let before = forge.reviews(pr.number)?;
+        for r in reviewers.iter().filter(|r| !reviewed_head(&before, r, &pr.head_sha)) {
+            forge.request_review(pr.number, r).map_err(|e| match e {
+                ForgeError::Permanent(why) => {
+                    ForgeError::Permanent(format!("review request for {r} refused: {why}"))
+                }
+                other => other,
+            })?;
+        }
+        // The read that makes the request mean something. Attached is either still requested,
+        // or already answered on this head.
+        let requested = forge.review_requests(pr.number)?;
+        let reviews = forge.reviews(pr.number)?;
+        let missing: Vec<&str> = reviewers
+            .iter()
+            .filter(|r| !requested.contains(r) && !reviewed_head(&reviews, r, &pr.head_sha))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, reviewers = ?reviewers, "review requested and verified attached");
+            self.store.set_review_requested(
+                clock.as_ref(),
+                issue_id,
+                &pr.head_sha,
+                &reviewers,
+                None,
+            )?;
+            if self.review_waits.get(issue_id).is_none_or(|(head, _)| *head != pr.head_sha) {
+                self.review_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), clock.mono()));
+            }
+            return Ok(false);
+        }
+        let reason = format!(
+            "review request accepted by the provider but attached nobody: {}",
+            missing.join(", ")
+        );
+        tracing::error!(issue_id, pr = pr.number, missing = ?missing, "review request did not attach; handing off");
+        self.store.set_review_requested(
+            clock.as_ref(),
+            issue_id,
+            &pr.head_sha,
+            &reviewers,
+            Some(&reason),
+        )?;
+        self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+        Ok(true)
+    }
+
+    /// `missing` have not reviewed `pr`'s head: wait, leaving `ready` if the row was there, or
+    /// hand off naming them once `review_timeout_ms` has passed since the request. Never ready
+    /// in between, which is the whole of #222.
+    fn await_review(
+        &mut self,
+        issue_id: &str,
+        d: &DeliveryRecord,
+        pr: &PullRequest,
+        missing: &[String],
+    ) -> Result<(), StepError> {
+        let clock = self.clock.clone();
+        let now = clock.mono();
+        let since = resume_wait(
+            &mut self.review_waits,
+            clock.as_ref(),
+            issue_id,
+            &pr.head_sha,
+            d.review_requested_on.as_ref(),
+        )
+        .unwrap_or_else(|| {
+            self.review_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), now));
+            now
+        });
+        let timeout = self.cfg.delivery.review_timeout_ms;
+        let waited = now.saturating_since(since);
+        if waited <= timeout {
+            if d.stage == DeliveryStage::Ready {
+                tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, missing = ?missing, "no longer ready: its head is not reviewed");
+                self.store.set_delivery_stage(
+                    clock.as_ref(),
+                    issue_id,
+                    DeliveryStage::Awaiting,
+                    None,
+                )?;
+            }
+            tracing::debug!(issue_id, pr = pr.number, head = %pr.head_sha, "awaiting review");
+            return Ok(());
+        }
+        let reason = format!(
+            "no review from {} on {} within {} of {}",
+            missing.join(", "),
             pr.head_sha,
             fmt_ms(timeout),
             timestamp(clock.wall().0 - waited as i64)
@@ -769,6 +880,8 @@ impl Scheduler {
             last_progress_at: now,
             verdicts: Vec::new(),
             handed_back: None,
+            queued_feedback: None,
+            fresh_session: false,
             _broker: None,
         };
         self.gating.insert(issue_id.to_string(), Gating { run, handle, started: now });
@@ -969,31 +1082,54 @@ impl Scheduler {
             .collect()
     }
 
+    /// The issue a pull request is composed from: `seen`, else read by id, since delivery runs
+    /// before the first poll and a parked issue may never be polled again (#223). A failed or
+    /// empty read waits for the next delivery poll.
+    fn delivery_issue(&mut self, issue_id: &str) -> Option<Issue> {
+        if let Some(issue) = self.seen.get(issue_id) {
+            return Some(issue.clone());
+        }
+        match self.tracker.by_ids(&[issue_id.to_string()]) {
+            Ok(found) => {
+                let Some(issue) = found.into_iter().find(|i| i.id == issue_id) else {
+                    // Visible rather than debug: a Jira issue moved out of the configured project
+                    // stays omitted, and its delivery then waits with nothing else saying why.
+                    tracing::warn!(issue_id, "tracker omitted the issue; its pull request waits");
+                    self.last_error =
+                        Some(format!("delivery {issue_id}: the tracker does not return the issue"));
+                    return None;
+                };
+                self.seen.insert(issue.id.clone(), issue.clone());
+                Some(issue)
+            }
+            Err(e) => {
+                log_tracker_failure("issue read for its pull request failed", &e);
+                self.last_error = Some(format!("delivery {issue_id}: {e}"));
+                None
+            }
+        }
+    }
+
     /// The pull request's title and body, derived from the run record — never composed by the
     /// agent. What a reviewer needs first is what the issue asked for and what the branch
     /// actually contains; both are facts the orchestrator holds and the agent could only
     /// restate.
     fn pr_spec(
         &self,
-        issue_id: &str,
+        issue: &Issue,
         st: &IssueState,
         branch: &str,
         base: &str,
         commits: &[String],
     ) -> Result<PullRequestSpec, StepError> {
-        let issue = self.seen.get(issue_id);
-        let title = match issue {
-            Some(i) if !i.title.is_empty() => format!("{}: {}", i.identifier, i.title),
-            _ => format!("{}: {}", st.identifier, branch),
-        };
+        let issue_id = issue.id.as_str();
+        let title = format!("{}: {}", issue.identifier, issue.title);
 
         let mut body = String::new();
-        match issue.and_then(|i| i.url.as_deref().map(|url| (i, url))) {
-            Some((_, url)) if is_github_issue_url(url) => {
-                body.push_str(&format!("Closes {url}\n\n"))
-            }
-            Some((i, url)) => body.push_str(&format!("Issue: [{}]({url})\n\n", i.identifier)),
-            None => body.push_str(&format!("Issue: {}\n\n", st.identifier)),
+        match issue.url.as_deref() {
+            Some(url) if is_github_issue_url(url) => body.push_str(&format!("Closes {url}\n\n")),
+            Some(url) => body.push_str(&format!("Issue: [{}]({url})\n\n", issue.identifier)),
+            None => body.push_str(&format!("Issue: {}\n\n", issue.identifier)),
         }
         if base != self.cfg.delivery.base {
             body.push_str(&format!(
@@ -1042,6 +1178,38 @@ impl Scheduler {
             .map(|d| (d.issue_id.clone(), DeliveryView::from(d)))
             .collect())
     }
+}
+
+/// Whether `reviewer` has reviewed `head`. Only the current head counts: a review of an earlier
+/// one has not seen what the pull request now holds (#222).
+fn reviewed_head(reviews: &[Review], reviewer: &str, head: &str) -> bool {
+    reviews.iter().any(|rv| rv.reviewer == reviewer && rv.commit_sha == head)
+}
+
+/// Where a wait on `head` began, on `Mono`: from memory, else from the wall-clock start a
+/// restart left on the row. Wall time is all that crosses a restart, so it alone decides how
+/// much of the wait is already spent — the same trust `retry.due_at` places in it. `None` when
+/// neither knows this head, and the caller starts the wait.
+fn resume_wait(
+    waits: &mut HashMap<String, (String, Mono)>,
+    clock: &dyn Clock,
+    issue_id: &str,
+    head: &str,
+    persisted: Option<&(String, i64)>,
+) -> Option<Mono> {
+    if let Some((h, since)) = waits.get(issue_id)
+        && h == head
+    {
+        return Some(*since);
+    }
+    let (h, at) = persisted?;
+    if h != head {
+        return None;
+    }
+    let spent = clock.wall().0.saturating_sub(*at).max(0) as u64;
+    let since = Mono(clock.mono().0.saturating_sub(spent));
+    waits.insert(issue_id.to_string(), (head.to_string(), since));
+    Some(since)
 }
 
 /// Whether `url` is a GitHub issue's own permalink — the one shape GitHub's `Closes` keyword

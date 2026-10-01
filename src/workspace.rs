@@ -18,7 +18,7 @@ use nix::unistd::Pid;
 
 use crate::credentials::Credentials;
 use crate::forge::{ForgeError, Published, Publisher, Synced};
-use crate::model::{looks_like_commit, worktree_key};
+use crate::model::{dispatch_suffix, looks_like_commit, worktree_key};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -98,16 +98,31 @@ pub struct Removed {
 
 pub trait Workspace: Send + Sync {
     fn prepare(&self, issue_id: &str, identifier: &str) -> Result<Prepared, WorkspaceError>;
+
+    /// [`Workspace::prepare`], with the issue title and the branch already stored for it.
+    ///
+    /// A new git branch is named from the title. Passing the stored name is what keeps a later
+    /// edit of that title from minting a second branch, which delivery would never push: it
+    /// reads the stored one (#205). Impls with no branches ignore both.
+    fn prepare_for(
+        &self,
+        issue_id: &str,
+        identifier: &str,
+        title: &str,
+        stored_branch: Option<&str>,
+    ) -> Result<Prepared, WorkspaceError> {
+        let _ = (title, stored_branch);
+        self.prepare(issue_id, identifier)
+    }
+
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError>;
     fn path_for(&self, issue_id: &str, identifier: &str) -> PathBuf;
 
     /// The branch this issue's runs commit on, for impls that have one.
     ///
-    /// Pure naming, like [`Workspace::path_for`]: it answers what the branch *is called*, not
-    /// whether it exists right now. That is what lets the published snapshot carry it for an
-    /// issue whose run is over — which is when a reviewer wants it, since the branch is the
-    /// only thing a finished run leaves behind. Asking git per row per tick instead would put
-    /// a subprocess on the snapshot path.
+    /// The snapshot does not call this per row — it reads the branch [`Workspace::prepare`]
+    /// stored — so a tick does not pay for a subprocess. It stays the naming `prepare` uses,
+    /// so the two cannot spell the branch differently.
     fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String>;
 }
 
@@ -721,15 +736,167 @@ impl GitWorktreeWorkspace {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Namespaced under `crew/` and named after the same key as the directory, so the
-    /// branch holding a finished run's work can be found from the issue identifier by eye
-    /// rather than by recomputing a hash. `worktree_key` already keys off the dispatch id, so
-    /// two issues that happen to share an identifier still get two distinct branches.
+    /// An uncut title is the unreadable branch name #205 replaces, and a cut in the middle of
+    /// a word is just as hard to scan. Forty characters holds the title the operator quoted.
+    const SLUG_MAX: usize = 40;
+
+    /// The issue number as it appears in the branch: one leading `#` dropped, then anything
+    /// git refuses in a ref turned into `_`. `#178` and `PROJ-123` stay recognisable; `..`
+    /// and `a..b` do not reach the ref namespace as dots.
+    fn issue_number(identifier: &str) -> String {
+        let stripped = identifier.strip_prefix('#').unwrap_or(identifier);
+        let sanitized: String = stripped
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        if sanitized.is_empty() { "issue".into() } else { sanitized }
+    }
+
+    /// Lowercase ASCII words of `title`, joined by `-`, cut at a word boundary.
     ///
-    /// Dots are dropped even though the directory name keeps them: `a..b` is a legal directory
-    /// and an illegal ref, and a hostile identifier reaches both.
-    fn branch_name(issue_id: &str, identifier: &str) -> String {
+    /// A word longer than [`Self::SLUG_MAX`] is skipped, not sliced: a partial token is the
+    /// unreadable name the limit exists to avoid, and skipping it lets a later word still name
+    /// the branch (#205). Once the slug holds a word, the next word that does not fit ends it.
+    fn title_slug(title: &str) -> String {
+        let mut slug = String::new();
+        let mut word = String::new();
+        for c in title.chars() {
+            if c.is_ascii_alphanumeric() {
+                word.push(c.to_ascii_lowercase());
+                continue;
+            }
+            if !Self::push_slug_word(&mut slug, &word) && !slug.is_empty() {
+                return slug;
+            }
+            word.clear();
+        }
+        if !Self::push_slug_word(&mut slug, &word) && !slug.is_empty() {
+            return slug;
+        }
+        slug
+    }
+
+    /// Append `word` when the result still fits in [`Self::SLUG_MAX`].
+    ///
+    /// `false` means nothing was written. The word is never sliced: a cut in the middle of a
+    /// token is the unreadable branch name the limit exists to avoid (#205).
+    fn push_slug_word(slug: &mut String, word: &str) -> bool {
+        if word.is_empty() {
+            return true;
+        }
+        let sep = usize::from(!slug.is_empty());
+        if slug.len() + sep + word.len() > Self::SLUG_MAX {
+            return false;
+        }
+        if sep == 1 {
+            slug.push('-');
+        }
+        slug.push_str(word);
+        true
+    }
+
+    /// `crew/<number>-<slug>`, or `crew/<number>` when the title yields no words.
+    fn pretty_branch(identifier: &str, title: &str) -> String {
+        let number = Self::issue_number(identifier);
+        let slug = Self::title_slug(title);
+        match slug.is_empty() {
+            true => format!("crew/{number}"),
+            false => format!("crew/{number}-{slug}"),
+        }
+    }
+
+    /// The name `branch_name` produced before #205: `crew/` plus the directory key with dots
+    /// folded out. An issue already in flight has this ref, and renaming it would orphan the
+    /// commits delivery is about to push.
+    fn legacy_branch_name(issue_id: &str, identifier: &str) -> String {
         format!("crew/{}", Self::ref_key(issue_id, identifier))
+    }
+
+    /// `refs/crew/branch/<issue key>` → the branch this dispatch id already checked out.
+    ///
+    /// Keyed on the issue id alone, like [`Self::wip_prefix`]: `Store::ensure` may rename the
+    /// identifier after the branch exists, and a record under the old identifier would make
+    /// the next prepare mint a second branch. A symbolic ref, not a commit: the thing to
+    /// remember is the name, which a title edit must not change (#205).
+    fn branch_record_ref(issue_id: &str) -> String {
+        format!("refs/crew/branch/{}", Self::ref_key(issue_id, issue_id))
+    }
+
+    fn ref_exists(repo: &Path, branch: &str) -> bool {
+        let full = format!("refs/heads/{branch}");
+        Self::git(repo, &["rev-parse", "--verify", "--quiet", &full]).is_ok()
+    }
+
+    fn checked_out_branch(path: &Path) -> Option<String> {
+        Self::git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()
+    }
+
+    fn recorded_branch(repo: &Path, issue_id: &str) -> Option<String> {
+        let raw = Self::git(repo, &["symbolic-ref", "--quiet", &Self::branch_record_ref(issue_id)])
+            .ok()?;
+        let name = raw.strip_prefix("refs/heads/")?;
+        Self::ref_exists(repo, name).then(|| name.to_string())
+    }
+
+    fn record_branch(repo: &Path, issue_id: &str, branch: &str) -> Result<(), WorkspaceError> {
+        let target = format!("refs/heads/{branch}");
+        Self::git(repo, &["symbolic-ref", &Self::branch_record_ref(issue_id), &target])?;
+        Ok(())
+    }
+
+    /// True when some other dispatch id's record already points at `branch`.
+    ///
+    /// An unowned name is not this: it is reused, because it is this issue's own branch from
+    /// a prepare whose record did not land, and minting the hashed form would leave those
+    /// commits on a branch nothing attaches to. A name recorded for a different dispatch id
+    /// is the collision #205 requires a suffix for — sharing it would put two issues on one
+    /// branch.
+    fn pretty_taken_by_other(repo: &Path, issue_id: &str, branch: &str) -> bool {
+        let mine = Self::branch_record_ref(issue_id);
+        let target = format!("refs/heads/{branch}");
+        let listed =
+            Self::git(repo, &["for-each-ref", "--format=%(refname) %(symref)", "refs/crew/branch"])
+                .unwrap_or_default();
+        listed.lines().any(|line| {
+            let mut parts = line.splitn(2, ' ');
+            let name = parts.next().unwrap_or("");
+            let sym = parts.next().unwrap_or("");
+            name != mine && sym == target
+        })
+    }
+
+    /// The branch `prepare` should check out. Order is the one that does not rename or share:
+    /// the stored name, then the record, then a legacy ref, then the hashed form this issue
+    /// already holds, then a free pretty name, then — only when another dispatch id holds
+    /// the pretty name — the hashed form.
+    fn resolve_branch(
+        &self,
+        issue_id: &str,
+        identifier: &str,
+        title: &str,
+        stored: Option<&str>,
+    ) -> String {
+        if let Some(stored) = stored.filter(|b| Self::ref_exists(&self.repo, b)) {
+            return stored.to_string();
+        }
+        if let Some(recorded) = Self::recorded_branch(&self.repo, issue_id) {
+            return recorded;
+        }
+        let legacy = Self::legacy_branch_name(issue_id, identifier);
+        if Self::ref_exists(&self.repo, &legacy) {
+            return legacy;
+        }
+        let pretty = Self::pretty_branch(identifier, title);
+        let hashed = format!("{pretty}-{}", dispatch_suffix(issue_id));
+        if Self::ref_exists(&self.repo, &hashed) {
+            return hashed;
+        }
+        if !Self::ref_exists(&self.repo, &pretty)
+            || !Self::pretty_taken_by_other(&self.repo, issue_id, &pretty)
+        {
+            return pretty;
+        }
+        hashed
     }
 
     fn ref_key(issue_id: &str, identifier: &str) -> String {
@@ -880,10 +1047,20 @@ impl Workspace for GitWorktreeWorkspace {
     }
 
     fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String> {
-        Some(Self::branch_name(issue_id, identifier))
+        Some(self.resolve_branch(issue_id, identifier, "", None))
     }
 
     fn prepare(&self, issue_id: &str, identifier: &str) -> Result<Prepared, WorkspaceError> {
+        self.prepare_for(issue_id, identifier, "", None)
+    }
+
+    fn prepare_for(
+        &self,
+        issue_id: &str,
+        identifier: &str,
+        title: &str,
+        stored_branch: Option<&str>,
+    ) -> Result<Prepared, WorkspaceError> {
         let path = self.path_for(issue_id, identifier);
         self.guard(&path)?;
 
@@ -892,13 +1069,24 @@ impl Workspace for GitWorktreeWorkspace {
         // treat a leftover plain directory — e.g. from a `DirWorkspace` deployment migrating to
         // this type, or any other stray write to the workspace root — as an already-prepared
         // worktree, when nothing ever registered it with git.
-        let branch = Self::branch_name(issue_id, identifier);
+        //
+        // The branch this issue owns, not whatever the worktree was switched onto. Git lets
+        // this checkout move to another issue's retained ref once that issue's worktree is
+        // gone; recording the checkout would store both issues against one branch, which
+        // delivery then pushes (#205). An owned name the checkout is already on is left
+        // there, so an in-flight legacy spelling is not overwritten with a new one.
         let wip = self.existing_wip(issue_id);
         if Self::is_worktree_checkout(&path) {
+            let owned = self.resolve_branch(issue_id, identifier, title, stored_branch);
+            if Self::checked_out_branch(&path).is_some_and(|current| current != owned) {
+                Self::git(&path, &["switch", "--quiet", &owned])?;
+            }
+            Self::record_branch(&self.repo, issue_id, &owned)?;
             let head = Self::git(&path, &["rev-parse", "HEAD"]).ok();
-            return Ok(Prepared { path, created_now: false, branch: Some(branch), wip, head });
+            return Ok(Prepared { path, created_now: false, branch: Some(owned), wip, head });
         }
 
+        let branch = self.resolve_branch(issue_id, identifier, title, stored_branch);
         let path_str = path.to_string_lossy().into_owned();
         let start = self.start_ref()?;
         // A branch left behind by an earlier run holds that run's commits, so this attaches to
@@ -921,6 +1109,10 @@ impl Workspace for GitWorktreeWorkspace {
         } else {
             Self::git(&self.repo, &["worktree", "add", "-B", &branch, &path_str])?;
         }
+        // Without this record the next prepare cannot tell this issue's branch from another
+        // issue's identical `crew/<number>-<slug>`, and would either share it or leave these
+        // commits on a name nothing attaches to (#205).
+        Self::record_branch(&self.repo, issue_id, &branch)?;
         let head = Self::git(&path, &["rev-parse", "HEAD"]).ok();
         Ok(Prepared { path, created_now: true, branch: Some(branch), wip, head })
     }
@@ -932,6 +1124,17 @@ impl Workspace for GitWorktreeWorkspace {
         if !path.exists() {
             return Ok(Removed::default());
         }
+
+        // Read before `worktree remove` deletes the checkout. The branch to delete is the one
+        // this issue owns — the record, else the name resolve would check out, which is how a
+        // legacy ref is still found when `remove` is not handed the title. The checkout is
+        // that branch only while the agent left it there. Deleting a checkout switched onto
+        // another issue's retained ref removes their commits, and `branch -d` succeeds once
+        // those commits are already in HEAD (#205).
+        let checked_out =
+            if Self::is_worktree_checkout(&path) { Self::checked_out_branch(&path) } else { None };
+        let owned = Self::recorded_branch(&self.repo, issue_id)
+            .unwrap_or_else(|| self.resolve_branch(issue_id, identifier, "", None));
 
         // Worktrees registered *beneath* this one — an orchestrator that ran inside this
         // checkout before `new` refused that, or anything else that nested a worktree here by
@@ -971,7 +1174,8 @@ impl Workspace for GitWorktreeWorkspace {
         // Best-effort either way: a branch that was already deleted, or never created because
         // `prepare` failed before reaching it, must not turn a successful worktree removal into
         // an error — it just means `branch_deleted` reads `false`, same as "kept".
-        let branch = Self::branch_name(issue_id, identifier);
+        let mismatched = checked_out.as_ref().is_some_and(|current| current != &owned);
+        let branch = if mismatched { owned } else { checked_out.unwrap_or(owned) };
         let branch_deleted = match self.known_base() {
             Some(base) => {
                 Self::git(&self.repo, &["merge-base", "--is-ancestor", &branch, &base]).is_ok()
@@ -979,6 +1183,26 @@ impl Workspace for GitWorktreeWorkspace {
             }
             None => Self::git(&self.repo, &["branch", "-d", &branch]).is_ok(),
         };
+        if branch_deleted {
+            // A record that still names this branch would, once some other issue created that
+            // same pretty name, read as this issue's branch and check out theirs. `update-ref
+            // -d` follows the symbolic ref and deletes the branch; `--delete` removes the
+            // record alone (#205).
+            let record = Self::branch_record_ref(issue_id);
+            let points_here = Self::git(&self.repo, &["symbolic-ref", "--quiet", &record])
+                .ok()
+                .is_some_and(|raw| raw == format!("refs/heads/{branch}"));
+            if points_here
+                && let Err(e) = Self::git(&self.repo, &["symbolic-ref", "--delete", &record])
+            {
+                tracing::warn!(
+                    issue_id,
+                    branch,
+                    error = %e,
+                    "deleted the branch but not its name record"
+                );
+            }
+        }
 
         // Reconcile what the removal just orphaned in the shared metadata. The registrations
         // now point at directories that no longer exist, which is precisely what `prune`
@@ -1047,8 +1271,18 @@ impl Publisher for GitWorktreeWorkspace {
             .map_err(|e| ForgeError::Transient(format!("reading the fetched head: {e}")))?;
         let is_ancestor =
             |a: &str, b: &str| Self::git(worktree, &["merge-base", "--is-ancestor", a, b]).is_ok();
+        // Folding an unchanged remote head back in after the gate rebases onto a moved base
+        // merges commits the worktree already held — its own, or someone else's that an earlier
+        // sync took in — into their rewritten copies. Where the two sides touched the same lines
+        // that merge conflicts, and delivery reports it as someone else's push (#227, on #191).
+        // The lease is that last incorporated head. Equality with the fetched head means the
+        // remote has not moved since the last sync or publish, so the divergence is the rewrite
+        // and the push replaces it. A head the lease does not name is still merged (#163).
+        let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &lease_ref])
+            .unwrap_or_default();
+        let remote_unchanged = lease == remote_head;
 
-        let synced = if is_ancestor(&remote_head, "HEAD") {
+        let synced = if is_ancestor(&remote_head, "HEAD") || remote_unchanged {
             Synced::Current { remote_head: remote_head.clone() }
         } else {
             let fast_forward = is_ancestor("HEAD", &remote_head);
@@ -1077,7 +1311,8 @@ impl Publisher for GitWorktreeWorkspace {
             }
             Synced::Advanced { remote_head: remote_head.clone(), merged: !fast_forward }
         };
-        // Only now: the lease may name a head only once the worktree holds it.
+        // Only now may the lease move to a head, and only once the worktree holds it. When the
+        // fetched head is already the lease, this writes that same head back.
         Self::git(worktree, &["update-ref", &lease_ref, &remote_head])
             .map_err(|e| ForgeError::Transient(format!("recording the fetched head: {e}")))?;
         Ok(synced)
@@ -1436,7 +1671,7 @@ mod tests {
 
         let p = ws.prepare("id-1", "MT-1").unwrap().path;
         std::fs::write(p.join("scratch.txt"), b"never committed").unwrap();
-        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
+        let branch = GitWorktreeWorkspace::pretty_branch("MT-1", "");
         assert!(branch_exists(&repo, &branch));
 
         let removed = ws.remove("id-1", "MT-1").unwrap();
@@ -1508,7 +1743,7 @@ mod tests {
 
         let p = ws.prepare("id-1", "MT-1").unwrap().path;
         commit_in(&p, "work.txt", "the agent output");
-        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
+        let branch = GitWorktreeWorkspace::pretty_branch("MT-1", "");
 
         let removed = ws.remove("id-1", "MT-1").unwrap();
 
@@ -1631,7 +1866,7 @@ mod tests {
             Some(branch_head.as_str()),
             "the snapshot is parented on the branch head it was taken from"
         );
-        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
+        let branch = GitWorktreeWorkspace::pretty_branch("MT-1", "");
         assert_eq!(
             git_stdout(&repo, &["rev-parse", &branch]).as_deref(),
             Some(branch_head.as_str()),
@@ -1817,7 +2052,7 @@ mod tests {
         assert!(matches!(err, WorkspaceError::BaseFetch { .. }), "got {err:?}");
         let path = ws.path_for("id-1", "MT-1");
         assert!(!path.exists(), "no worktree is created on a guessed start point");
-        assert!(!branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")));
+        assert!(!branch_exists(&repo, &GitWorktreeWorkspace::pretty_branch("MT-1", "")));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -1865,7 +2100,7 @@ mod tests {
         let first = ws.prepare("id-1", "MT-1").unwrap().path;
         commit_in(&first, "work.txt", "the agent output");
         let committed = head_of(&first);
-        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
+        let branch = GitWorktreeWorkspace::pretty_branch("MT-1", "");
         ws.remove("id-1", "MT-1").unwrap();
         git_out(&repo, &["merge", "--ff-only", &branch]).unwrap();
 
@@ -1909,7 +2144,7 @@ mod tests {
             "got {err:?}"
         );
         assert!(!ws.path_for("id-1", "MT-1").exists());
-        assert!(!branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")));
+        assert!(!branch_exists(&repo, &GitWorktreeWorkspace::pretty_branch("MT-1", "")));
 
         for d in [&root, &repo, &bare] {
             std::fs::remove_dir_all(d).ok();
@@ -1964,7 +2199,7 @@ mod tests {
         let fresh = ws.prepare("id-1", "MT-1").unwrap();
         let reused = ws.prepare("id-1", "MT-1").unwrap();
         let named = fresh.branch.as_deref().expect("a git worktree always has a branch");
-        assert!(named.starts_with("crew/MT-1-"), "{named} does not name its issue");
+        assert_eq!(named, "crew/MT-1");
         assert_eq!(fresh.branch, reused.branch, "reuse reports the same branch as creation");
 
         std::fs::remove_dir_all(&root).ok();
@@ -2004,15 +2239,172 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_names_the_issue_whose_work_it_holds() {
-        // Finding a finished run's output must not mean recomputing a hash by hand.
-        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
-        assert!(branch.starts_with("crew/MT-1-"), "{branch} does not name its issue");
-        assert_ne!(
-            branch,
-            GitWorktreeWorkspace::branch_name("id-2", "MT-1"),
-            "two issues sharing an identifier still need distinct branches"
+    fn a_new_branch_is_named_after_the_issue_number_and_title() {
+        let root = tmp_root("wt-branch-slug");
+        let repo = tmp_repo("wt-branch-slug");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let title = "A pull request is judged on the head crewd just pushed";
+
+        let prepared = ws.prepare_for("id-178", "#178", title, None).unwrap();
+
+        let branch = "crew/178-a-pull-request-is-judged-on-the-head";
+        assert_eq!(prepared.branch.as_deref(), Some(branch));
+        assert_eq!(ws.branch_for("id-178", "#178").as_deref(), Some(branch));
+        assert!(branch_exists(&repo, branch));
+        assert!(!branch.contains(crate::model::dispatch_suffix("id-178").as_str()));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn two_issues_whose_names_collide_still_get_distinct_branches() {
+        let root = tmp_root("wt-branch-collide");
+        let repo = tmp_repo("wt-branch-collide");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let title = "Judge the pushed head";
+
+        let first = ws.prepare_for("id-a", "#178", title, None).unwrap();
+        let second = ws.prepare_for("id-b", "#178", title, None).unwrap();
+
+        let pretty = "crew/178-judge-the-pushed-head";
+        let hashed = format!("{pretty}-{}", crate::model::dispatch_suffix("id-b"));
+        assert_eq!(first.branch.as_deref(), Some(pretty));
+        assert_eq!(second.branch.as_deref(), Some(hashed.as_str()));
+        assert!(branch_exists(&repo, pretty));
+        assert!(branch_exists(&repo, &hashed));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_branch_created_under_the_old_name_is_still_found() {
+        let root = tmp_root("wt-branch-legacy");
+        let repo = tmp_repo("wt-branch-legacy");
+        let legacy = GitWorktreeWorkspace::legacy_branch_name("id-178", "#178");
+        assert!(legacy.starts_with("crew/_178-"), "{legacy}");
+        git_out(&repo, &["checkout", "-q", "-b", &legacy]).unwrap();
+        std::fs::write(repo.join("kept.txt"), b"from the old branch\n").unwrap();
+        git_out(&repo, &["add", "kept.txt"]).unwrap();
+        git_out(&repo, &["commit", "-q", "-m", "old work"]).unwrap();
+        git_out(&repo, &["checkout", "-q", "main"]).unwrap();
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let prepared = ws
+            .prepare_for(
+                "id-178",
+                "#178",
+                "A pull request is judged on the head crewd just pushed",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(prepared.branch.as_deref(), Some(legacy.as_str()));
+        assert!(prepared.path.join("kept.txt").exists(), "attached to the old branch");
+        assert!(!branch_exists(&repo, "crew/178-a-pull-request-is-judged-on-the-head"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_title_edit_does_not_rename_an_existing_branch() {
+        let root = tmp_root("wt-branch-retitle");
+        let repo = tmp_repo("wt-branch-retitle");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let first = ws.prepare_for("id-1", "#178", "Judge the pushed head", None).unwrap();
+        let branch = first.branch.clone().unwrap();
+        commit_in(&first.path, "work.txt", "the agent output");
+        ws.remove("id-1", "#178").unwrap();
+
+        let again = ws.prepare_for("id-1", "#178", "A completely different title", None).unwrap();
+        assert_eq!(again.branch.as_deref(), Some(branch.as_str()));
+        assert!(again.path.join("work.txt").exists(), "the commits stay on the original branch");
+        ws.remove("id-1", "#178").unwrap();
+
+        // The store is the other copy of the name. With the git record gone, a title edit
+        // still has to reattach to the branch delivery already has.
+        let record = GitWorktreeWorkspace::branch_record_ref("id-1");
+        git_out(&repo, &["symbolic-ref", "--delete", &record]).unwrap();
+        let from_store =
+            ws.prepare_for("id-1", "#178", "Yet another title", Some(&branch)).unwrap();
+        assert_eq!(from_store.branch.as_deref(), Some(branch.as_str()));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_title_whose_first_word_exceeds_the_slug_is_cut_at_a_word_boundary() {
+        // A token longer than the limit has no boundary inside it. Slicing it would put the
+        // partial word #205 rejects into the branch name; skipping it leaves a later word, or
+        // no slug at all.
+        let long = "A".repeat(50);
+        assert_eq!(GitWorktreeWorkspace::title_slug(&long), "");
+        assert_eq!(GitWorktreeWorkspace::pretty_branch("#178", &long), "crew/178");
+        let later = format!("{long} keeps the later words");
+        assert_eq!(GitWorktreeWorkspace::title_slug(&later), "keeps-the-later-words");
+        assert_eq!(
+            GitWorktreeWorkspace::title_slug(
+                "A pull request is judged on the head crewd just pushed"
+            ),
+            "a-pull-request-is-judged-on-the-head"
         );
+    }
+
+    #[test]
+    fn a_warm_worktree_checked_out_on_another_issues_branch_is_not_adopted_or_deleted() {
+        // Once an issue's worktree is gone, git lets another worktree check out the branch
+        // that was kept. Adopting that checkout stores both issues against one ref, and
+        // `branch -d` on remove then deletes it whenever the commits are already in HEAD.
+        let root = tmp_root("wt-foreign-branch");
+        let repo = tmp_repo("wt-foreign-branch");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let other = ws.prepare_for("id-a", "#178", "Judge the pushed head", None).unwrap();
+        let other_branch = other.branch.clone().unwrap();
+        commit_in(&other.path, "other.txt", "the other issue");
+        git_out(&repo, &["merge", "--ff-only", &other_branch]).unwrap();
+        git_out(&repo, &["worktree", "remove", "--force", other.path.to_str().unwrap()]).unwrap();
+        assert!(branch_exists(&repo, &other_branch), "the retained branch outlives its worktree");
+
+        let mine = ws.prepare_for("id-b", "#179", "A different change", None).unwrap();
+        let my_branch = mine.branch.clone().unwrap();
+        commit_in(&mine.path, "mine.txt", "this issue");
+        git_out(&mine.path, &["switch", "--quiet", &other_branch]).unwrap();
+
+        let removed = ws.remove("id-b", "#179").unwrap();
+        assert!(
+            branch_exists(&repo, &other_branch),
+            "remove must not delete the other issue's branch"
+        );
+        assert!(branch_exists(&repo, &my_branch), "this issue's own commits still outlive cleanup");
+        assert!(!removed.branch_deleted);
+
+        let again = ws.prepare_for("id-b", "#179", "A different change", Some(&my_branch)).unwrap();
+        git_out(&again.path, &["switch", "--quiet", &other_branch]).unwrap();
+        let continued =
+            ws.prepare_for("id-b", "#179", "A different change", Some(&my_branch)).unwrap();
+        assert_eq!(continued.branch.as_deref(), Some(my_branch.as_str()));
+        let head =
+            git_out(&continued.path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap();
+        assert_eq!(head, my_branch);
+        assert!(branch_exists(&repo, &other_branch));
+        let record = GitWorktreeWorkspace::branch_record_ref("id-b");
+        assert_eq!(
+            git_out(&repo, &["symbolic-ref", "--quiet", &record]).unwrap(),
+            format!("refs/heads/{my_branch}")
+        );
+        let other_record = GitWorktreeWorkspace::branch_record_ref("id-a");
+        assert_eq!(
+            git_out(&repo, &["symbolic-ref", "--quiet", &other_record]).unwrap(),
+            format!("refs/heads/{other_branch}")
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -2026,7 +2418,7 @@ mod tests {
         for (i, bad) in ["..", "a..b", "x.lock", "@", "-dash", "a/../b"].iter().enumerate() {
             let id = format!("id-{i}");
             ws.prepare(&id, bad).expect("a hostile identifier must not fail preparation");
-            let branch = GitWorktreeWorkspace::branch_name(&id, bad);
+            let branch = GitWorktreeWorkspace::pretty_branch(bad, "");
             assert!(branch_exists(&repo, &branch), "git refused the branch name {branch}");
         }
 
@@ -2134,7 +2526,7 @@ mod tests {
         assert!(!branch_exists(&repo, "crew/MT-601"), "a nested branch holding nothing goes");
         assert!(branch_exists(&repo, "crew/MT-602"), "a nested branch holding commits stays");
         assert!(
-            !branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")),
+            !branch_exists(&repo, &GitWorktreeWorkspace::pretty_branch("MT-1", "")),
             "the parent's own branch is treated exactly as before"
         );
 
@@ -2731,6 +3123,105 @@ mod tests {
             git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
             theirs
         );
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #227: the gate rebases a delivered branch onto a base that has moved, rewriting every
+    /// commit. The remote still holds crewd's own pre-rebase push, the head the lease recorded,
+    /// which is not an ancestor of the rewrite. `sync` leaves that branch alone, and the push
+    /// replaces the earlier head. Merging those commits back in is the conflict #191 was handed
+    /// with its own push.
+    #[test]
+    fn a_branch_the_gate_rebased_onto_a_moved_base_replaces_crewds_own_earlier_push() {
+        let root = tmp_root("wt-rebase-own");
+        let (repo, bare) = repo_with_remote("wt-rebase-own");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the agent's change");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        commit_in(&repo, "base.txt", "base moved");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["fetch", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["rebase", "-q", "FETCH_HEAD"]).unwrap();
+        let rebased = head_of(&p.path);
+        assert_ne!(rebased, first.head_sha, "the gate rewrote the delivered commits");
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: first.head_sha.clone() },
+            "the remote head is crewd's own push, so there is nothing to merge"
+        );
+        assert_eq!(
+            head_of(&p.path),
+            rebased,
+            "sync must leave the rebased branch as the gate left it"
+        );
+
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.head_sha, rebased);
+        let remote = git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap();
+        assert_eq!(remote, rebased, "the push replaces crewd's own earlier head");
+        assert!(
+            git_out(&bare, &["merge-base", "--is-ancestor", &first.head_sha, &remote]).is_err(),
+            "the earlier push was replaced, not merged back in"
+        );
+        let base = git_out(&bare, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert!(
+            git_out(&bare, &["merge-base", "--is-ancestor", &base, &remote]).is_ok(),
+            "the replaced branch still sits on the base the gate rebased onto"
+        );
+        let parents = git_out(&bare, &["rev-list", "--parents", "-n", "1", &remote]).unwrap();
+        assert_eq!(parents.split_whitespace().count(), 2, "the replaced head is not a merge");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #227 stops at crewd's own head. A commit someone else pushed after that — a head the lease
+    /// does not name — is still merged in, including once the gate has rewritten the worktree so
+    /// ancestry alone can no longer tell the two apart (#163).
+    #[test]
+    fn a_commit_someone_else_pushed_after_crewd_is_still_merged_in() {
+        let root = tmp_root("wt-rebase-theirs");
+        let (repo, bare) = repo_with_remote("wt-rebase-theirs");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the agent's change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-rebase-theirs-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+
+        commit_in(&repo, "base.txt", "base moved");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["fetch", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["rebase", "-q", "FETCH_HEAD"]).unwrap();
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Advanced { remote_head: theirs.clone(), merged: true }
+        );
+        assert!(p.path.join("theirs.txt").exists(), "their commit was merged in");
+        assert!(p.path.join("base.txt").exists(), "the rebase onto the moved base was kept");
+        assert!(
+            git_out(&p.path, &["merge-base", "--is-ancestor", &theirs, "HEAD"]).is_ok(),
+            "their commit is an ancestor of the branch, not something the push will replace"
+        );
+
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        let remote = git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap();
+        assert!(git_out(&bare, &["merge-base", "--is-ancestor", &theirs, &remote]).is_ok());
+        let base = git_out(&bare, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert!(git_out(&bare, &["merge-base", "--is-ancestor", &base, &remote]).is_ok());
 
         for d in [&root, &repo, &bare, &other] {
             std::fs::remove_dir_all(d).ok();

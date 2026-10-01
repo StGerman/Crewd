@@ -128,7 +128,16 @@ struct Running {
     verdicts: Vec<ReviewVerdict>,
     /// The delivery hand-back this run was dispatched to answer, kept so a gate that sends the
     /// run back can queue it again rather than delivery charging a second round for it (#160).
+    /// Also what a run that took no turn puts back: `launch` had already taken it (#216, #237).
     handed_back: Option<Feedback>,
+    /// Issue-level feedback `launch` took for this run — a queued conflict or gate brief, or
+    /// the retry reason when that was the prompt's only item. Put back if the worker halted
+    /// before a turn, because no agent acted on it (#216, #237).
+    queued_feedback: Option<Feedback>,
+    /// This run named a new session the CLI has never created. A worker that halts before a
+    /// turn must drop that id: the next attempt would `--resume` a conversation that does not
+    /// exist. A resumed session is one the CLI already has, and stays (#216, #237).
+    fresh_session: bool,
     /// This run's authority to write to the tracker, held for exactly as long as the run is in
     /// the `running` map. Never read — dropping it is the point. Every path that ends a run
     /// removes the entry, so every path revokes the token and deletes the config file without
@@ -146,7 +155,7 @@ struct Gating {
     started: Mono,
 }
 
-pub use libcrew::{RateLimitPause, Row, Snapshot};
+pub use libcrew::{HaltReason, HaltedWorker, RateLimitPause, Row, Snapshot};
 
 pub struct Scheduler {
     pub cfg: Config,
@@ -157,15 +166,13 @@ pub struct Scheduler {
     workers: Vec<WorkerPool>,
     workspace: Arc<dyn Workspace>,
     projector: Arc<dyn Projector>,
-    /// `None` when the broker could not start, or the operator turned it off. Dispatch carries
-    /// on either way — an agent without tracker tools is a degrade, not a failure.
+    /// `None` when the operator turned it off; one that is on and cannot start stops startup
+    /// in `main.rs` (#218).
     broker: Option<Arc<Broker>>,
-    /// `None` when transcripts are off or their root could not be created. Same contract as
-    /// the broker and the projector: a run with no record on disk, never a run that did not
-    /// happen.
+    /// `None` when transcripts are off. A run whose own file cannot be opened still runs: a run
+    /// with no record on disk, never a run that did not happen.
     transcripts: Option<Transcripts>,
-    /// `None` when the operator turned the gate off. Unlike the broker and the transcripts this
-    /// is not a degrade: with no gate a `Done` verdict is applied as the agent reported it,
+    /// `None` when the operator turned the gate off, which is a decision with a cost: with no gate a `Done` verdict is applied as the agent reported it,
     /// which is the exact handoff issue #21 is about, so `main.rs` sets one whenever
     /// `gate.enabled` is true and the tests say so explicitly when they want it.
     gate: Option<Arc<dyn Gate>>,
@@ -180,6 +187,9 @@ pub struct Scheduler {
     /// clock so a wall-clock step cannot hand a pull request off early (#105). Rebuilt from
     /// the store's wall-clock record after a restart, since `Mono` does not cross one.
     ci_waits: HashMap<String, (String, Mono)>,
+    /// The same, for the reviews `delivery.reviewers` names: the head they were requested on
+    /// and when, bounded by `delivery.review_timeout_ms` (#222).
+    review_waits: HashMap<String, (String, Mono)>,
     running: HashMap<String, Running>,
     /// Runs between the agent's `Done` and the verdict the gate turns it into. Disjoint from
     /// `running`; an issue is in at most one of the two.
@@ -200,6 +210,11 @@ pub struct Scheduler {
     /// that run still charges no attempt, the same as the one that set the pause in the first
     /// place (#37).
     rate_limit_pauses: HashMap<String, RateLimitPause>,
+    /// Keyed by worker name: a worker whose spawn failed `agent_not_found` (#216) or whose
+    /// account answered HTTP 402 (#237). Never cleared, and neither the binary nor the balance is
+    /// looked at again: the pause lasts until this process exits, and a restart is the operator
+    /// saying it is fixed (#218).
+    halted_workers: HashMap<String, HaltedWorker>,
     /// Set when a `prepare` in this tick's dispatch could not fetch the base, and read by both
     /// dispatch loops to stop there: every later `prepare` would wait out the same bounded
     /// fetch against the same remote, a minute each, and a tick has to end (review on #194).
@@ -243,6 +258,7 @@ impl Scheduler {
             publisher: None,
             delivery_polled: HashMap::new(),
             ci_waits: HashMap::new(),
+            review_waits: HashMap::new(),
             running: HashMap::new(),
             gating: HashMap::new(),
             seen: HashMap::new(),
@@ -250,6 +266,7 @@ impl Scheduler {
             recovered: false,
             last_parked_sweep: None,
             rate_limit_pauses: HashMap::new(),
+            halted_workers: HashMap::new(),
             base_unreachable: false,
             ticks: 0,
             last_error: None,
@@ -331,10 +348,10 @@ impl Scheduler {
         self.sweep_parked()?;
 
         // Checked after the housekeeping above and before the two dispatch steps it guards:
-        // reclaiming a closed parked issue's workspace has nothing to do with the account being
-        // throttled, but starting a new agent does (#37). Only when every worker is paused;
+        // reclaiming a closed parked issue's workspace has nothing to do with a worker being
+        // paused, but starting a new agent does (#37, #216, #237). Only when every worker is paused;
         // otherwise `pick_worker` skips the paused ones and the rest keep dispatching (#119).
-        if self.all_rate_limited() {
+        if self.all_paused() {
             self.publish()?;
             return Ok(());
         }
@@ -351,7 +368,9 @@ impl Scheduler {
     /// Release the claims of runs that did not survive the previous process.
     ///
     /// `running` is in-memory and the claim is in the store, so the two can only disagree
-    /// across a process boundary. Every ordinary exit reconciles them — `shutdown()`, `Drop for
+    /// across a process boundary. The daemon holds [`StoreLock`](crate::store::StoreLock) for
+    /// the life of the process, so a second daemon exits before it can reach this (#217).
+    /// Every ordinary exit reconciles them — `shutdown()`, `Drop for
     /// Scheduler`, the interrupt arm in `main` — and a `SIGKILL`, an OOM kill or a host reboot
     /// reaches none of those. What is left afterwards is an issue marked `running` in a
     /// database with nothing running: [`Store::claim`] refuses it forever, `detect_stalls`
@@ -478,6 +497,25 @@ impl Scheduler {
                 }
             }
 
+            // A binary that cannot be found, or an account with no balance, is the worker's
+            // failure, not this issue's: the same release as a rate limit, and a pause that
+            // lasts until restart (#216, #237). Only `ErrorKind::NotFound` is classified
+            // `agent_not_found`; a permission or resource error stays on the ordinary path
+            // below. `model_not_found` does too.
+            let halt = match &outcome {
+                Outcome::Failed { class: ErrorClass::AgentNotFound, .. } => {
+                    Some(HaltReason::BinaryNotFound)
+                }
+                Outcome::Failed { class: ErrorClass::AccountExhausted, .. } => {
+                    Some(HaltReason::AccountExhausted)
+                }
+                _ => None,
+            };
+            if let Some(reason) = halt {
+                self.halt_worker(&issue_id, &r, reason)?;
+                continue;
+            }
+
             if outcome == Outcome::Done {
                 // Now, and not when delivery applies them: the gate below rebases the branch,
                 // and a rebase rewrites the very shas these verdicts name. Checked against the
@@ -553,6 +591,79 @@ impl Scheduler {
             "account-wide rate limit; pausing this worker's dispatch until it resets"
         );
         self.pause_worker(&r.worker, kind, resets_at_ms);
+        Ok(())
+    }
+
+    /// The worker cannot run anything: its binary could not be spawned (#216), or its account
+    /// has no balance (#237). The claim is released uncharged (`Store::release_for_rate_limit`),
+    /// and dispatch to this worker stays paused for the rest of the process: neither the path
+    /// nor the balance is looked at again on a later tick.
+    ///
+    /// `launch` has already taken this run's feedback and named its session. A run that took no
+    /// turn acted on neither: the feedback goes back, and a session minted for this spawn is
+    /// dropped. A session the run was resuming is one the CLI already has, and stays. A run the
+    /// 402 cut short after a turn keeps both, and the handoff carries where it stopped.
+    fn halt_worker(
+        &mut self,
+        issue_id: &str,
+        r: &Running,
+        reason: HaltReason,
+    ) -> anyhow::Result<()> {
+        let p = r.handle.progress();
+        let label = match reason {
+            HaltReason::BinaryNotFound => ErrorClass::AgentNotFound.as_str(),
+            HaltReason::AccountExhausted => ErrorClass::AccountExhausted.as_str(),
+        };
+        self.store.finish_run(self.clock.as_ref(), &r.run_id, label, p.turns, p.tokens)?;
+        self.store.add_turns(issue_id, p.turns)?;
+        if p.turns == 0 {
+            self.return_untouched_launch(issue_id, r)?;
+        }
+        self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
+
+        let binary = self
+            .pool(&r.worker)
+            .and_then(|pool| pool.worker.bin())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::error!(
+            issue_id,
+            identifier = %r.issue.identifier,
+            worker = %r.worker,
+            %binary,
+            ?reason,
+            "worker cannot run; pausing this worker's dispatch until restart"
+        );
+        self.halted_workers.entry(r.worker.clone()).or_insert(HaltedWorker {
+            worker: r.worker.clone(),
+            binary,
+            reason,
+        });
+        Ok(())
+    }
+
+    /// Puts back what `launch` took for a run whose process acted on none of it.
+    fn return_untouched_launch(&mut self, issue_id: &str, r: &Running) -> anyhow::Result<()> {
+        // A sync brief is absent here: the next `sync_before_run` writes it again.
+        if let Some(fb) = &r.queued_feedback {
+            self.store.set_pending_feedback(
+                self.clock.as_ref(),
+                issue_id,
+                &serde_json::to_string(fb)?,
+            )?;
+        }
+        if let Some(fb) = &r.handed_back {
+            self.store.requeue_delivery_feedback(
+                self.clock.as_ref(),
+                issue_id,
+                &serde_json::to_string(fb)?,
+            )?;
+        }
+        if r.fresh_session {
+            // Minted for this spawn. The CLI never created the conversation, and a later
+            // `--resume` of it fails with no turns and charges a retry that did not need to happen.
+            self.store.set_session(self.clock.as_ref(), issue_id, None)?;
+        }
         Ok(())
     }
 
@@ -1461,11 +1572,11 @@ impl Scheduler {
             }
 
             // `st.attempt`, not a literal 0. For a genuinely new issue these are the same,
-            // but a rate-limit pause releases the claim with the attempt preserved
-            // (`release_for_rate_limit`) and sends the issue back through here — so a hard 0
-            // would tell the worker and the transcript this is a first attempt while the store
-            // still says it is the Nth, which is exactly the disagreement the pause exists to
-            // avoid.
+            // but a rate-limit pause, and a worker whose binary cannot be spawned, release the
+            // claim with the attempt preserved (`release_for_rate_limit`) and send the issue
+            // back through here — so a hard 0 would tell the worker and the transcript this is
+            // a first attempt while the store still says it is the Nth, which is exactly the
+            // disagreement the pause exists to avoid.
             //
             // An issue holding a session — one a rate limit or a human's unblock sent back
             // through here — is pinned to its worker like a continuation, and skipped while
@@ -1492,7 +1603,7 @@ impl Scheduler {
         let pool = self.pool(worker).expect("pick_worker only names a configured worker");
         let (pool_worker, pool_name) = (pool.worker.clone(), pool.name.clone());
 
-        self.store.ensure(
+        let st = self.store.ensure(
             self.clock.as_ref(),
             &issue.id,
             &issue.identifier,
@@ -1504,7 +1615,15 @@ impl Scheduler {
             return Ok(());
         }
 
-        let prepared = match self.workspace.prepare(&issue.id, &issue.identifier) {
+        // The stored branch, not a name recomputed from the title: a title edit between
+        // dispatches would otherwise mint a second branch and leave the commits on the one
+        // delivery pushes (#205).
+        let prepared = match self.workspace.prepare_for(
+            &issue.id,
+            &issue.identifier,
+            &issue.title,
+            st.branch.as_deref(),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(issue_id = %issue.id, error = %e, "workspace preparation failed");
@@ -1648,6 +1767,15 @@ impl Scheduler {
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
             .and_then(|j| parse(j, "delivery"));
+        // Kept on the run, not only copied into the prompt: a spawn that never starts has to
+        // put these back, and the retry reason is only in the prompt when nothing else was.
+        let queued_feedback = match &queued {
+            Some(fb) => Some(fb.clone()),
+            None if synced.is_none() && delivery.is_none() => {
+                brief.map(|b| Feedback::Gate { output: b.to_string() })
+            }
+            None => None,
+        };
         let mut feedback: Vec<Feedback> =
             synced.into_iter().chain(queued).chain(delivery.clone()).collect();
         if feedback.is_empty()
@@ -1713,6 +1841,8 @@ impl Scheduler {
                 last_progress_at: now,
                 verdicts: Vec::new(),
                 handed_back: delivery,
+                queued_feedback,
+                fresh_session: matches!(session, crate::worker::Session::New(_)),
                 _broker: broker_session,
             },
         );
@@ -1823,6 +1953,7 @@ impl Scheduler {
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
             rate_limit_pauses: self.published_pauses(),
+            halted_workers: self.published_halts(),
             rows,
         })
     }
