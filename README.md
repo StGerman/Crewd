@@ -4,8 +4,9 @@
 
 crewd is a daemon you run on your own machine. Label an issue in GitHub Issues or Jira, and
 crewd opens a git worktree for it, runs Claude Code there (or Grok, as a second worker on its
-own account), and opens a pull request only after the branch has been rebased onto today's base
-and has passed your own checks. You review pull requests. Nothing it does merges.
+own account), and opens a pull request only after the branch has been brought onto today's base
+and has passed your own checks (the gate, on by default). You review pull requests. Nothing it
+does merges.
 
 It ships as two binaries: `crewd`, the daemon, and `crewctl`, which asks a running daemon what
 it is doing without being able to touch its state.
@@ -33,20 +34,24 @@ Running one coding agent is easy. Running several, unattended, against a real ba
 it falls apart, and it falls apart in specific, repeatable ways. Each one has a brake here:
 
 - **An agent that says "done" is not done.** Two branches cut from the same base can each pass
-  the test suite alone and fail together. crewd rebases a finished branch onto the current
-  base, fetched fresh, and runs your checks in it *before* it believes the verdict. A failure
-  goes back to the agent with the output in hand; a rebase conflict it cannot hand back, or
-  `gate.max_failures` failures in a row, parks the issue for a human.
-- **A loop with no brake spends your whole budget.** Turns, retries, review round-trips and the
-  agent's tool calls are each bounded per session *and* per issue, and the per-issue bounds
-  never reset. An agent cannot buy itself a fresh budget by starting a new session or opening a
-  new pull request. The bounds count turns and calls, not dollars ([#26]).
+  the test suite alone and fail together. crewd's gate brings a finished branch onto the
+  current base, fetched fresh (a rebase, or a merge when the branch already merged an older
+  base), and runs your checks in it *before* it believes the verdict. A failure goes back to the
+  agent with the output in hand; a conflict it cannot hand back, or `gate.max_failures` failures
+  in a row, parks the issue for a human. The gate is on by default; with `gate.enabled = false`
+  a "done" is believed as reported.
+- **A loop with no brake spends your whole budget.** Each budget has a narrow bound and an
+  issue-wide one that never resets: turns per session and per issue, broker calls per run and
+  per issue, review round-trips per pull request and per issue. An agent cannot buy itself a
+  fresh budget by starting a new session or opening a new pull request. A run that keeps failing
+  the same way is quarantined rather than retried forever. The bounds count turns and calls, not
+  dollars ([#26]).
 - **A crash should cost a poll, not a wedged queue.** The database is a cache of judgment, not
   a system of record. Losing it degrades to re-polling the tracker. A hard kill releases its
   claims at the next startup rather than leaving an issue marked running forever. A second
   `crewd` pointed at the same database refuses to start while the first is alive.
 - **You should be able to see what happened.** Every run writes its full event stream to a
-  transcript on disk, and a running daemon answers questions over an HTTP API, and as MCP tools
+  transcript on disk (on by default), and a running daemon answers questions over an HTTP API, and as MCP tools
   for a supervising agent, without being disturbed.
 
 The orchestrator is the only authority, and every external thing (tracker, agent, git, clock)
@@ -64,9 +69,10 @@ crewd.
   decides what that is.
 - **Contain the agent, yet** ([#135]). A real worker runs on your machine, as you: `claude -p
   --permission-mode bypassPermissions`, or `grok --always-approve`, in the issue's worktree.
-  Its environment is built from an allowlist and tracker writes go through a scoped, logged
-  broker, but on macOS `gh` and `claude` read the login keychain, so a dispatched agent can
-  still push, comment and close as you. Run it where that is acceptable.
+  Its environment is built from an allowlist, and Claude's tracker writes go through a scoped,
+  logged broker (Grok gets no tracker tools), but on macOS `gh` and `claude` read the login
+  keychain, so a dispatched agent can still push, comment and close as you. Run it where that
+  is acceptable.
 
 ## Installation
 

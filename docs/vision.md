@@ -17,7 +17,7 @@ and the "Not yet" rows below are the roadmap that stance implies.
 | `WatchdogSec` | Stall detection, `agent.stall_timeout_ms` |
 | A stop that waits for the process | A workspace is removed only after its worker is confirmed stopped |
 | State that survives its own crash | Claims released and worktrees reconciled at the next startup |
-| Resource limits | Per-session and per-issue budgets on turns, tool calls and review rounds that never reset. **Not yet:** dollars ([#26]), CPU and memory ([#143]) |
+| Resource limits | Turns per session and per issue, broker calls per run and per issue, review rounds per pull request and per issue; the issue-wide bounds never reset. **Not yet:** dollars ([#26]), CPU and memory ([#143]) |
 | journald | A transcript per run |
 | `systemctl status` | `crewctl status`, the TUI, MCP tools for a supervising agent |
 | A pluggable runtime (runc) | The `Worker` trait: Claude Code, Grok |
@@ -46,7 +46,8 @@ In scope and built:
 
 - **The session lifecycle:** claim, worktree, spawn, supervise, detect a stall, retry, stop,
   release.
-- **Bounds** per session and per issue, which an agent cannot reset.
+- **Bounds** on turns, broker calls and review rounds, each with an issue-wide bound an agent
+  cannot reset.
 - **The handoff:** the gate, the pull request, and red CI or review comments sent back to the
   agent.
 - **The operator surface:** transcripts, `crewctl`, the TUI, the ops API and its MCP tools.
@@ -66,7 +67,8 @@ Out of scope:
   goal into tasks.
 - **Merging.** The trait that talks to the forge has no merge method, and is not going to grow
   one.
-- **Being an editor.** The TUI and `crewctl` show state; they do not change the work.
+- **Being an editor.** The TUI can force a tick, clear a quarantine and lift a park, and
+  `crewctl` only reads; neither edits the work.
 
 New work lands at one of the four boundaries [ADR 1](adr/0001-extension-boundaries.md) names: a
 trait implementation, a `crewctl-<name>` command, a hook, or a core change that protects an
