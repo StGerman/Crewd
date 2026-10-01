@@ -6,7 +6,8 @@ each issue the tracker marks ready, supervises it, bounds it, retries or stops i
 log. Something above it (the tracker, an operator, a supervising agent) decides what work to run.
 
 The [README](../README.md) is what crewd does for you today. This page is where it is headed,
-and the "Not yet" rows below are the roadmap that stance implies.
+and the "Not yet" rows below are the roadmap that stance implies. Each names the milestone that
+closes it; milestones are worked in `M<n>` order.
 
 ## The model
 
@@ -17,14 +18,14 @@ and the "Not yet" rows below are the roadmap that stance implies.
 | `WatchdogSec` | Stall detection, `agent.stall_timeout_ms` |
 | A stop that waits for the process | A workspace is removed only after its worker is confirmed stopped |
 | State that survives its own crash | Claims released and worktrees reconciled at the next startup |
-| Resource limits | Turns per session and per issue, broker calls per run and per issue, review rounds per pull request and per issue; the issue-wide bounds never reset. **Not yet:** dollars ([#26]), CPU and memory ([#143]) |
+| Resource limits | Turns per session and per issue, broker calls per run and per issue, review rounds per pull request and per issue; the issue-wide bounds never reset. **Not yet:** dollars ([#26]), CPU and memory ([#143]), in [M9] |
 | journald | A transcript per run |
 | `systemctl status` | `crewctl status`, the TUI, MCP tools for a supervising agent |
 | A pluggable runtime (runc) | The `Worker` trait: Claude Code, Grok |
-| A versioned API a higher layer drives (CRI) | The ops API at `/api/v1`. **Not yet:** a promise of what v1 keeps stable ([#90]) |
-| Sandboxing | **Not yet** ([#135]). Agents run as you |
-| Packaged, started by the init system | **Not yet** ([#90]). Built from source, run by hand |
-| Drain and restart | **Not yet** ([#107]) |
+| A versioned API a higher layer drives (CRI) | The ops API at `/api/v1`. **Not yet:** a promise of what v1 keeps stable ([#245]), in [M7] |
+| Sandboxing | **Not yet** ([#135], in [M8]). Agents run as you |
+| Packaged, started by the init system | **Not yet** ([#90], in [M7]). Built from source, run by hand |
+| Drain and restart | **Not yet** ([#107], in [M11]) |
 
 One row has no counterpart. A service manager believes a process's exit status; crewd does not
 believe an agent's "done".
@@ -54,10 +55,10 @@ In scope and built:
 
 In scope and not built yet:
 
-- **Confining the agent** ([#135]).
-- **Packaging, and running under launchd or systemd** ([#90]).
-- **Draining for a restart** ([#107]), and **accounting** in dollars, CPU and memory ([#26],
-  [#143]).
+- **Confining the agent** ([#135], [M8]).
+- **Packaging, and running under launchd or systemd** ([#90], [M7]).
+- **Draining for a restart** ([#107], [M11]), and **accounting** in dollars, CPU and memory ([#26],
+  [#143], [M9]).
 
 Out of scope:
 
@@ -79,3 +80,8 @@ invariant.
 [#107]: https://github.com/StGerman/crewd/issues/107
 [#135]: https://github.com/StGerman/crewd/issues/135
 [#143]: https://github.com/StGerman/crewd/issues/143
+[#245]: https://github.com/StGerman/crewd/issues/245
+[M7]: https://github.com/StGerman/crewd/milestone/10
+[M8]: https://github.com/StGerman/crewd/milestone/11
+[M9]: https://github.com/StGerman/crewd/milestone/12
+[M11]: https://github.com/StGerman/crewd/milestone/13
