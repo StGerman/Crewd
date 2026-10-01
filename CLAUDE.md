@@ -35,7 +35,10 @@ daemon's store.
 
 Where new work lands is decided by [ADR 1](docs/adr/0001-extension-boundaries.md): a trait
 implementation, an external `crewctl-<name>` command, a hook, or a core change that protects an
-invariant.
+invariant. Whether it belongs at all is [docs/vision.md](docs/vision.md): crewd is the runner
+for agent sessions, what a service manager is to processes, and its Scope section names what is
+out (deciding what to work on, planning, merging, editing). Read it before filing or taking work
+that widens what crewd does.
 
 ## Commands
 
