@@ -656,7 +656,9 @@ impl<H: Http> Forge for GithubForge<H> {
     }
 
     /// A bot through GraphQL's `requestReviewsByLogin`, since REST drops one and answers
-    /// success (GETT-174120); anyone else through REST.
+    /// success (GETT-174120); anyone else through REST. Sent with an App's installation token,
+    /// a request for Copilot succeeds and attaches nobody, because an App has no Copilot seat:
+    /// only a person can request it (#252). Delivery reads that back and asks the operator.
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError> {
         if let Some(bot) = reviewer.strip_suffix(BOT_SUFFIX) {
             let id = self.pull_request_node_id(number)?;

@@ -162,9 +162,12 @@ timeout_ms = 1800000
 #
 # `reviewers` are requested on every head delivery pushes and waited for: a pull request is
 # ready only once each has reviewed its current head (#222). The repository's automatic Copilot
-# review never runs on a pull request the app opens, so delivery requests Copilot itself — a
-# `[bot]` login through GraphQL, since REST drops a bot and answers success (GETT-174120) — and
-# a request that attaches nobody, or is refused, is handed off naming the reviewer.
+# review does not cover a pull request the app opens, and the app cannot request Copilot either:
+# an App has no Copilot seat, so the request is accepted and attaches nobody (#252). A `[bot]`
+# login is requested through GraphQL, since REST drops a bot and answers success (GETT-174120);
+# one that attaches nobody is waited for like any other, with the issue's note telling the
+# operator to request it, and a review from it on the head counts whoever requested it. A person
+# or team that attaches nobody, or a refused request, is handed off naming the reviewer.
 [delivery]
 enabled = true
 base = "master"
