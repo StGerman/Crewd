@@ -34,9 +34,12 @@
 //!
 //! A review request is followed by a read. GitHub answers a request for a bot reviewer with
 //! `200` and attaches nobody (GETT-174120), so the provider's own answer is not evidence; the
-//! pull request's outstanding requests and its posted reviews are. A request that verifiably
-//! attached nobody is a handoff with that reason, reported on the issue's row — never a quiet
-//! success that leaves a pull request nobody will look at.
+//! pull request's outstanding requests and its posted reviews are. A person or team request
+//! that verifiably attached nobody is a handoff with that reason, reported on the issue's row —
+//! never a quiet success that leaves a pull request nobody will look at. A bot's is the one
+//! waiting can fix: an App has no Copilot seat, so only a person can request Copilot, and the
+//! pull request waits for that review with the issue's row telling the operator to request it
+//! (#252). It is never ready in between.
 //!
 //! And it is per head. A fix round pushes a new head to the same pull request, and a reviewer
 //! verified against the old one has not seen it; so a head the request was not made on is
@@ -520,12 +523,16 @@ impl Scheduler {
         let settled = self.store.verdicts_for(issue_id)?;
         let reviews = forge.reviews(number)?;
         // The review the operator was told to request has arrived, whoever requested it: the
-        // note is done, and left on the row it would tell them to request it still (#252).
+        // note is done, and left on the row it would tell them to request it still (#252). The
+        // row's note is cleared first: `review_error` is what finds this again, so a kill between
+        // the two writes is finished on the next poll.
         if let Some(note) = &d.review_error
-            && st.last_error.as_ref() == Some(note)
             && self.cfg.delivery.reviewers.iter().all(|r| reviewed_head(&reviews, r, &pr.head_sha))
         {
             tracing::info!(issue_id, pr = number, head = %pr.head_sha, "the review the operator was asked to request has arrived");
+            if st.last_error.as_ref() == Some(note) {
+                self.store.clear_note(clock.as_ref(), issue_id)?;
+            }
             self.store.set_review_requested(
                 clock.as_ref(),
                 issue_id,
@@ -533,7 +540,6 @@ impl Scheduler {
                 &d.review_reviewers,
                 None,
             )?;
-            self.store.clear_note(clock.as_ref(), issue_id)?;
         }
         let mut open = forge.review_comments(number)?;
         open.extend(summary_findings(&reviews, &pr.head_sha, &self.cfg.delivery.summary_reviewers));

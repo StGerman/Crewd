@@ -1651,8 +1651,9 @@ impl Store {
     }
 
     /// The expected reviews were requested on `head` from `reviewers`. `error` is the
-    /// verification's finding when the provider accepted the request and attached nobody;
-    /// `None` records a request that verifiably took. The request time is kept for the same
+    /// verification's finding when the provider accepted the request and attached nobody: the
+    /// handoff reason, or for a bot the request the operator is asked to make (#252). `None`
+    /// records a request that verifiably took, or a bot's review that arrived since. The request time is kept for the same
     /// head and the same reviewers, so asking again does not restart the wait
     /// `delivery.review_timeout_ms` bounds; a reviewer added since is a new request and starts
     /// it afresh (#222).
