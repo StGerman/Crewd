@@ -74,8 +74,6 @@ struct GhPullRequest {
     #[serde(default)]
     merged_at: Option<String>,
     #[serde(default)]
-    requested_reviewers: Vec<GhUser>,
-    #[serde(default)]
     mergeable: Option<bool>,
     #[serde(default)]
     mergeable_state: Option<String>,
@@ -98,7 +96,6 @@ fn to_pull_request(gh: GhPullRequest) -> PullRequest {
         head_sha: gh.head.sha,
         base: gh.base.r#ref,
         state,
-        requested_reviewers: gh.requested_reviewers.into_iter().map(|u| u.login).collect(),
         // `dirty` is GitHub's word for a merge conflict, and can arrive with `mergeable` still
         // unset; any other state leaves the boolean to speak.
         mergeable: if gh.mergeable_state.as_deref() == Some("dirty") {
@@ -179,9 +176,11 @@ struct GhReviewComment {
     in_reply_to_id: Option<u64>,
 }
 
-// ---- GitHub's GraphQL shape, for review threads alone ------------------
+// ---- GitHub's GraphQL shape: review threads, and bot review requests ---
 
-/// Review threads and their resolution exist only in GraphQL; REST has neither.
+/// Review threads and their resolution exist only in GraphQL; REST has neither. A bot reviewer
+/// too: REST `requested_reviewers` drops a requested bot and answers success (GETT-174120), and
+/// its read of a pull request omits one that GraphQL's `reviewRequests` lists (#222).
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 const THREADS_QUERY: &str =
@@ -195,6 +194,33 @@ const THREADS_QUERY: &str =
     }
   }
 }";
+
+const PULL_REQUEST_ID_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } }
+}";
+
+const REVIEW_REQUESTS_QUERY: &str =
+    "query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id
+      reviewRequests(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { requestedReviewer { __typename ... on Actor { login } ... on Team { slug } } }
+      }
+    }
+  }
+}";
+
+/// `union: true`, or the mutation replaces every request already on the pull request.
+const REQUEST_BOT_REVIEW_MUTATION: &str = "mutation($id: ID!, $bots: [String!]) {
+  requestReviewsByLogin(input: { pullRequestId: $id, botLogins: $bots, union: true }) {
+    pullRequest { id }
+  }
+}";
+
+/// How the reviews endpoint spells a bot's login, and GraphQL's `botLogins` does not.
+const BOT_SUFFIX: &str = "[bot]";
 
 const RESOLVE_MUTATION: &str = "mutation($id: ID!) {
   resolveReviewThread(input: { threadId: $id }) { thread { id isResolved } }
@@ -252,6 +278,62 @@ struct GqlThread {
     id: String,
     is_resolved: bool,
     comments: GqlCommentPage,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlReviewRequestsData {
+    repository: Option<GqlRequestsRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlRequestsRepository {
+    pull_request: Option<GqlRequestsPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlRequestsPullRequest {
+    id: String,
+    /// Absent from [`PULL_REQUEST_ID_QUERY`]'s answer, which asks for the id alone.
+    #[serde(default)]
+    review_requests: Option<GqlRequestPage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlRequestPage {
+    page_info: GqlPageInfo,
+    nodes: Vec<GqlRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlRequest {
+    requested_reviewer: Option<GqlReviewer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlReviewer {
+    #[serde(rename = "__typename")]
+    typename: String,
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+impl GqlReviewer {
+    /// The login as [`Forge::reviews`] reports it. GraphQL spells a bot without the suffix REST
+    /// gives it, so a requested bot compared as GraphQL spells it would never match its review.
+    fn login(self) -> Option<String> {
+        match (self.typename.as_str(), self.login, self.slug) {
+            ("User" | "Mannequin" | "Organization", Some(login), _) => Some(login),
+            (_, Some(login), _) if login.ends_with(BOT_SUFFIX) => Some(login),
+            (_, Some(login), _) => Some(format!("{login}{BOT_SUFFIX}")),
+            (_, None, slug) => slug,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +456,18 @@ impl<H: Http> GithubForge<H> {
                 _ => return Ok(threads),
             }
         }
+    }
+
+    /// The pull request's GraphQL node id, which every GraphQL mutation on it is keyed by.
+    fn pull_request_node_id(&self, number: u64) -> Result<String, ForgeError> {
+        let data: GqlReviewRequestsData = self.graphql(
+            PULL_REQUEST_ID_QUERY,
+            json!({ "owner": self.owner, "repo": self.repo, "number": number }),
+        )?;
+        data.repository
+            .and_then(|r| r.pull_request)
+            .map(|p| p.id)
+            .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))
     }
 
     /// A mutation GitHub answers without `isResolved: true` did not resolve the thread, and
@@ -561,13 +655,47 @@ impl<H: Http> Forge for GithubForge<H> {
         Ok(to_pull_request(gh))
     }
 
+    /// A bot through GraphQL's `requestReviewsByLogin`, since REST drops one and answers
+    /// success (GETT-174120); anyone else through REST.
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError> {
+        if let Some(bot) = reviewer.strip_suffix(BOT_SUFFIX) {
+            let id = self.pull_request_node_id(number)?;
+            let _: Value =
+                self.graphql(REQUEST_BOT_REVIEW_MUTATION, json!({ "id": id, "bots": [bot] }))?;
+            return Ok(());
+        }
         let url = format!(
             "{API_BASE}/repos/{}/{}/pulls/{number}/requested_reviewers",
             self.owner, self.repo
         );
         self.send_json("POST", &url, &json!({ "reviewers": [reviewer] }))?;
         Ok(())
+    }
+
+    fn review_requests(&self, number: u64) -> Result<Vec<String>, ForgeError> {
+        let mut logins = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let data: GqlReviewRequestsData = self.graphql(
+                REVIEW_REQUESTS_QUERY,
+                json!({ "owner": self.owner, "repo": self.repo, "number": number, "after": after }),
+            )?;
+            let page = data
+                .repository
+                .and_then(|r| r.pull_request)
+                .and_then(|p| p.review_requests)
+                .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?;
+            logins.extend(
+                page.nodes
+                    .into_iter()
+                    .filter_map(|n| n.requested_reviewer)
+                    .filter_map(|r| r.login()),
+            );
+            match page.page_info.end_cursor {
+                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
+                _ => return Ok(logins),
+            }
+        }
     }
 
     fn reviews(&self, number: u64) -> Result<Vec<Review>, ForgeError> {
@@ -876,7 +1004,6 @@ mod tests {
             "head": { "sha": head_sha },
             "base": { "ref": base },
             "state": state,
-            "requested_reviewers": [],
         })
     }
 

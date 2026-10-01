@@ -15,10 +15,10 @@
 //! Two things a caller must know about the contract:
 //!
 //! * `request_review` performs the request and nothing else. Whether a reviewer actually
-//!   attached is answered by [`Forge::pull_request`] and [`Forge::reviews`] afterwards, and the
-//!   scheduler is what asks — because the provider's own answer cannot be trusted here: GitHub
-//!   answers a request for a bot reviewer with `200` and attaches nobody (GETT-174120), and the
-//!   only way to notice is to look.
+//!   attached is answered by [`Forge::review_requests`] and [`Forge::reviews`] afterwards, and
+//!   the scheduler is what asks — because the provider's own answer cannot be trusted here:
+//!   GitHub answers a REST request for a bot reviewer with `200` and attaches nobody
+//!   (GETT-174120), and the only way to notice is to look.
 //! * `ci_status` reports [`CiStatus::Pending`] for a head with no check runs yet as well as for
 //!   one still running. A repository with no CI at all therefore reads as pending forever; the
 //!   scheduler bounds that with a timeout rather than this trait guessing.
@@ -85,9 +85,6 @@ pub struct PullRequest {
     pub base: String,
     /// `open`, `closed` or `merged`. A merged pull request also reads as not open.
     pub state: PrState,
-    /// Logins with a review request outstanding. A reviewer who has already posted a review is
-    /// no longer in this list — check [`Forge::reviews`] too before concluding nobody attached.
-    pub requested_reviewers: Vec<String>,
     /// Whether the pull request can merge into its base: `Some(false)` for a conflict, `None`
     /// while the provider is still computing it — which GitHub does after every push, and which
     /// is not a conflict. A list endpoint never carries it, so only [`Forge::pull_request`] does.
@@ -182,6 +179,14 @@ pub trait Forge: Send + Sync {
     /// Ask `reviewer` to review. Performs the request only — see the module doc for why the
     /// caller, not this method, decides whether it worked.
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError>;
+
+    /// Logins with a review request outstanding, bots included and spelled as
+    /// [`Forge::reviews`] spells them (`<name>[bot]`). Not a field of [`PullRequest`]: GitHub's
+    /// REST read of a pull request omits a requested bot (#222), so a request verified there
+    /// reads as attaching nobody whether it took or not. A reviewer who has already posted a
+    /// review is no longer listed — check [`Forge::reviews`] too before concluding nobody
+    /// attached.
+    fn review_requests(&self, number: u64) -> Result<Vec<String>, ForgeError>;
 
     fn reviews(&self, number: u64) -> Result<Vec<Review>, ForgeError>;
 

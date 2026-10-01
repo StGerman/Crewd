@@ -208,7 +208,6 @@ impl GithubBackend {
             "base": { "ref": base },
             "state": "open",
             "merged": false,
-            "requested_reviewers": [],
             "mergeable": true,
         })
     }

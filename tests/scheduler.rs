@@ -3917,9 +3917,16 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
         },
     );
     run_once(&mut h2);
-    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
     assert!(delivery_of(&h2, "iss-1").review_error.is_none());
-    drop(forge2);
+    forge2.add_review(
+        forge2.open_prs()[0].number,
+        "copilot-pull-request-reviewer[bot]",
+        "COMMENTED",
+    );
+    h2.clock.advance_ms(1_000);
+    h2.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
 }
 
 #[test]
@@ -4379,11 +4386,17 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
     let d = delivery_of(&h, "iss-1");
     assert_eq!(d.head_sha.as_deref(), Some(FakeForge::head_after_publish(2).as_str()));
     assert_eq!(requests(&forge), 2, "a new head is a new request: {:?}", forge.ops());
-    assert!(
-        forge.pr(pr).unwrap().requested_reviewers.contains(&"reviewer".to_string()),
-        "and it verifiably attached"
+    assert!(forge.requested(pr).contains(&"reviewer".to_string()), "and it verifiably attached");
+    assert_eq!(
+        d.stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the approval was of the first head, not this one"
     );
-    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+
+    forge.add_review(pr, "reviewer", "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
 }
 
 /// A review round on a ready pull request whose first head is green, with the fix's push

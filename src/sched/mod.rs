@@ -187,6 +187,9 @@ pub struct Scheduler {
     /// clock so a wall-clock step cannot hand a pull request off early (#105). Rebuilt from
     /// the store's wall-clock record after a restart, since `Mono` does not cross one.
     ci_waits: HashMap<String, (String, Mono)>,
+    /// The same, for the reviews `delivery.reviewers` names: the head they were requested on
+    /// and when, bounded by `delivery.review_timeout_ms` (#222).
+    review_waits: HashMap<String, (String, Mono)>,
     running: HashMap<String, Running>,
     /// Runs between the agent's `Done` and the verdict the gate turns it into. Disjoint from
     /// `running`; an issue is in at most one of the two.
@@ -255,6 +258,7 @@ impl Scheduler {
             publisher: None,
             delivery_polled: HashMap::new(),
             ci_waits: HashMap::new(),
+            review_waits: HashMap::new(),
             running: HashMap::new(),
             gating: HashMap::new(),
             seen: HashMap::new(),

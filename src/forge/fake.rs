@@ -58,6 +58,8 @@ pub enum Op {
 struct PrRecord {
     pr: PullRequest,
     spec: PullRequestSpec,
+    /// Outstanding review requests, which [`Forge::review_requests`] answers.
+    requested: Vec<String>,
     reviews: Vec<Review>,
     comments: Vec<ReviewComment>,
 }
@@ -159,6 +161,11 @@ impl FakeForge {
 
     pub fn pr(&self, number: u64) -> Option<PullRequest> {
         self.inner.lock().unwrap().prs.get(&number).map(|r| r.pr.clone())
+    }
+
+    /// The review requests outstanding on pull request `number`.
+    pub fn requested(&self, number: u64) -> Vec<String> {
+        self.inner.lock().unwrap().prs.get(&number).map(|r| r.requested.clone()).unwrap_or_default()
     }
 
     pub fn spec_of(&self, number: u64) -> Option<PullRequestSpec> {
@@ -270,7 +277,7 @@ impl FakeForge {
             body: body.into(),
             url: Some(format!("https://forge.example/pulls/{number}#{id}")),
         });
-        rec.pr.requested_reviewers.retain(|r| r != reviewer);
+        rec.requested.retain(|r| r != reviewer);
         id
     }
 
@@ -544,12 +551,17 @@ impl Forge for FakeForge {
             head_sha,
             base: spec.base.clone(),
             state: PrState::Open,
-            requested_reviewers: vec![],
             mergeable: g.mergeable,
         };
         g.prs.insert(
             number,
-            PrRecord { pr: pr.clone(), spec: spec.clone(), reviews: vec![], comments: vec![] },
+            PrRecord {
+                pr: pr.clone(),
+                spec: spec.clone(),
+                requested: vec![],
+                reviews: vec![],
+                comments: vec![],
+            },
         );
         Ok(pr)
     }
@@ -583,10 +595,16 @@ impl Forge for FakeForge {
             .get_mut(&number)
             .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?;
         // The silent success: the provider says yes and does nothing.
-        if attach && !rec.pr.requested_reviewers.iter().any(|r| r == reviewer) {
-            rec.pr.requested_reviewers.push(reviewer.into());
+        if attach && !rec.requested.iter().any(|r| r == reviewer) {
+            rec.requested.push(reviewer.into());
         }
         Ok(())
+    }
+
+    fn review_requests(&self, number: u64) -> Result<Vec<String>, ForgeError> {
+        let g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        Ok(g.prs.get(&number).map(|r| r.requested.clone()).unwrap_or_default())
     }
 
     fn reviews(&self, number: u64) -> Result<Vec<Review>, ForgeError> {
