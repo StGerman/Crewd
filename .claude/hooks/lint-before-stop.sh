@@ -3,7 +3,7 @@
 # done, rather than a continuation later from the handoff gate (#187).
 #
 # It acts only on a `crew/` branch, the prefix every dispatched branch has
-# (`branch_name` in src/workspace.rs). An operator's session on such a branch is
+# (`pretty_branch` in src/workspace.rs). An operator's session on such a branch is
 # blocked too, on purpose: it is about to push to an agent's branch.
 #
 # It checks every stop, including the one after its own block, so a fix is

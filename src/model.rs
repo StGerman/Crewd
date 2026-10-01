@@ -273,11 +273,17 @@ pub fn worktree_key(issue_id: &str, identifier: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
         .collect();
 
-    let digest = blake3::hash(issue_id.as_bytes());
-    let suffix: String = digest.to_hex().chars().take(12).collect();
-
     let stem = if sanitized.is_empty() { "issue" } else { sanitized.as_str() };
-    format!("{stem}-{suffix}")
+    format!("{stem}-{}", dispatch_suffix(issue_id))
+}
+
+/// Twelve hex digits of the dispatch id.
+///
+/// Two issues whose identifiers — or whose issue number and title slug — sanitise to the same
+/// text would otherwise share a directory or a branch. The same length everywhere it is
+/// appended, so the branch collision form cannot be weaker than the directory name (#205).
+pub(crate) fn dispatch_suffix(issue_id: &str) -> String {
+    blake3::hash(issue_id.as_bytes()).to_hex().chars().take(12).collect()
 }
 
 /// A UUID-shaped name for a `claude` conversation, derived rather than random so this crate

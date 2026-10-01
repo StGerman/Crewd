@@ -184,7 +184,7 @@ this file.
 | :---- | :---- | :---- |
 | `anyhow` | Error context at the binary boundary: `main.rs`, `tui`, `api`, `sched`, `project` | Never inside a domain trait |
 | `base64` | URL-safe encoding of the GitHub App JWT, standard encoding of Jira's Basic auth header (#99) | Already in the tree under `ureq` |
-| `blake3` | Collision-proof suffix for `worktree_key`, derivation of `session_id` | Deterministic on purpose, see `src/model.rs` |
+| `blake3` | Collision-proof suffix for `worktree_key` and for a branch name another issue already holds, derivation of `session_id` | Deterministic on purpose, see `src/model.rs` |
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |

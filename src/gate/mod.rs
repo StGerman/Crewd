@@ -1,7 +1,7 @@
 //! The handoff gate: what stands between an agent saying `Done` and a human being handed the
 //! branch.
 //!
-//! "Agent said done" is not a merge signal. A dispatched run leaves commits on `crew/<key>`
+//! "Agent said done" is not a merge signal. A dispatched run leaves commits on `crew/<number>-<slug>`
 //! green against the base it forked from and unknown against the base it will actually merge
 //! into — and the three defects in issue #21 existed only in that combination, where neither
 //! agent could have seen them. So a `Done` verdict is not applied until the run's branch has
