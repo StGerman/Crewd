@@ -1,52 +1,36 @@
 # crewd
 
-**A system daemon for coding-agent sessions: what systemd is to services and containerd is to
-containers.**
+**Point it at your backlog. It works the tickets and hands you pull requests.**
 
-crewd starts an agent session for each issue your tracker marks ready, supervises it, bounds it,
-retries or stops it, and keeps its log. It does not decide what work matters; the tracker does.
-And unlike a service manager, it does not trust the exit status: a branch becomes a pull request
-only after it is rebased onto today's base and passes your checks. Nothing it does merges.
+crewd is a daemon you run on your own machine. Label an issue in GitHub Issues or Jira, and
+crewd opens a git worktree for it, runs Claude Code there (or Grok, as a second worker on its
+own account), and opens a pull request only after the branch has been rebased onto today's base
+and has passed your own checks. You review pull requests. Nothing it does merges.
 
-Work comes from GitHub Issues or Jira Cloud, pull requests go to GitHub, and the agent is Claude
-Code, with Grok as a second worker on its own account. It ships as two binaries: `crewd`, the
-daemon, and `crewctl`, which asks a running daemon what it is doing without being able to touch
-its state.
+It ships as two binaries: `crewd`, the daemon, and `crewctl`, which asks a running daemon what
+it is doing without being able to touch its state.
 
-## The model
+## Who it is for
 
-crewd is built to hold the guarantees a service manager holds, applied to coding-agent
-sessions. Where it does not hold one yet, the table says so.
+Teams whose tickets live in GitHub Issues or Jira Cloud and whose code lives on GitHub, who
+already use Claude Code, and who want it working the backlog while nobody is watching: on their
+own machine, under their own logins, behind their own test suite. A Grok account adds a second
+worker with its own slots, so work overflows to it when Claude's are full.
 
-| A service manager has | crewd has |
-|---|---|
-| One PID 1, one authority | One scheduler. A second `crewd` on the same store refuses to start |
-| Restart policy, `StartLimitBurst` | Capped backoff, quarantine on a permanent failure, `gate.max_failures` |
-| `WatchdogSec` | Stall detection, `agent.stall_timeout_ms` |
-| A stop that waits for the process | A workspace is removed only after its worker is confirmed stopped |
-| State that survives its own crash | Claims released and worktrees reconciled at the next startup |
-| Resource limits | Per-session and per-issue budgets on turns, tool calls and review rounds that never reset. **Not yet:** dollars ([#26]), CPU and memory ([#143]) |
-| journald | A transcript per run |
-| `systemctl status` | `crewctl status`, the TUI, MCP tools for a supervising agent |
-| A pluggable runtime (runc) | The `Worker` trait: Claude Code, Grok |
-| A versioned API a higher layer drives (CRI) | The ops API at `/api/v1`. **Not yet:** a promise of what v1 keeps stable ([#90]) |
-| Sandboxing | **Not yet** ([#135]). Agents run as you |
-| Packaged, started by the init system | **Not yet** ([#90]). Built from source, run by hand |
-| Drain and restart | **Not yet** ([#107]) |
+Something else fits better, as of October 2026, if:
 
-One row has no counterpart. A service manager believes a process's exit status; crewd does not
-believe an agent's "done".
-
-[#26]: https://github.com/StGerman/crewd/issues/26
-[#90]: https://github.com/StGerman/crewd/issues/90
-[#107]: https://github.com/StGerman/crewd/issues/107
-[#135]: https://github.com/StGerman/crewd/issues/135
-[#143]: https://github.com/StGerman/crewd/issues/143
+- **None of it should run on your machine.** Hosted agents (Codex cloud, Devin, Cursor's
+  background agents, Rovo Dev in Jira) run the agent in the vendor's sandbox.
+- **Your tracker is Linear.** Linear hands issues to Codex, Cursor, Devin or Copilot natively,
+  and Cyrus runs Claude Code from it. crewd has no Linear tracker.
+- **Your code is on Bitbucket or GitLab.** crewd opens pull requests on GitHub only.
+- **You want a dozen agent CLIs side by side.** crewd runs Claude Code and Grok, each held to
+  the same gate and budgets.
 
 ## Why it doesn't trust "done"
 
-Running one coding agent is easy. Running several unattended against a real backlog fails in
-specific, repeatable ways, and each one has a brake here:
+Running one coding agent is easy. Running several, unattended, against a real backlog is where
+it falls apart, and it falls apart in specific, repeatable ways. Each one has a brake here:
 
 - **An agent that says "done" is not done.** Two branches cut from the same base can each pass
   the test suite alone and fail together. crewd rebases a finished branch onto the current
@@ -59,7 +43,8 @@ specific, repeatable ways, and each one has a brake here:
   new pull request. The bounds count turns and calls, not dollars ([#26]).
 - **A crash should cost a poll, not a wedged queue.** The database is a cache of judgment, not
   a system of record. Losing it degrades to re-polling the tracker. A hard kill releases its
-  claims at the next startup rather than leaving an issue marked running forever.
+  claims at the next startup rather than leaving an issue marked running forever. A second
+  `crewd` pointed at the same database refuses to start while the first is alive.
 - **You should be able to see what happened.** Every run writes its full event stream to a
   transcript on disk, and a running daemon answers questions over an HTTP API, and as MCP tools
   for a supervising agent, without being disturbed.
@@ -70,64 +55,22 @@ why "would this still be correct if the agent were working on this repo?" is a q
 code can actually answer. The question is not hypothetical: crewd's own backlog is worked by
 crewd.
 
-## Who it is for
+## What it will not do
 
-Operators who want coding agents run as infrastructure: started from the tracker, supervised
-and bounded like any other service, and observed without being disturbed, on their own machine,
-under their own logins, behind their own test suite. A Grok account adds a second worker with
-its own slots, so work overflows to it when Claude's are full.
-
-Where it sits among the alternatives, as of October 2026:
-
-- **Hosted agents** (Codex cloud, Devin, Cursor's background agents, Rovo Dev in Jira) are
-  vertically integrated: agent, runtime and interface in one product, sandboxed and run by the
-  vendor. Choose one of them if none of it should run on your machine.
-- **Agent apps** (Agent Orchestrator, Cyrus, the Symphony ports) each bring their own runner and
-  their own interface. crewd is only the runner, and `crewctl`, the TUI and the ops API are its
-  whole interface.
-- **Not covered yet:** a Linear tracker (Linear delegates to agents natively, and Cyrus runs
-  Claude Code from it), pull requests on Bitbucket or GitLab, and a sandboxed agent ([#135]).
-
-## Scope
-
-In scope and built:
-
-- **The session lifecycle:** claim, worktree, spawn, supervise, detect a stall, retry, stop,
-  release.
-- **Bounds** per session and per issue, which an agent cannot reset.
-- **The handoff:** the gate, the pull request, and red CI or review comments sent back to the
-  agent.
-- **The operator surface:** transcripts, `crewctl`, the TUI, the ops API and its MCP tools.
-
-In scope and not built yet:
-
-- **Confining the agent** ([#135]). Today a real worker runs on your machine, as you: `claude -p
+- **Merge.** The trait that talks to the forge has no merge method, and is not going to grow
+  one. A red CI or a review comment goes back to the agent; a green, reviewed pull request
+  waits for you.
+- **Decide what to work on.** It dispatches what is labelled. Whoever triages the tracker
+  decides what that is.
+- **Contain the agent, yet** ([#135]). A real worker runs on your machine, as you: `claude -p
   --permission-mode bypassPermissions`, or `grok --always-approve`, in the issue's worktree.
   Its environment is built from an allowlist and tracker writes go through a scoped, logged
   broker, but on macOS `gh` and `claude` read the login keychain, so a dispatched agent can
   still push, comment and close as you. Run it where that is acceptable.
-- **Packaging, and running under launchd or systemd** ([#90]).
-- **Draining for a restart** ([#107]), and **accounting** in dollars, CPU and memory ([#26],
-  [#143]).
-
-Out of scope:
-
-- **Deciding what to work on.** The tracker, and whoever triages it, decides; crewd dispatches
-  what is labelled.
-- **Planning or splitting work.** The issue is the unit of work. crewd does not decompose a
-  goal into tasks.
-- **Merging.** The trait that talks to the forge has no merge method, and is not going to grow
-  one. A green, reviewed pull request waits for you.
-- **Being an editor.** The TUI and `crewctl` show state; they do not change the work.
-
-New work lands at one of the four boundaries [ADR 1](docs/adr/0001-extension-boundaries.md)
-names: a trait implementation, a `crewctl-<name>` command, a hook, or a core change that
-protects an invariant.
 
 ## Installation
 
-A system daemon should arrive as a package and be started by launchd or systemd. crewd has
-neither yet ([#90]): you build it from source and run it by hand. You need Rust, `git`, and the
+There is no release yet ([#90]), so you build from source. You need Rust, `git`, and the
 [Claude Code CLI](https://claude.com/claude-code) logged in.
 
 ```bash
@@ -275,3 +218,11 @@ concrete defects in that design: a continuation loop that could respawn every se
 that could overflow, permanent failures retried forever, a workspace deleted under a live
 worker. Each is a row in [docs/invariants.md](docs/invariants.md) with the test that fails
 without its fix; the later rows came from crewd working its own backlog.
+
+Where it is headed: crewd is built to hold the guarantees a service manager holds, applied to
+coding-agent sessions, the way systemd runs services and containerd runs containers.
+[docs/vision.md](docs/vision.md) maps each guarantee to crewd and marks what is not built yet.
+
+[#26]: https://github.com/StGerman/crewd/issues/26
+[#90]: https://github.com/StGerman/crewd/issues/90
+[#135]: https://github.com/StGerman/crewd/issues/135
