@@ -3,5 +3,6 @@ target
 *.db
 *.db-wal
 *.db-shm
+*.db.lock
 .claude/settings.local.json
 .DS_Store
