@@ -1957,6 +1957,7 @@ impl Scheduler {
         });
 
         Ok(Snapshot {
+            build: libcrew::build().to_string(),
             generated_at: now_wall,
             running: self.running.len() + self.gating.len(),
             reserved: retries.values().filter(|r| r.reserved_state.is_some()).count(),
