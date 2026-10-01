@@ -96,6 +96,9 @@ cargo run -- --api 127.0.0.1:8787
 cargo run -p crewctl -- status
 ```
 
+`crewctl` reads the same `/api/v1` a program of your own can drive; what v1 keeps stable is
+[docs/api-v1.md](docs/api-v1.md).
+
 ### Pointing it at your own repository
 
 1. **Copy `crew.github.toml`** and set `tracker.owner` / `tracker.repo` to yours. Both
