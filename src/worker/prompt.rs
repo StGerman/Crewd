@@ -10,6 +10,10 @@
 //! one, and stays. Everything else is copied through — a markdown crate would re-emit the
 //! description — except the blank-line run that touches a removed comment. A body with no
 //! comment must reach the agent unchanged.
+//!
+//! Both prompts also name a checkpoint in the worktree's git directory (#186). A lost
+//! session id and a compacted resume otherwise start the issue over; the scheduler never
+//! reads the file, so a missing one only costs that advice.
 
 use super::{RateLimitSignal, TokenUsage, ToolEndpoint};
 use crate::model::{Feedback, Issue, ReviewVerdict, Verdict, looks_like_commit};
@@ -400,6 +404,26 @@ fn inline_span_end(input: &str, i: usize) -> Option<usize> {
     None
 }
 
+/// The checkpoint's name inside the worktree's git directory, as `git rev-parse --git-path`
+/// takes it (#186). Git answers with the right place for a linked worktree too
+/// (`.git/worktrees/<name>/crew/checkpoint.md`), which is outside the index and outside the
+/// worktree, so the file cannot be committed and goes away with the worktree.
+pub(crate) const CHECKPOINT_GIT_PATH: &str = "crew/checkpoint.md";
+
+/// Tells the agent to keep a checkpoint and to read it first (#186). Fixed text in both
+/// prompts: a new session is also the cold start after a lost session id on a worktree that
+/// survived, so it needs the same instruction as a continuation, and neither prompt checks
+/// whether the file exists.
+fn checkpoint_help() -> String {
+    format!(
+        "Keep a checkpoint at the path `git rev-parse --git-path {CHECKPOINT_GIT_PATH}` prints \
+         in this worktree. If it already exists, read it before anything else and do not \
+         repeat what it covers. Update it after each commit with the acceptance criteria and \
+         the status of each, the last commit that passed the commit-gate commands, and the next \
+         action. Git does not track that path, so the file cannot be committed.\n"
+    )
+}
+
 /// The prompt for an attempt that resumes an existing conversation.
 ///
 /// It omits the issue body when the session already holds the current one, and most of the
@@ -408,6 +432,7 @@ fn inline_span_end(input: &str, i: usize) -> Option<usize> {
 /// operator writes decisions, and a session told only to continue acts on the old text. What
 /// the prompt adds is what the agent cannot see from inside: why the previous session ended,
 /// which is a rebase conflict when the gate blocked it and an unfinished session otherwise.
+/// The checkpoint comes before that (#186): a compacted resume would otherwise re-explore.
 pub(crate) fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
@@ -432,14 +457,18 @@ pub(crate) fn build_continuation_prompt(
     };
     let mut p = format!(
         "Continue working on {}. {why} The working directory is the same worktree, with \
-         whatever you committed still in it. Pick up where you left off.\n\n\
-         The same rules apply: commit as you go, and when the work is fully complete, simply \
+         whatever you committed still in it.\n\n",
+        issue.identifier
+    );
+    p.push_str(&checkpoint_help());
+    p.push('\n');
+    p.push_str(
+        "The same rules apply: commit as you go, and when the work is fully complete, simply \
          stop. If you need another turn, end your final message with a line reading \
          exactly:\n\
          CREW_OUTCOME: continue: <one-sentence reason>\n\n\
          If you are stuck and need a human to unblock you, end with:\n\
          CREW_OUTCOME: blocked: <one-sentence reason>\n",
-        issue.identifier
     );
     if body_changed {
         p.push_str(
@@ -466,6 +495,10 @@ pub(crate) fn build_prompt(
     if let Some(url) = &issue.url {
         p.push_str(&format!("Tracker URL: {url}\n\n"));
     }
+    // Ahead of the description: a retry whose session id was lost is this prompt, and
+    // reading the body first is the re-exploration the checkpoint exists to skip (#186).
+    p.push_str(&checkpoint_help());
+    p.push('\n');
     if let Some(body) = &issue.body {
         p.push_str("Description:\n");
         p.push_str(&prompt_body(body));
@@ -672,6 +705,18 @@ mod tests {
             build_prompt(&issue, None, &[], &[]),
             build_continuation_prompt(&issue, None, &[], &[], true),
         ]
+    }
+
+    /// Both prompts carry the same fixed checkpoint text ahead of the work (#186): a new
+    /// session is also the cold start after a lost session id.
+    #[test]
+    fn a_new_and_a_continued_prompt_both_tell_the_agent_to_read_the_checkpoint_first() {
+        let issue = issue("Do the work.");
+        insta::assert_snapshot!("checkpoint_new_prompt", build_prompt(&issue, None, &[], &[]));
+        insta::assert_snapshot!(
+            "checkpoint_continuation_prompt",
+            build_continuation_prompt(&issue, None, &[], &[], false)
+        );
     }
 
     #[test]

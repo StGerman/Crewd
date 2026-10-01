@@ -1,8 +1,10 @@
 ---
 source: src/worker/claude.rs
-expression: "build_prompt(&issue(), None, None, &[])"
+expression: "build_prompt(&issue(), None, &[], &[])"
 ---
 You are working on issue MT-1: t
+
+Keep a checkpoint at the path `git rev-parse --git-path crew/checkpoint.md` prints in this worktree. If it already exists, read it before anything else and do not repeat what it covers. Update it after each commit with the acceptance criteria and the status of each, the last commit that passed the commit-gate commands, and the next action. Git does not track that path, so the file cannot be committed.
 
 Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
 
