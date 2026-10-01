@@ -128,15 +128,15 @@ struct Running {
     verdicts: Vec<ReviewVerdict>,
     /// The delivery hand-back this run was dispatched to answer, kept so a gate that sends the
     /// run back can queue it again rather than delivery charging a second round for it (#160).
-    /// Also what a spawn that never started puts back: `launch` had already taken it (#216).
+    /// Also what a run that took no turn puts back: `launch` had already taken it (#216, #237).
     handed_back: Option<Feedback>,
     /// Issue-level feedback `launch` took for this run — a queued conflict or gate brief, or
-    /// the retry reason when that was the prompt's only item. Put back if the process never
-    /// started, because nothing read it (#216).
+    /// the retry reason when that was the prompt's only item. Put back if the worker halted
+    /// before a turn, because no agent acted on it (#216, #237).
     queued_feedback: Option<Feedback>,
-    /// This run named a new session the CLI has never created. A spawn that fails before the
-    /// process exists must drop that id: the next attempt would `--resume` a conversation that
-    /// does not exist. A resumed session is one the CLI already has, and stays (#216).
+    /// This run named a new session the CLI has never created. A worker that halts before a
+    /// turn must drop that id: the next attempt would `--resume` a conversation that does not
+    /// exist. A resumed session is one the CLI already has, and stays (#216, #237).
     fresh_session: bool,
     /// This run's authority to write to the tracker, held for exactly as long as the run is in
     /// the `running` map. Never read — dropping it is the point. Every path that ends a run
@@ -155,7 +155,7 @@ struct Gating {
     started: Mono,
 }
 
-pub use libcrew::{MissingBinary, RateLimitPause, Row, Snapshot};
+pub use libcrew::{HaltReason, HaltedWorker, RateLimitPause, Row, Snapshot};
 
 pub struct Scheduler {
     pub cfg: Config,
@@ -207,10 +207,11 @@ pub struct Scheduler {
     /// that run still charges no attempt, the same as the one that set the pause in the first
     /// place (#37).
     rate_limit_pauses: HashMap<String, RateLimitPause>,
-    /// Keyed by worker name: the binary a spawn failed to exec (`agent_not_found`). Never
-    /// cleared and never re-resolved — the pause lasts until this process exits, and a restart
-    /// is what looks for the binary again (#216, #218).
-    missing_binaries: HashMap<String, String>,
+    /// Keyed by worker name: a worker whose spawn failed `agent_not_found` (#216) or whose
+    /// account answered HTTP 402 (#237). Never cleared, and neither the binary nor the balance is
+    /// looked at again: the pause lasts until this process exits, and a restart is the operator
+    /// saying it is fixed (#218).
+    halted_workers: HashMap<String, HaltedWorker>,
     /// Set when a `prepare` in this tick's dispatch could not fetch the base, and read by both
     /// dispatch loops to stop there: every later `prepare` would wait out the same bounded
     /// fetch against the same remote, a minute each, and a tick has to end (review on #194).
@@ -261,7 +262,7 @@ impl Scheduler {
             recovered: false,
             last_parked_sweep: None,
             rate_limit_pauses: HashMap::new(),
-            missing_binaries: HashMap::new(),
+            halted_workers: HashMap::new(),
             base_unreachable: false,
             ticks: 0,
             last_error: None,
@@ -344,7 +345,7 @@ impl Scheduler {
 
         // Checked after the housekeeping above and before the two dispatch steps it guards:
         // reclaiming a closed parked issue's workspace has nothing to do with a worker being
-        // paused, but starting a new agent does (#37, #216). Only when every worker is paused;
+        // paused, but starting a new agent does (#37, #216, #237). Only when every worker is paused;
         // otherwise `pick_worker` skips the paused ones and the rest keep dispatching (#119).
         if self.all_paused() {
             self.publish()?;
@@ -492,12 +493,22 @@ impl Scheduler {
                 }
             }
 
-            // A binary that cannot be found is the worker's failure, not this issue's: the
-            // same release as a rate limit, and a pause that lasts until restart (#216).
-            // Only `ErrorKind::NotFound` is classified this way; a permission or resource
-            // error stays on the ordinary path below. `model_not_found` does too.
-            if matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }) {
-                self.pause_for_missing_binary(&issue_id, &r)?;
+            // A binary that cannot be found, or an account with no balance, is the worker's
+            // failure, not this issue's: the same release as a rate limit, and a pause that
+            // lasts until restart (#216, #237). Only `ErrorKind::NotFound` is classified
+            // `agent_not_found`; a permission or resource error stays on the ordinary path
+            // below. `model_not_found` does too.
+            let halt = match &outcome {
+                Outcome::Failed { class: ErrorClass::AgentNotFound, .. } => {
+                    Some(HaltReason::BinaryNotFound)
+                }
+                Outcome::Failed { class: ErrorClass::AccountExhausted, .. } => {
+                    Some(HaltReason::AccountExhausted)
+                }
+                _ => None,
+            };
+            if let Some(reason) = halt {
+                self.halt_worker(&issue_id, &r, reason)?;
                 continue;
             }
 
@@ -579,23 +590,56 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The worker's binary could not be spawned. The claim is released uncharged
-    /// (`Store::release_for_rate_limit`), and dispatch to this worker stays paused for the
-    /// rest of the process: the path is not looked up again on a later tick (#216).
+    /// The worker cannot run anything: its binary could not be spawned (#216), or its account
+    /// has no balance (#237). The claim is released uncharged (`Store::release_for_rate_limit`),
+    /// and dispatch to this worker stays paused for the rest of the process: neither the path
+    /// nor the balance is looked at again on a later tick.
     ///
-    /// `launch` has already taken this run's feedback and named its session. Nothing read
-    /// either: the feedback goes back, and a session minted for this spawn is dropped. A
-    /// session the run was resuming is one the CLI already has, and stays.
-    fn pause_for_missing_binary(&mut self, issue_id: &str, r: &Running) -> anyhow::Result<()> {
+    /// `launch` has already taken this run's feedback and named its session. A run that took no
+    /// turn acted on neither: the feedback goes back, and a session minted for this spawn is
+    /// dropped. A session the run was resuming is one the CLI already has, and stays. A run the
+    /// 402 cut short after a turn keeps both, and the handoff carries where it stopped.
+    fn halt_worker(
+        &mut self,
+        issue_id: &str,
+        r: &Running,
+        reason: HaltReason,
+    ) -> anyhow::Result<()> {
         let p = r.handle.progress();
-        self.store.finish_run(
-            self.clock.as_ref(),
-            &r.run_id,
-            "agent_not_found",
-            p.turns,
-            p.tokens,
-        )?;
+        let label = match reason {
+            HaltReason::BinaryNotFound => ErrorClass::AgentNotFound.as_str(),
+            HaltReason::AccountExhausted => ErrorClass::AccountExhausted.as_str(),
+        };
+        self.store.finish_run(self.clock.as_ref(), &r.run_id, label, p.turns, p.tokens)?;
         self.store.add_turns(issue_id, p.turns)?;
+        if p.turns == 0 {
+            self.return_untouched_launch(issue_id, r)?;
+        }
+        self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
+
+        let binary = self
+            .pool(&r.worker)
+            .and_then(|pool| pool.worker.bin())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::error!(
+            issue_id,
+            identifier = %r.issue.identifier,
+            worker = %r.worker,
+            %binary,
+            ?reason,
+            "worker cannot run; pausing this worker's dispatch until restart"
+        );
+        self.halted_workers.entry(r.worker.clone()).or_insert(HaltedWorker {
+            worker: r.worker.clone(),
+            binary,
+            reason,
+        });
+        Ok(())
+    }
+
+    /// Puts back what `launch` took for a run whose process acted on none of it.
+    fn return_untouched_launch(&mut self, issue_id: &str, r: &Running) -> anyhow::Result<()> {
         // A sync brief is absent here: the next `sync_before_run` writes it again.
         if let Some(fb) = &r.queued_feedback {
             self.store.set_pending_feedback(
@@ -616,21 +660,6 @@ impl Scheduler {
             // `--resume` of it fails with no turns and charges a retry that did not need to happen.
             self.store.set_session(self.clock.as_ref(), issue_id, None)?;
         }
-        self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
-
-        let binary = self
-            .pool(&r.worker)
-            .and_then(|pool| pool.worker.bin())
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        tracing::error!(
-            issue_id,
-            identifier = %r.issue.identifier,
-            worker = %r.worker,
-            %binary,
-            "worker binary cannot be spawned; pausing this worker's dispatch until restart"
-        );
-        self.missing_binaries.entry(r.worker.clone()).or_insert(binary);
         Ok(())
     }
 
@@ -1920,7 +1949,7 @@ impl Scheduler {
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
             rate_limit_pauses: self.published_pauses(),
-            missing_binaries: self.published_missing(),
+            halted_workers: self.published_halts(),
             rows,
         })
     }

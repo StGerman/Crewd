@@ -89,21 +89,34 @@ pub struct Snapshot {
     /// and a daemon on either side of #119 still see a pause while the API marker says `1`.
     #[serde(flatten, with = "pauses_wire")]
     pub rate_limit_pauses: Vec<RateLimitPause>,
-    /// One entry per worker whose binary could not be spawned, in dispatch order (#216). The
-    /// pause lasts until the daemon restarts; empty when every worker can start. Defaulted so a
-    /// client still reads a daemon from before this field existed.
-    #[serde(default)]
-    pub missing_binaries: Vec<MissingBinary>,
+    /// One entry per worker paused until the daemon restarts, in dispatch order: its binary
+    /// could not be spawned (#216) or its account has no balance left (#237). Empty when every
+    /// worker can run. The wire key predates the reason, so a client from before #237 still sees
+    /// the pause; defaulted so a client still reads a daemon from before #216.
+    #[serde(default, rename = "missing_binaries")]
+    pub halted_workers: Vec<HaltedWorker>,
 }
 
-/// A worker that cannot start, published so `status` says which binary is missing rather than
+/// A worker that takes nothing until restart, published so `status` says why rather than
 /// showing that worker as idle (#216). Unlike [`RateLimitPause`], nothing here lifts the pause:
-/// the binary is not re-resolved while the daemon runs.
+/// the binary is not re-resolved and the balance is not probed while the daemon runs (#237).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissingBinary {
+pub struct HaltedWorker {
     pub worker: String,
     /// The path the worker was spawned with.
     pub binary: String,
+    /// Defaulted because a daemon from before #237 halted a worker only for its binary.
+    #[serde(default)]
+    pub reason: HaltReason,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HaltReason {
+    #[default]
+    BinaryNotFound,
+    /// The provider refused the account with HTTP 402: no balance, and no reset time (#237).
+    AccountExhausted,
 }
 
 /// The pause list plus the pre-#119 singleton. Without the singleton an older client reads no
@@ -300,6 +313,14 @@ mod tests {
         let mut old = serde_json::to_value(Snapshot::default()).unwrap();
         old.as_object_mut().unwrap().remove("missing_binaries");
         let read: Snapshot = serde_json::from_value(old).unwrap();
-        assert!(read.missing_binaries.is_empty());
+        assert!(read.halted_workers.is_empty());
+    }
+
+    /// A daemon from before #237 sends no `reason`; every worker it halted had a missing binary.
+    #[test]
+    fn a_halted_worker_without_a_reason_reads_as_a_missing_binary() {
+        let old = serde_json::json!({"worker": "grok", "binary": "/no/such/grok"});
+        let read: HaltedWorker = serde_json::from_value(old).unwrap();
+        assert_eq!(read.reason, HaltReason::BinaryNotFound);
     }
 }

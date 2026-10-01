@@ -19,6 +19,9 @@
 //!   then exit 1 and no `end`. That is [`ErrorClass::ModelNotFound`]. An unknown `--resume`
 //!   id exits 1 with an empty stdout and does not hang. No rate-limit event was emitted;
 //!   `rate_limit` stays empty until one is observed.
+//! * **An account out of balance is one `error` line** reporting HTTP 402, then exit 1, zero
+//!   turns and no `end` (recorded 2026-10-01). That is [`ErrorClass::AccountExhausted`], which
+//!   pauses this worker rather than charging the issue (#237).
 //! * **`--prompt-file`, not argv.** The prompt is the issue body plus feedback. `--cwd` and
 //!   the process working directory are the same worktree. `--trust` was required for a fresh
 //!   worktree to read `AGENTS.md`: the passphrase that lives only in `CLAUDE.md` was written
@@ -435,11 +438,8 @@ fn run_reader(
             }
             Some("error") => {
                 let msg = value.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
-                if msg.contains("unknown model id") {
-                    terminal = Some(Outcome::Failed {
-                        class: ErrorClass::ModelNotFound,
-                        msg: truncate(&msg, 500),
-                    });
+                if let Some(class) = error_class(&msg) {
+                    terminal = Some(Outcome::Failed { class, msg: truncate(&msg, 500) });
                 } else {
                     model_error = Some(msg);
                 }
@@ -541,6 +541,19 @@ fn strip_output_bytes(value: &mut serde_json::Value) -> Option<String> {
     }
     raw_output.remove("output");
     serde_json::to_string(value).ok()
+}
+
+/// The class of an `error` event that is not this run's crash, or `None` for one that is.
+/// Matched on the message because both arrive as text: the 402 as JSON quoted inside
+/// `message`, not as a field of the event (#237).
+fn error_class(msg: &str) -> Option<ErrorClass> {
+    if msg.contains("unknown model id") {
+        Some(ErrorClass::ModelNotFound)
+    } else if msg.contains("status 402") || msg.contains("\"http_status\": 402") {
+        Some(ErrorClass::AccountExhausted)
+    } else {
+        None
+    }
 }
 
 fn outcome_from_text(text: &str, error: Option<&str>) -> Outcome {
@@ -760,6 +773,23 @@ mod tests {
             Outcome::Failed { class: ErrorClass::ModelNotFound, .. } => {}
             other => panic!("expected ModelNotFound, got {other:?}"),
         }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// #237: a 402 is the account's, not this run's crash. Read as `AgentCrash`, it quarantined
+    /// every issue Grok touched while the balance was empty.
+    #[test]
+    fn a_grok_error_with_http_status_402_fails_as_an_exhausted_account() {
+        let ws = tmp_workspace("402");
+        let w = GrokWorker::new(fixture("account_exhausted.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh()));
+        match wait_for_finish(&h) {
+            Outcome::Failed { class: ErrorClass::AccountExhausted, msg } => {
+                assert!(msg.contains("balance exhausted"), "{msg}")
+            }
+            other => panic!("expected AccountExhausted, got {other:?}"),
+        }
+        assert_eq!(h.progress().turns, 0);
         std::fs::remove_dir_all(&ws).ok();
     }
 

@@ -1,0 +1,10 @@
+---
+source: libcrew/src/render.rs
+expression: "snapshot(&snap, \"x\")"
+---
+crewd @ x  —  0 running / 0 limit
+grok paused: account balance exhausted; dispatch stays paused until restart
+tick 0
+tokens 0 in / 0 out
+
+no issues tracked yet

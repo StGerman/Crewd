@@ -14,5 +14,6 @@ pub mod render;
 pub mod snapshot;
 
 pub use snapshot::{
-    DeliveryView, MissingBinary, Phase, RateLimitPause, Row, RunRecord, Snapshot, TokenUsage,
+    DeliveryView, HaltReason, HaltedWorker, Phase, RateLimitPause, Row, RunRecord, Snapshot,
+    TokenUsage,
 };

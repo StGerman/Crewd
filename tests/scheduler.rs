@@ -16,7 +16,7 @@ use crew::gate::fake::{FakeGate, GateScript};
 use crew::gate::{Gate, GateHandle, GitGate};
 use crew::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
 use crew::project::{NoopProjector, Projector, TasksProjector};
-use crew::sched::{Scheduler, WorkerPool};
+use crew::sched::{HaltReason, HaltedWorker, Scheduler, WorkerPool};
 use crew::store::Store;
 use crew::tracker::TrackerError;
 use crew::tracker::fake::FakeTracker;
@@ -1233,7 +1233,7 @@ fn a_missing_worker_binary_pauses_that_worker_and_quarantines_nothing() {
         "no per-issue retry owns this — the worker's dispatch is what pauses"
     );
 
-    let missing = h.sched.snapshot().unwrap().missing_binaries;
+    let missing = h.sched.snapshot().unwrap().halted_workers;
     assert_eq!(missing.len(), 1, "{missing:?}");
     assert_eq!(missing[0].worker, "fake");
     assert_eq!(missing[0].binary, MISSING_BIN);
@@ -1244,7 +1244,7 @@ fn a_missing_worker_binary_pauses_that_worker_and_quarantines_nothing() {
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 0, "still paused an hour later");
     assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
-    let missing = h.sched.snapshot().unwrap().missing_binaries;
+    let missing = h.sched.snapshot().unwrap().halted_workers;
     assert_eq!(missing.len(), 1, "{missing:?}");
     assert_eq!(missing[0].binary, MISSING_BIN);
 }
@@ -1279,7 +1279,7 @@ fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
         "a first spawn queued nothing and named no conversation to hand off: {:?}",
         grok.feedback_for("iss-1")
     );
-    let missing = h.sched.snapshot().unwrap().missing_binaries;
+    let missing = h.sched.snapshot().unwrap().halted_workers;
     assert_eq!(missing.len(), 1, "{missing:?}");
     assert_eq!((missing[0].worker.as_str(), missing[0].binary.as_str()), ("claude", MISSING_BIN));
     assert!(!h.sched.store().get("iss-1").unwrap().unwrap().is_quarantined());
@@ -1289,7 +1289,7 @@ fn the_other_worker_keeps_dispatching_while_one_is_missing_its_binary() {
     h.sched.tick().unwrap();
     assert_eq!(grok.sessions_for("iss-2").len(), 1, "grok keeps dispatching");
     assert!(h.worker.sessions_for("iss-2").is_empty());
-    assert_eq!(h.sched.snapshot().unwrap().missing_binaries.len(), 1);
+    assert_eq!(h.sched.snapshot().unwrap().halted_workers.len(), 1);
 }
 
 /// A session the CLI already created stays across the missing-binary restart, and the brief
@@ -1389,6 +1389,130 @@ fn a_spawn_that_never_started_returns_the_feedback_it_took() {
     };
     assert!(output.contains("conflict in CLAUDE.md"), "{output}");
     assert_eq!(pr_url, "https://example/pr/1");
+}
+
+fn account_exhausted() -> Script {
+    Script {
+        turns: 0,
+        outcome: Outcome::Failed {
+            class: ErrorClass::AccountExhausted,
+            msg: "API error (status 402 Payment Required): usage balance exhausted".into(),
+        },
+        ..Script::succeeds_in(0)
+    }
+}
+
+/// An empty balance is the account's, not the issue's: on 2026-10-01 each issue Grok touched
+/// was quarantined for it. The claim goes back uncharged, the worker takes nothing more, and the
+/// other worker takes the issue over with a handoff naming why (#237).
+#[test]
+fn an_exhausted_account_pauses_its_worker_and_charges_the_issue_nothing() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+    grok.set_default(Script::succeeds_in(60_000));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    h.worker.set_default(account_exhausted());
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        h.worker.sessions_for("iss-1").len(),
+        2,
+        "claude resumes before its balance runs out"
+    );
+    for _ in 0..2 {
+        h.sched
+            .store()
+            .record_failure(h.clock.as_ref(), "iss-1", ErrorClass::AgentCrash, "earlier", 99)
+            .unwrap();
+    }
+    let before = h.sched.store().get("iss-1").unwrap().unwrap();
+
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.attempt, before.attempt, "the issue keeps the attempt it was on");
+    assert_eq!(st.consecutive_fail, 2, "the identical-failure streak is not charged");
+    assert!(!st.is_quarantined());
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "claude is paused and takes nothing more");
+    let fed = grok.feedback_for("iss-1");
+    assert_eq!(fed.len(), 1, "grok takes the issue over: {fed:?}");
+    let [Feedback::Handoff { from, why, .. }, Feedback::Gate { output }] = fed[0].as_slice() else {
+        panic!("a handoff plus the brief the turnless run never acted on: {fed:?}");
+    };
+    assert_eq!(from, "claude");
+    assert!(why.contains("balance is exhausted"), "{why}");
+    assert!(output.contains("more to do"), "{output}");
+
+    h.clock.advance_ms(3_600_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "still paused an hour later");
+}
+
+/// A 402 after a turn cut short a run that did act on its brief and did create its session:
+/// neither is given back, unlike a run that never took a turn (#237).
+#[test]
+fn a_run_cut_short_by_an_exhausted_account_after_a_turn_keeps_its_session_and_brief() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script { turns: 2, ..account_exhausted() });
+    let clock = Arc::clone(&h.clock);
+    h.sched
+        .store()
+        .ensure(clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1"))
+        .unwrap();
+    let gate = Feedback::Gate { output: "conflict in CLAUDE.md".into() };
+    h.sched
+        .store()
+        .set_pending_feedback(clock.as_ref(), "iss-1", &serde_json::to_string(&gate).unwrap())
+        .unwrap();
+
+    h.sched.tick().unwrap();
+    let named = h.worker.sessions_for("iss-1")[0].id().to_string();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(!st.is_quarantined());
+    assert_eq!(st.session_id.as_deref(), Some(named.as_str()), "the CLI created this session");
+    assert_eq!(
+        h.sched.store().take_pending_feedback(clock.as_ref(), "iss-1").unwrap(),
+        None,
+        "the run acted on its brief; it is not queued twice"
+    );
+    assert_eq!(h.sched.snapshot().unwrap().halted_workers.len(), 1);
+}
+
+/// `status` has to say why an exhausted worker takes nothing, or it reads as idle (#237).
+#[test]
+fn the_snapshot_names_a_worker_paused_for_an_exhausted_account() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_bin("/opt/grok/bin/grok");
+    h.worker.set_default(account_exhausted());
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+
+    let snap = h.sched.snapshot().unwrap();
+    assert_eq!(
+        snap.halted_workers,
+        vec![HaltedWorker {
+            worker: "fake".into(),
+            binary: "/opt/grok/bin/grok".into(),
+            reason: HaltReason::AccountExhausted,
+        }]
+    );
+    assert!(snap.rate_limit_pauses.is_empty());
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(!st.is_quarantined());
+    assert_eq!(st.session_id, None, "a run that took no turn drops the session it named");
 }
 
 /// A session id means nothing to another provider, so a continuation goes back to the worker

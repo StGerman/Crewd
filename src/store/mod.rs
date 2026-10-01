@@ -302,8 +302,8 @@ impl Store {
     /// `released`, but `attempt`, `consecutive_fail` and `last_fail_class` all left alone.
     ///
     /// [`Store::release`] zeroes those columns, which is right after a `Done` or `Blocked`
-    /// verdict but wrong here — an account-wide rate limit (#37) and a binary that cannot be
-    /// spawned (#216) did not fail on the issue's account, so the next attempt must not look
+    /// verdict but wrong here — an account-wide rate limit (#37), a binary that cannot be
+    /// spawned (#216) and an account with no balance (#237) did not fail on the issue's account, so the next attempt must not look
     /// like a fresh start. No retry row to clear either: this is only ever called on an issue
     /// the claim just found `running`, which cannot also hold one.
     pub fn release_for_rate_limit(
