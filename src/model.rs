@@ -359,6 +359,7 @@ mod tests {
             ErrorClass::ModelNotFound,
             ErrorClass::WorkspaceOutsideRoot,
             ErrorClass::AuthFailed,
+            ErrorClass::AccountExhausted,
         ];
         for c in all {
             let _ = c.retryable();
@@ -366,6 +367,7 @@ mod tests {
         }
         assert!(!ErrorClass::TemplateRender.retryable());
         assert!(ErrorClass::RateLimited.retryable());
+        assert!(!ErrorClass::AccountExhausted.retryable(), "a retry pays for the same refusal");
     }
 
     #[test]
