@@ -4026,6 +4026,72 @@ fn a_review_of_an_earlier_head_does_not_make_the_pull_request_ready() {
     assert_eq!(requests(&forge), 2, "a reviewed head is not asked about again");
 }
 
+/// Copilot on #240: a ready pull request moved to a head whose CI is still running stayed
+/// `Ready`, because the CI wait ended the step before the unreviewed head was looked at.
+#[test]
+fn a_ready_pull_request_moved_to_a_head_still_in_ci_is_no_longer_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    forge.set_ci("sha-operator", CiStatus::Pending { running: vec!["test".into()] });
+    forge.push_head(pr, "sha-operator");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "an unreviewed head is not ready while its CI runs"
+    );
+}
+
+/// Copilot on #240: a reviewer added to `delivery.reviewers` across a restart, on a head already
+/// requested, was never asked, and the wait then handed off for a review nobody requested.
+#[test]
+fn a_reviewer_added_to_the_config_is_requested_on_a_head_already_requested() {
+    let dir = tmp_dir("review-added");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            copilot_expected,
+        );
+        run_once(&mut h);
+    }
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |c| c.delivery.reviewers = vec![COPILOT.into(), "alice".into()],
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let pr = forge.open_prs()[0].number;
+    assert!(
+        forge
+            .ops()
+            .iter()
+            .any(|o| matches!(o, Op::RequestReview { reviewer, .. } if reviewer == "alice")),
+        "the added reviewer is asked: {:?}",
+        forge.ops()
+    );
+    assert!(forge.requested(pr).contains(&"alice".to_string()));
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The review wait is the CI wait's shape (#105): a restart resumes it rather than forgiving it.
 #[test]
 fn a_restart_does_not_forgive_the_review_wait_already_spent() {

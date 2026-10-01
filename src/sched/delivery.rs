@@ -465,13 +465,28 @@ impl Scheduler {
 
         // Keyed on the head rather than reset only by crewd's own push, so a head the operator
         // pushed is asked about too: a review of an earlier head does not make this one ready.
+        // The reviewers compared too, so one added to `delivery.reviewers` since is asked.
+        let mut expected = self.cfg.delivery.reviewers.clone();
+        expected.sort();
         let requested_here = d.review_requested
-            && d.review_requested_on.as_ref().is_some_and(|(head, _)| *head == pr.head_sha);
-        if !requested_here
-            && !self.cfg.delivery.reviewers.is_empty()
-            && self.request_reviews(issue_id, &pr)?
-        {
-            return Ok(());
+            && d.review_requested_on.as_ref().is_some_and(|(head, _)| *head == pr.head_sha)
+            && d.review_reviewers == expected;
+        if !requested_here && !expected.is_empty() {
+            // Before the request and the CI read, either of which can end this step: a head
+            // nobody was asked about is not ready while CI runs on it or the request is retried.
+            if d.stage == DeliveryStage::Ready {
+                tracing::info!(issue_id, pr = number, head = %pr.head_sha, "no longer ready: its head has not been put to review");
+                self.store.set_delivery_stage(
+                    clock.as_ref(),
+                    issue_id,
+                    DeliveryStage::Awaiting,
+                    None,
+                )?;
+                d.stage = DeliveryStage::Awaiting;
+            }
+            if self.request_reviews(issue_id, &pr)? {
+                return Ok(());
+            }
         }
 
         let ci = forge.ci_status(&pr.head_sha)?;
@@ -635,7 +650,13 @@ impl Scheduler {
             .collect();
         if missing.is_empty() {
             tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, reviewers = ?reviewers, "review requested and verified attached");
-            self.store.set_review_requested(clock.as_ref(), issue_id, &pr.head_sha, None)?;
+            self.store.set_review_requested(
+                clock.as_ref(),
+                issue_id,
+                &pr.head_sha,
+                &reviewers,
+                None,
+            )?;
             if self.review_waits.get(issue_id).is_none_or(|(head, _)| *head != pr.head_sha) {
                 self.review_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), clock.mono()));
             }
@@ -646,7 +667,13 @@ impl Scheduler {
             missing.join(", ")
         );
         tracing::error!(issue_id, pr = pr.number, missing = ?missing, "review request did not attach; handing off");
-        self.store.set_review_requested(clock.as_ref(), issue_id, &pr.head_sha, Some(&reason))?;
+        self.store.set_review_requested(
+            clock.as_ref(),
+            issue_id,
+            &pr.head_sha,
+            &reviewers,
+            Some(&reason),
+        )?;
         self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
         Ok(true)
     }

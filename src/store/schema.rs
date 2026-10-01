@@ -234,12 +234,14 @@ pub(super) const MIGRATIONS: &[&str] = &[
     "#,
     // v16
     r#"
-    -- The head the expected reviews were requested on, and when (#222). A pull request is ready
-    -- only once each has reviewed that head, and one that has not within
+    -- The head the expected reviews were requested on, from whom, and when (#222). A pull
+    -- request is ready only once each has reviewed that head, and one that has not within
     -- `delivery.review_timeout_ms` is handed off; the wall-clock start is what lets a restart
-    -- resume that wait rather than forgive it. A head other than this one is requested again.
+    -- resume that wait rather than forgive it. Another head, or a `delivery.reviewers` other
+    -- than the JSON list in `review_reviewers`, is requested again.
     ALTER TABLE delivery ADD COLUMN review_head TEXT;
     ALTER TABLE delivery ADD COLUMN review_requested_at INTEGER;
+    ALTER TABLE delivery ADD COLUMN review_reviewers TEXT;
     "#,
 ];
 
@@ -338,7 +340,7 @@ mod tests {
         "d102caf59988230bdea97ad90b36339238e95b23246d5132fe9ab356a66f449f", // v13
         "520562198a072368e0c51621f67c99d360a8e0f4201dc3f0d9b94330499bbf2e", // v14
         "52c5243e127d8c5571d26806596277fd07c7ef125cf8e2cfed3dc95ffb9b7067", // v15
-        "110ad1593687130e0935d9ff01dbf622e7a4b04d2e61581fd971320983a8bc33", // v16
+        "329182dbac3862b45fe5c572e621f2ea5c6f3589dbd6abd2b52c998cb2a3f620", // v16
     ];
 
     #[test]
