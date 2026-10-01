@@ -3917,9 +3917,237 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
         },
     );
     run_once(&mut h2);
-    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
     assert!(delivery_of(&h2, "iss-1").review_error.is_none());
-    drop(forge2);
+    forge2.add_review(
+        forge2.open_prs()[0].number,
+        "copilot-pull-request-reviewer[bot]",
+        "COMMENTED",
+    );
+    h2.clock.advance_ms(1_000);
+    h2.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
+}
+
+const REVIEW_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+fn copilot_expected(c: &mut Config) {
+    c.delivery.reviewers = vec![COPILOT.into()];
+}
+
+/// #222: five pull requests crewd opened were called ready with green CI and no comments, because
+/// nobody had reviewed them at all. The review delivery requested is what it waits for.
+#[test]
+fn a_pull_request_with_no_review_yet_is_not_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    assert_eq!(forge.requested(pr), vec![COPILOT.to_string()], "requested and attached");
+
+    for _ in 0..5 {
+        h.clock.advance_ms(60_000);
+        h.sched.tick().unwrap();
+        assert_eq!(
+            delivery_of(&h, "iss-1").stage,
+            crew::store::DeliveryStage::Awaiting,
+            "green CI and no comments, but nobody has reviewed it"
+        );
+    }
+
+    forge.add_review(pr, COPILOT, "COMMENTED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+}
+
+/// #222: a review that never arrives is the operator's, with the reviewer named, and the pull
+/// request is never marked ready on the way there.
+#[test]
+fn a_pull_request_whose_review_never_arrives_is_handed_off_naming_the_reviewer() {
+    let (mut h, _forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS - 1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+
+    h.clock.advance_ms(2_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains(COPILOT), "names the reviewer: {why}");
+    assert!(why.contains(&FakeForge::head_after_publish(1)), "and the head: {why}");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(row.last_error.as_deref().is_some_and(|e| e.contains(COPILOT)), "{row:?}");
+}
+
+/// #222: only a review of the current head counts. A head someone else pushed onto a ready pull
+/// request is asked about again, and the approval of the head before it does not keep it ready.
+#[test]
+fn a_review_of_an_earlier_head_does_not_make_the_pull_request_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let requests = |forge: &FakeForge| {
+        forge.ops().iter().filter(|o| matches!(o, Op::RequestReview { .. })).count()
+    };
+    assert_eq!(requests(&forge), 1);
+
+    forge.push_head(pr, "sha-operator");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(requests(&forge), 2, "the new head is asked about: {:?}", forge.ops());
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the approval was of the head before"
+    );
+
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(requests(&forge), 2, "a reviewed head is not asked about again");
+}
+
+/// Copilot on #240: a ready pull request moved to a head whose CI is still running stayed
+/// `Ready`, because the CI wait ended the step before the unreviewed head was looked at.
+#[test]
+fn a_ready_pull_request_moved_to_a_head_still_in_ci_is_no_longer_ready() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    forge.set_ci("sha-operator", CiStatus::Pending { running: vec!["test".into()] });
+    forge.push_head(pr, "sha-operator");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "an unreviewed head is not ready while its CI runs"
+    );
+}
+
+/// Copilot on #240: a reviewer added to `delivery.reviewers` across a restart, on a head already
+/// requested, was never asked, and the wait then handed off for a review nobody requested.
+#[test]
+fn a_reviewer_added_to_the_config_is_requested_on_a_head_already_requested() {
+    let dir = tmp_dir("review-added");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            copilot_expected,
+        );
+        run_once(&mut h);
+    }
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |c| c.delivery.reviewers = vec![COPILOT.into(), "alice".into()],
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let pr = forge.open_prs()[0].number;
+    assert!(
+        forge
+            .ops()
+            .iter()
+            .any(|o| matches!(o, Op::RequestReview { reviewer, .. } if reviewer == "alice")),
+        "the added reviewer is asked: {:?}",
+        forge.ops()
+    );
+    assert!(forge.requested(pr).contains(&"alice".to_string()));
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The review wait is the CI wait's shape (#105): a restart resumes it rather than forgiving it.
+#[test]
+fn a_restart_does_not_forgive_the_review_wait_already_spent() {
+    let dir = tmp_dir("review-wait-restart");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            copilot_expected,
+        );
+        run_once(&mut h);
+        h.clock.advance_ms(REVIEW_TIMEOUT_MS * 3 / 4);
+        h.sched.tick().unwrap();
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    }
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        copilot_expected,
+    );
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS * 3 / 4 + 5_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::HandedOff,
+        "the wait spent before the restart still counts"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #222: whether crew-bot may request Copilot at all is unknown until a live pull request asks,
+/// so a refusal has to reach the operator with the reviewer it was for.
+#[test]
+fn a_refused_review_request_is_handed_off_naming_the_reviewer() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        copilot_expected,
+    );
+    forge.refuse_review_requests(Some(ForgeError::Permanent(
+        "graphql: Resource not accessible by integration".into(),
+    )));
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains(COPILOT) && why.contains("not accessible"), "{why}");
 }
 
 #[test]
@@ -4379,11 +4607,17 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
     let d = delivery_of(&h, "iss-1");
     assert_eq!(d.head_sha.as_deref(), Some(FakeForge::head_after_publish(2).as_str()));
     assert_eq!(requests(&forge), 2, "a new head is a new request: {:?}", forge.ops());
-    assert!(
-        forge.pr(pr).unwrap().requested_reviewers.contains(&"reviewer".to_string()),
-        "and it verifiably attached"
+    assert!(forge.requested(pr).contains(&"reviewer".to_string()), "and it verifiably attached");
+    assert_eq!(
+        d.stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the approval was of the first head, not this one"
     );
-    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+
+    forge.add_review(pr, "reviewer", "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
 }
 
 /// A review round on a ready pull request whose first head is green, with the fix's push

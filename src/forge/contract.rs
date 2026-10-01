@@ -171,6 +171,8 @@ trait ForgeBackend {
     fn will_open(&self, spec: &PullRequestSpec);
     /// The provider holds `open` for `spec.head`, and moves it to `spec.base` when asked.
     fn holds_open(&self, open: &PullRequest, spec: &PullRequestSpec);
+    /// The provider attaches bot `login` (as reviews spell it) when asked to review `pr`.
+    fn attaches_bot(&self, pr: &PullRequest, login: &str);
 }
 
 struct FakeForgeBackend(FakeForge);
@@ -187,6 +189,8 @@ impl ForgeBackend for FakeForgeBackend {
     fn will_open(&self, _spec: &PullRequestSpec) {}
 
     fn holds_open(&self, _open: &PullRequest, _spec: &PullRequestSpec) {}
+
+    fn attaches_bot(&self, _pr: &PullRequest, _login: &str) {}
 }
 
 struct GithubBackend {
@@ -208,7 +212,6 @@ impl GithubBackend {
             "base": { "ref": base },
             "state": "open",
             "merged": false,
-            "requested_reviewers": [],
             "mergeable": true,
         })
     }
@@ -233,6 +236,22 @@ impl ForgeBackend for GithubBackend {
         if open.base != spec.base {
             self.http.push(ok(Self::pull(open.number, &open.head_sha, &spec.base)));
         }
+    }
+
+    fn attaches_bot(&self, _pr: &PullRequest, login: &str) {
+        let bare = login.strip_suffix("[bot]").unwrap_or(login);
+        let node = json!({ "repository": { "pullRequest": { "id": "PR_node" } } });
+        self.http.push(ok(json!({ "data": node })));
+        self.http.push(ok(
+            json!({ "data": { "requestReviewsByLogin": { "pullRequest": { "id": "PR_node" } } } }),
+        ));
+        self.http.push(ok(json!({ "data": { "repository": { "pullRequest": {
+            "id": "PR_node",
+            "reviewRequests": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [{ "requestedReviewer": { "__typename": "Bot", "login": bare } }]
+            }
+        } } } })));
     }
 }
 
@@ -261,8 +280,28 @@ fn a_second_open_for_a_head_finds_the_first_and_points_it_at_the_base_asked_for(
     assert_eq!(again, moved, "{}", b.name());
 }
 
-const FORGE_CASES: &[fn(&dyn ForgeBackend)] =
-    &[a_second_open_for_a_head_finds_the_first_and_points_it_at_the_base_asked_for];
+/// #222: delivery compares a requested reviewer to `delivery.reviewers` and to the reviews it
+/// posts, both spelled `<name>[bot]` for a bot; GraphQL spells one without the suffix.
+fn a_requested_bot_is_listed_as_its_reviews_spell_it(b: &dyn ForgeBackend) {
+    let f = b.forge();
+    let spec = PullRequestSpec {
+        title: "Do the work".into(),
+        body: String::new(),
+        head: "crew/MT-1".into(),
+        base: "main".into(),
+    };
+    b.will_open(&spec);
+    let pr = f.open_pull_request(&spec).unwrap();
+    let copilot = "copilot-pull-request-reviewer[bot]";
+    b.attaches_bot(&pr, copilot);
+    f.request_review(pr.number, copilot).unwrap();
+    assert_eq!(f.review_requests(pr.number).unwrap(), vec![copilot.to_string()], "{}", b.name());
+}
+
+const FORGE_CASES: &[fn(&dyn ForgeBackend)] = &[
+    a_second_open_for_a_head_finds_the_first_and_points_it_at_the_base_asked_for,
+    a_requested_bot_is_listed_as_its_reviews_spell_it,
+];
 
 /// Fresh backends per case, so no case can pass on state another left behind.
 #[test]

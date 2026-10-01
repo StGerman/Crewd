@@ -58,6 +58,8 @@ pub enum Op {
 struct PrRecord {
     pr: PullRequest,
     spec: PullRequestSpec,
+    /// Outstanding review requests, which [`Forge::review_requests`] answers.
+    requested: Vec<String>,
     reviews: Vec<Review>,
     comments: Vec<ReviewComment>,
 }
@@ -89,6 +91,8 @@ struct Inner {
     fail_reply: Option<ForgeError>,
     /// Makes `resolve_threads` alone fail.
     fail_resolve: Option<ForgeError>,
+    /// Makes `request_review` alone fail: the credential refused the request outright.
+    fail_request: Option<ForgeError>,
     /// `(number, comment_id)` of every thread resolved.
     resolved: HashSet<(u64, String)>,
     ops: Vec<Op>,
@@ -161,6 +165,11 @@ impl FakeForge {
         self.inner.lock().unwrap().prs.get(&number).map(|r| r.pr.clone())
     }
 
+    /// The review requests outstanding on pull request `number`.
+    pub fn requested(&self, number: u64) -> Vec<String> {
+        self.inner.lock().unwrap().prs.get(&number).map(|r| r.requested.clone()).unwrap_or_default()
+    }
+
     pub fn spec_of(&self, number: u64) -> Option<PullRequestSpec> {
         self.inner.lock().unwrap().prs.get(&number).map(|r| r.spec.clone())
     }
@@ -225,6 +234,11 @@ impl FakeForge {
         self.inner.lock().unwrap().fail_resolve = e;
     }
 
+    /// Make only `request_review` fail until cleared.
+    pub fn refuse_review_requests(&self, e: Option<ForgeError>) {
+        self.inner.lock().unwrap().fail_request = e;
+    }
+
     pub fn is_resolved(&self, number: u64, comment_id: &str) -> bool {
         self.inner.lock().unwrap().resolved.contains(&(number, comment_id.to_string()))
     }
@@ -270,7 +284,7 @@ impl FakeForge {
             body: body.into(),
             url: Some(format!("https://forge.example/pulls/{number}#{id}")),
         });
-        rec.pr.requested_reviewers.retain(|r| r != reviewer);
+        rec.requested.retain(|r| r != reviewer);
         id
     }
 
@@ -544,12 +558,17 @@ impl Forge for FakeForge {
             head_sha,
             base: spec.base.clone(),
             state: PrState::Open,
-            requested_reviewers: vec![],
             mergeable: g.mergeable,
         };
         g.prs.insert(
             number,
-            PrRecord { pr: pr.clone(), spec: spec.clone(), reviews: vec![], comments: vec![] },
+            PrRecord {
+                pr: pr.clone(),
+                spec: spec.clone(),
+                requested: vec![],
+                reviews: vec![],
+                comments: vec![],
+            },
         );
         Ok(pr)
     }
@@ -576,6 +595,9 @@ impl Forge for FakeForge {
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError> {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
+        if let Some(e) = &g.fail_request {
+            return Err(e.clone());
+        }
         g.ops.push(Op::RequestReview { number, reviewer: reviewer.into() });
         let attach = g.attach_reviewers;
         let rec = g
@@ -583,10 +605,16 @@ impl Forge for FakeForge {
             .get_mut(&number)
             .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?;
         // The silent success: the provider says yes and does nothing.
-        if attach && !rec.pr.requested_reviewers.iter().any(|r| r == reviewer) {
-            rec.pr.requested_reviewers.push(reviewer.into());
+        if attach && !rec.requested.iter().any(|r| r == reviewer) {
+            rec.requested.push(reviewer.into());
         }
         Ok(())
+    }
+
+    fn review_requests(&self, number: u64) -> Result<Vec<String>, ForgeError> {
+        let g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        Ok(g.prs.get(&number).map(|r| r.requested.clone()).unwrap_or_default())
     }
 
     fn reviews(&self, number: u64) -> Result<Vec<Review>, ForgeError> {
