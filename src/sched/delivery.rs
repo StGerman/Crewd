@@ -834,7 +834,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Whether either round bound is reached, handing the pull request to the operator if so.
+    /// Whether either round bound or the issue's turn budget is reached, handing the pull
+    /// request to the operator if so. The budget is checked here because a round is dispatched
+    /// through a retry row, and neither `dispatch_due_retries` nor `launch` reads
+    /// `cumulative_turns`: without it a round, or an unblock's resumed delivery, would start an
+    /// agent past `max_turns_per_issue` (#262).
     fn rounds_spent(
         &mut self,
         issue_id: &str,
@@ -842,13 +846,19 @@ impl Scheduler {
         what: &str,
     ) -> Result<bool, StepError> {
         let cfg = &self.cfg.delivery;
-        if d.rounds_pr < cfg.max_rounds_per_pr && d.rounds_issue < cfg.max_rounds_per_issue {
+        let budget = self.cfg.agent.max_turns_per_issue;
+        let turns = self.store.get(issue_id)?.map_or(0, |st| st.cumulative_turns);
+        let reason = if turns >= budget {
+            format!("turn budget exhausted ({turns} of {budget} turns on this issue); {what}")
+        } else if d.rounds_pr >= cfg.max_rounds_per_pr || d.rounds_issue >= cfg.max_rounds_per_issue
+        {
+            format!(
+                "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
+                d.rounds_pr, d.rounds_issue
+            )
+        } else {
             return Ok(false);
-        }
-        let reason = format!(
-            "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
-            d.rounds_pr, d.rounds_issue
-        );
+        };
         tracing::warn!(issue_id, pr = ?d.pr_number, "{reason}; handing off");
         self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
         Ok(true)

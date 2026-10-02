@@ -2020,8 +2020,8 @@ impl Scheduler {
     /// The same holds for every other gate `dispatch_new` applies: an issue that has lost its
     /// dispatch marker or spent its per-issue turn budget would be unparked and never
     /// dispatched, invisible to the sweep, so the park is kept and the answer says no. A resumed
-    /// delivery keeps its park, and a round it opens is dispatched by `dispatch_due_retries`,
-    /// which applies those gates itself.
+    /// delivery keeps its park, and the turn budget is checked before it opens a round, so an
+    /// issue past its budget is handed off again rather than dispatched.
     pub fn unblock(&mut self, issue_id: &str) -> anyhow::Result<Unblocked> {
         let fresh = self.tracker.by_ids(&[issue_id.to_string()])?;
         let Some(issue) = fresh.iter().find(|i| i.id == issue_id) else {

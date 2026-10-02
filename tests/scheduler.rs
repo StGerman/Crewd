@@ -5433,6 +5433,40 @@ fn a_fix_round_whose_push_was_refused_is_pushed_when_unblocked() {
     assert_eq!(d.pr_number, Some(pr.number));
 }
 
+/// Review on #264: a delivery round is dispatched through a retry row, and nothing on that path
+/// reads the issue's turn total, so a resumed delivery could start an agent past
+/// `max_turns_per_issue`. The budget is checked before the round opens: the pull request is
+/// handed off again naming it, and nothing is dispatched.
+#[test]
+fn a_resumed_delivery_past_the_turn_budget_is_handed_off_rather_than_dispatched() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["alice".into()];
+            c.agent.max_turns_per_issue = 3; // the fake burns 3 turns per run
+        },
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    let pr = forge.open_prs()[0].clone();
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    forge.set_attach_reviewers(true);
+    forge.add_review(pr.number, "alice", "COMMENTED");
+    forge.add_comment(pr.number, "alice", "src/lib.rs", "this leaks");
+    assert!(h.sched.unblock("iss-1").unwrap().cleared());
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let reason = d.handoff_reason.unwrap();
+    assert!(reason.starts_with("turn budget exhausted"), "{reason}");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (0, 0), "no round is charged");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "and no agent is dispatched");
+}
+
 /// The stack is gate first, delivery second (#44). A `Done` with both attached goes to the gate
 /// before anything is pushed: a failing gate sends the issue back to an agent and the forge sees
 /// nothing at all, and only the gate's pass hands the branch — rebased and re-gated — to

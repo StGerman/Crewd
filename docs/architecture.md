@@ -474,7 +474,8 @@ moves it back to `awaiting` when it was handed off waiting on its pull request, 
 to `pending`, so a fix run whose push was refused is pushed rather than judged on the old head.
 It forgets the review request and the CI wait so neither is timed from before the handoff, and
 keeps both round counts, so a pull request at `max_rounds_per_pr` is handed off again on its next
-round. The
+round; the turn budget is checked before any round opens, so one past `max_turns_per_issue` is
+handed off rather than dispatched. The
 answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. `Scheduler::unblock`
 also reads the ticket fresh and keeps a park whose ticket is no longer active, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
