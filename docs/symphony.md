@@ -9,10 +9,11 @@ and the test that holds it.
 
 Every quote is from `SPEC.md` at
 [`8001b52`](https://github.com/openai/symphony/blob/8001b52e3062495a16e520e4ceaf8f9de868c4d0/SPEC.md)
-("Draft v1", 2026-08-12), the newest revision of the file when this page was written. Each
-passage reads the same in every revision of `SPEC.md` back to the first,
-[`fa75ec6`](https://github.com/openai/symphony/blob/fa75ec68c23f/SPEC.md), so no defect here has
-been fixed upstream. A section says so, with the commit, if one is.
+("Draft v1", 2026-08-12), the newest revision of the file when this page was written. No defect
+here has been fixed upstream in any revision up to that one; a section says so, with the
+commit, if one is. The wording has moved, though, and each section notes where its passage
+differs from the first revision,
+[`fa75ec6`](https://github.com/openai/symphony/blob/fa75ec68c23f/SPEC.md).
 
 The guard tests are rows of [invariants.md](invariants.md). Run one with
 `cargo test <name>`.
@@ -37,11 +38,17 @@ formula looks safe when read against it.
 
 **crewd.** `backoff_ms` in [src/sched/retry.rs](../src/sched/retry.rs) caps the *exponent*
 (`EXP_CAP = 16`) before shifting, then multiplies with saturating arithmetic and applies the
-configured cap. The delay is the cap for every attempt from the sixth to `u32::MAX`.
+configured cap. The exponent cap bounds the uncapped delay at `10_000 * 2^16` ms, about 182
+hours, so a configured `max_retry_backoff_ms` above that is never reached; at or below it, which
+includes the 5-minute default, the delay reaches the cap and stays there for every attempt up to
+`u32::MAX`, from the sixth attempt at the default.
 
 **Invariant:** "Backoff cannot overflow or collapse". **Guard test:**
 `backoff_never_overflows_or_collapses_at_any_attempt_count`, which walks attempts 0 to 64 and the
-`u32` boundaries and asserts the delay is never above the cap and never below it after the sixth.
+`u32` boundaries at the default cap and asserts the delay is never above the cap and never below
+it after the sixth.
+
+**Upstream history.** The formula reads the same in every revision since `fa75ec6`.
 
 ## 2. The 1s continuation respawn loop
 
@@ -85,6 +92,8 @@ the second unmoved continuation waits 30s, not 1s), `the_per_issue_turn_budget_s
 and `a_finished_issue_is_not_re_dispatched_while_its_state_is_unchanged`, all in
 [tests/scheduler.rs](../tests/scheduler.rs).
 
+**Upstream history.** Both passages read the same in every revision since `fa75ec6`.
+
 ## 3. Permanent failures retried forever
 
 **The spec**, §14.2 Recovery Behavior
@@ -119,6 +128,11 @@ exhausted account, pauses that worker instead and charges the issue nothing.
 ([tests/scheduler.rs](../tests/scheduler.rs)), which fails a run with `TemplateRender` and
 asserts the issue is quarantined, has no retry, and is still not running ten minutes later.
 
+**Upstream history.** The §14.2 passage reads the same in every revision since `fa75ec6`. The
+§11.4 sentence came with [`7af5a76`](https://github.com/openai/symphony/commit/7af5a7648c9f) (2026-07-18, the generic tracker
+interface), which named `retryable` as an optional adapter field and said in the same sentence
+that the orchestrator does not use it.
+
 ## 4. A workspace removed before its worker is confirmed stopped
 
 **The spec**, §8.5 Active Run Reconciliation
@@ -149,6 +163,8 @@ the run is stopped and its workspace is gone after the same tick.
 ([src/worker/claude.rs](../src/worker/claude.rs)) holds the other half against a real process
 that traps `SIGTERM`: `kill` does not return until that process is gone.
 
+**Upstream history.** The passage reads the same in every revision since `fa75ec6`.
+
 ## 5. One tracker refresh miss destroying in-flight work
 
 **The spec**, §16.3 Reconcile Active Runs
@@ -176,6 +192,11 @@ omissions per issue (`Store::bump_miss`) and stops a run only once the count rea
 ([tests/scheduler.rs](../tests/scheduler.rs)), which hides a running issue for one refresh, shows
 it, then hides it for two, and asserts the run survives the first and stops after the second.
 
+**Upstream history.** The loop over missing ids came with
+[`7af5a76`](https://github.com/openai/symphony/commit/7af5a7648c9f) (2026-07-18). Before it, from `fa75ec6`, §16.3 iterated only over the issues the refresh
+returned and said nothing about one it omitted, so the defect was then an unspecified case
+rather than a specified kill.
+
 ## 6. Workspace root containment checked only at launch
 
 **The spec**, §9.5 Safety Invariants
@@ -201,13 +222,12 @@ Removal, at startup cleanup (§8.6), on a terminal transition (§8.5) and on a r
 one (§8.4), computes the same path from a tracker-supplied identifier and deletes it, with no
 check named. Removal is the destructive operation: launching in the wrong directory runs an
 agent somewhere unexpected, while removing the wrong directory recursively deletes it. Any path
-the launch check would have refused (an identifier that sanitization mishandles, a symlink
-inside the root, a root changed by a config reload between launch and cleanup) reaches
-`rm -rf` unchecked.
+the launch check would have refused (an identifier that sanitization mishandles, a root changed
+by a config reload between launch and cleanup) reaches `rm -rf` unchecked.
 
 **crewd.** Every path leaving a `Workspace` implementation passes `guard_within`
-([src/workspace.rs](../src/workspace.rs)), which canonicalises the parent and refuses anything
-not under the canonical root. `prepare` and `remove` both call it, in `DirWorkspace` and in
+([src/workspace.rs](../src/workspace.rs)), which canonicalises the path's *parent* and refuses
+one whose parent is not under the canonical root. `prepare` and `remove` both call it, in `DirWorkspace` and in
 `GitWorktreeWorkspace`, and so do delivery's operations on a worktree. A refused path is
 `ErrorClass::WorkspaceOutsideRoot`, which is permanent (section 3).
 
@@ -217,3 +237,18 @@ not under the canonical root. `prepare` and `remove` both call it, in `DirWorksp
 `../../etc`, `/etc/passwd`, `..` and `a/../../b` as identifiers and assert each workspace lands
 exactly one level under the root. Both drive `prepare`; `remove` is held by sharing the same
 `guard_within`, not by a test of its own.
+
+**What this does not cover.** `guard_within` canonicalises the parent, not the leaf, because the
+leaf may not exist yet. A symlink planted *at* the workspace path, `<root>/<key>` pointing
+outside the root, therefore passes the check: `prepare` accepts it as an existing workspace and
+the agent runs wherever it points. `DirWorkspace::remove` is safer there by accident rather than by
+the guard, since `std::fs::remove_dir_all` removes a symlink rather than following it. Planting that link
+takes write access to the workspace root, but crewd does not yet refuse it, and no test pins
+either behaviour. What crewd closes is the spec's defect, a removal path with no containment
+check at all; a leaf symlink defeats the spec's prefix check in the same way.
+
+**Upstream history.** §8.6 reads the same in every revision since `fa75ec6`. §9.5's
+"MUST" was "must" until [`eaa457d`](https://github.com/openai/symphony/commit/eaa457d96acd)
+(2026-04-27). §17.2 read "Workspace path sanitization and root containment invariants are
+enforced before agent launch" until `7af5a76` added the identifier-hash clause; both say
+"before agent launch" and nothing about removal.
