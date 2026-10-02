@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::credentials::{GithubAppFile, JiraCredentialsFile};
+use crate::credentials::{GithubAppFile, JiraCredentialsFile, expand_home};
 use crate::worker::{Effort, ModelChoice};
 
 fn d_interval() -> u64 {
@@ -539,9 +539,9 @@ impl Default for PollingConfig {
 pub struct WorkspaceConfig {
     #[serde(default)]
     pub root: Option<PathBuf>,
-    /// The git repository worktrees are created from. Defaults to the current directory, which
-    /// is the shape dogfooding takes: crewd run from inside the repo it dispatches
-    /// against.
+    /// The git repository worktrees are created from. Set, it resolves against the config's
+    /// directory like every path key; unset, it is the current directory, which is the shape
+    /// dogfooding takes: crewd run from inside the repo it dispatches against.
     #[serde(default)]
     pub repo: Option<PathBuf>,
 }
@@ -604,6 +604,17 @@ impl Default for AgentConfig {
     }
 }
 
+/// The store a daemon started with the config at `config` opens: `crew_db`, the `CREW_DB`
+/// environment value, when set, else `crew.db` beside the config. Not in the current directory,
+/// which made the same config open a fresh, empty store when started from anywhere else (#251).
+/// `CREW_DB` is not resolved against the config: like any path given in the environment, it
+/// means what the shell that set it meant.
+pub fn store_path(config: &Path, crew_db: Option<std::ffi::OsString>) -> PathBuf {
+    crew_db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("crew.db"))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read config at {path}: {source}")]
@@ -661,8 +672,28 @@ impl Config {
         let mut cfg: Config = toml::from_str(&text)
             .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
         cfg.normalize();
+        cfg.resolve_paths(path.parent().unwrap_or(Path::new("")));
         cfg.preflight()?;
         Ok(cfg)
+    }
+
+    /// Every path key against `dir`, the config's own directory, after expanding `~`: resolved
+    /// against the shell's current directory instead, the same config started from `$HOME`
+    /// names a different clone, worktree root and credential file (#251).
+    fn resolve_paths(&mut self, dir: &Path) {
+        let resolve = |p: &mut Option<PathBuf>| {
+            if let Some(path) = p {
+                *path = dir.join(expand_home(path));
+            }
+        };
+        resolve(&mut self.workspace.repo);
+        resolve(&mut self.workspace.root);
+        resolve(&mut self.transcripts.root);
+        resolve(&mut self.tracker.github_app);
+        resolve(&mut self.forge.github_app);
+        if let Some(jira) = &mut self.tracker.jira {
+            resolve(&mut jira.credentials);
+        }
     }
 
     /// Once, at load, and not in `preflight`: preflight runs every tick, and a key file briefly
@@ -1024,6 +1055,90 @@ mod tests {
         };
         c.normalize();
         c
+    }
+
+    const PATH_KEYS: &str = r#"
+[tracker]
+kind = "fake"
+active_states = ["In Progress"]
+terminal_states = ["Done"]
+github_app = "PREFIX/app.toml"
+
+[tracker.jira]
+credentials = "PREFIX/jira.toml"
+
+[forge]
+github_app = "PREFIX/forge-app.toml"
+
+[workspace]
+repo = "PREFIX/clone"
+root = "PREFIX/workspaces"
+
+[transcripts]
+root = "PREFIX/transcripts"
+"#;
+
+    /// Writes `PATH_KEYS` with each path under `prefix` into a fresh directory and parses it.
+    fn parse_path_keys(name: &str, prefix: &str) -> (PathBuf, Config) {
+        let dir = std::env::temp_dir().join(format!("crew-cfg-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crewd.toml");
+        std::fs::write(&path, PATH_KEYS.replace("PREFIX", prefix)).unwrap();
+        (dir, Config::parse(&path).unwrap())
+    }
+
+    fn path_keys(c: &Config) -> Vec<(&'static str, &Path)> {
+        vec![
+            ("workspace.repo", c.workspace.repo.as_deref().unwrap()),
+            ("workspace.root", c.workspace.root.as_deref().unwrap()),
+            ("transcripts.root", c.transcripts.root.as_deref().unwrap()),
+            ("tracker.github_app", c.tracker.github_app.as_deref().unwrap()),
+            ("forge.github_app", c.forge.github_app.as_deref().unwrap()),
+            (
+                "tracker.jira.credentials",
+                c.tracker.jira.as_ref().unwrap().credentials.as_deref().unwrap(),
+            ),
+        ]
+    }
+
+    /// #251: the same config names the same clone, worktrees and credentials wherever crewd is
+    /// started, not paths under the shell's current directory.
+    #[test]
+    fn relative_paths_in_a_config_resolve_against_its_directory() {
+        let (dir, c) = parse_path_keys("relative", "deploy");
+        assert_ne!(std::env::current_dir().unwrap(), dir, "the test needs the cwd elsewhere");
+        for (key, path) in path_keys(&c) {
+            assert!(path.starts_with(dir.join("deploy")), "{key} = {}", path.display());
+        }
+
+        let (_, c) = parse_path_keys("absolute", "/srv/deploy");
+        for (key, path) in path_keys(&c) {
+            assert!(path.starts_with("/srv/deploy"), "{key} = {} moved", path.display());
+        }
+    }
+
+    #[test]
+    fn a_tilde_in_any_path_key_expands_to_home() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set under cargo test"));
+        let (_, c) = parse_path_keys("tilde", "~/.crewd");
+        for (key, path) in path_keys(&c) {
+            assert!(path.starts_with(home.join(".crewd")), "{key} = {}", path.display());
+        }
+    }
+
+    #[test]
+    fn the_store_defaults_beside_the_config_wherever_crewd_starts() {
+        let dir = std::env::temp_dir().join("deploy");
+        assert_eq!(store_path(&dir.join("crewd.toml"), None), dir.join("crew.db"));
+        assert_eq!(store_path(Path::new("crewd.toml"), None), Path::new("crew.db"));
+    }
+
+    /// `CREW_DB` is taken as given, never joined onto the config's directory.
+    #[test]
+    fn crew_db_overrides_the_store_beside_the_config() {
+        let config = std::env::temp_dir().join("deploy/crewd.toml");
+        assert_eq!(store_path(&config, Some("other.db".into())), Path::new("other.db"));
+        assert_eq!(store_path(&config, Some("/tmp/x.db".into())), Path::new("/tmp/x.db"));
     }
 
     /// #64: each half-configured App names its missing piece instead of reaching the first poll

@@ -137,17 +137,18 @@ It is a separate switch from the tracker on purpose: a real tracker with the fak
 real dispatch decisions without spawning anything.
 
 ```bash
-cargo run -- --config ~/.crewd/<deployment>.toml --max-ticks 3
+cargo run -- --config ~/.crewd/<deployment>/crewd.toml --max-ticks 3
 ```
 
 runs the Jira Cloud tracker (#99) from a filled-in copy of `crew.jira.toml`. That copy names a
-real Jira site and repository, so it lives under `~/.crewd/` and never in this public repo. The
+real Jira site and repository, so it lives in its own deployment directory under `~/.crewd/`
+(see "Deployments" in [docs/architecture.md](docs/architecture.md)) and never in this public repo. The
 Jira credential is the file `tracker.jira.credentials` names (`email`, `api_token`), else
 `JIRA_EMAIL`/`JIRA_API_TOKEN`; `Config::load` refuses a half-written file by name. `[forge]`
 names the GitHub repository delivery pushes to, and each key falls back to `[tracker]`, which
-is why `crew.github.toml` has no `[forge]` table. **A second deployment on this host needs its
-own `CREW_DB`, `workspace.root` and `api.bind`/`api.mcp_bind`**: the default `crew.db` in the cwd
-is the dogfooding daemon's, and both shipped configs bind `127.0.0.1:8787`/`:8788`.
+is why `crew.github.toml` has no `[forge]` table. A config's relative paths and its `crew.db`
+resolve against the config's directory, not the cwd (#251). **A second deployment on this host
+needs its own `api.bind`/`api.mcp_bind`**: both shipped configs bind `127.0.0.1:8787`/`:8788`.
 
 ## Architecture
 

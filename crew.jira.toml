@@ -36,11 +36,12 @@ repo = "your-repo"
 [polling]
 interval_ms = 30000
 
-# A clone of the [forge] repository, and a worktree root beside it. Run the daemon from outside
-# both: never from inside a worktree (#29).
+# A clone of the [forge] repository, by absolute path, and the worktree root inside this
+# deployment's directory: relative paths resolve against this file's directory (#251). Never
+# start the daemon from inside a worktree (#29).
 [workspace]
-root = "../your-repo-crew"
-repo = "../your-repo"
+root = "workspaces"
+repo = "~/src/your-repo"
 
 [[workers]]
 kind = "claude"
