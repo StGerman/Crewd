@@ -711,6 +711,23 @@ Do not restate this as "the worker cannot reach a credential"; it is the weaker 
 options issue #4 offered, and it was chosen because the stronger one is not true on this
 platform.
 
+## Deployments
+
+A **deployment** is one directory holding a config, its `crew.db`, its log and its `workspaces/`,
+pointing at the repository's clone by absolute path. Everything a running crewd owns is in that
+directory, so two deployments on one host share nothing but the clone (and must still pick their
+own `api.bind`/`api.mcp_bind`). `crewd init` (#247) writes one per deployment under `~/.crewd/`.
+
+What makes the directory the unit rather than the shell that started crewd is `Config::parse`
+(#251): every path key (`workspace.repo`, `workspace.root`, `transcripts.root`,
+`tracker.github_app`, `forge.github_app`, `tracker.jira.credentials`) has `~` expanded and is then
+resolved against the config file's directory, and the store defaults to `crew.db` beside the
+config (`config::store_path`). Resolved against the current directory instead, `crewd --config
+~/.crewd/acme-api/crewd.toml` started from `$HOME` opened a fresh, empty store there and took
+`$HOME` for the clone. `CREW_DB` still overrides the store and, like any path given in the
+environment or on the command line, means what it says relative to the shell that set it. This
+repository's own run is unchanged: `crew.github.toml` sits at the root it is started from.
+
 ## Running the daemon inside a worktree
 
 One thing the overrides do not cover: running the daemon from *inside* a worktree — which is

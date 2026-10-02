@@ -98,6 +98,7 @@ reading — check that the named test is still meaningful, not just still green.
 | Invariant | Mechanism | Guard test |
 |---|---|---|
 | A half-applied migration cannot stop the store opening | each migration and the `user_version` bump that records it commit in one transaction | `a_migration_that_fails_partway_leaves_no_trace_and_does_not_advance_the_version` |
+| A config names the same store and worktrees wherever crewd is started | `Config::parse` resolves every path key against the config's directory after expanding `~`, and `config::store_path` defaults the store to `crew.db` beside the config; only `CREW_DB` overrides it (#251) | `relative_paths_in_a_config_resolve_against_its_directory`, `a_tilde_in_any_path_key_expands_to_home`, `the_store_defaults_beside_the_config_wherever_crewd_starts` |
 | A released migration is never edited | `migrate` records only the number of the last migration a store applied, so the tests pin a `blake3` of every released entry in `RELEASED`: an edited entry fails naming its version, and a new one fails until its hash is appended (#81) | `a_released_migration_is_never_edited` |
 
 ## Operator surface: API, MCP, client, projection, transcripts

@@ -322,7 +322,8 @@ fn jira_toml_error_message(text: &str, e: &toml::de::Error) -> String {
     }
 }
 
-fn expand_home(path: &Path) -> PathBuf {
+/// `~` and `~/...` against `HOME`; any other path, `~user` included, is returned unchanged.
+pub(crate) fn expand_home(path: &Path) -> PathBuf {
     match (path.strip_prefix("~"), std::env::var_os("HOME")) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => path.to_path_buf(),

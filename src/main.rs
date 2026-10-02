@@ -157,8 +157,7 @@ async fn main() -> anyhow::Result<()> {
     // one root-certificate set rather than each reading the environment for their own.
     let http = UreqHttp::from_env().context("building the HTTPS client")?;
 
-    let db_path =
-        std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
+    let db_path = crew::config::store_path(&args.config, std::env::var_os("CREW_DB"));
     // Before the store is opened and before the first tick's `recover`. A second process on
     // this file must exit here rather than release claims a live daemon still holds (#217).
     let _store_lock = StoreLock::acquire(&db_path)?;
