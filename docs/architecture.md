@@ -468,7 +468,12 @@ it, since with `active_states = ["open"]` the tracker has no state to move it th
 ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
 running, gating (a held claim is phase `running`), retry-queued, quarantined, or parked under a
 delivery still `pending`, `awaiting` or `ready` — which would push or hand back the branch in the
-tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. `Scheduler::unblock`
+tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. A
+`handed_off` delivery is what the same unblock hands back instead (#262): `Store::resume_delivery`
+moves it to `awaiting`, or to `pending` when it stopped before its pull request, forgets the
+review request and the CI wait so neither is timed from before the handoff, and keeps both round
+counts, so a pull request at `max_rounds_per_pr` is handed off again on its next round. The
+answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. `Scheduler::unblock`
 also reads the ticket fresh and keeps a park whose ticket is no longer active, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
 changed into the issue's description first: that is the prompt the next run reads.

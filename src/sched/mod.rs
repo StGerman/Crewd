@@ -36,7 +36,9 @@ use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
 use crate::forge::{Forge, Publisher};
 use crate::gate::{self, Gate, GateHandle, Verdict};
-use crate::model::{ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, worktree_key};
+use crate::model::{
+    ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, Unblocked, worktree_key,
+};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RetryEntry, RunRecord, RunStart, Store};
 use crate::tracker::{Tracker, TrackerError};
@@ -2002,11 +2004,13 @@ impl Scheduler {
         Ok(self.store.unquarantine(self.clock.as_ref(), issue_id)?)
     }
 
-    /// Operator action: hand a parked issue back once whatever parked it has been resolved.
+    /// Operator action: hand a parked issue back once whatever parked it has been resolved, or
+    /// a handed-off delivery back to crewd once the cause of its handoff has been (#262).
     ///
-    /// Reports whether a park was lifted; anything live is a no-op that says so (see
-    /// [`Store::unblock`]). The next `dispatch_new` sees the issue as live and dispatches it
-    /// onto its existing branch.
+    /// Reports which was lifted; anything live is a no-op that says so (see [`Store::unblock`]
+    /// and [`Store::resume_delivery`]). After a park, the next `dispatch_new` sees the issue as
+    /// live and dispatches it onto its existing branch; after a handoff, the next delivery poll
+    /// reads the pull request as if it had never been handed off.
     ///
     /// The ticket's state is read fresh first, and a park on one that is no longer active is
     /// kept. `dispatch_new` never sees such an issue, and `sweep_parked` — the only path that
@@ -2015,20 +2019,32 @@ impl Scheduler {
     ///
     /// The same holds for every other gate `dispatch_new` applies: an issue that has lost its
     /// dispatch marker or spent its per-issue turn budget would be unparked and never
-    /// dispatched, invisible to the sweep, so the park is kept and the answer says no.
-    pub fn unblock(&self, issue_id: &str) -> anyhow::Result<bool> {
+    /// dispatched, invisible to the sweep, so the park is kept and the answer says no. A resumed
+    /// delivery keeps its park, and a round it opens is dispatched by `dispatch_due_retries`,
+    /// which applies those gates itself.
+    pub fn unblock(&mut self, issue_id: &str) -> anyhow::Result<Unblocked> {
         let fresh = self.tracker.by_ids(&[issue_id.to_string()])?;
         let Some(issue) = fresh.iter().find(|i| i.id == issue_id) else {
-            return Ok(false);
+            return Ok(Unblocked::Nothing);
         };
+        if !self.cfg.is_active(&issue.state_key()) {
+            return Ok(Unblocked::Nothing);
+        }
+        if let Some(resumed) = self.resume_delivery(issue_id)? {
+            return Ok(resumed);
+        }
         let within_budget = self
             .store
             .get(issue_id)?
             .is_some_and(|st| st.cumulative_turns < self.cfg.agent.max_turns_per_issue);
-        if !self.cfg.is_active(&issue.state_key()) || !self.routable(issue) || !within_budget {
-            return Ok(false);
+        if !self.routable(issue) || !within_budget {
+            return Ok(Unblocked::Nothing);
         }
-        Ok(self.store.unblock(self.clock.as_ref(), issue_id)?)
+        Ok(if self.store.unblock(self.clock.as_ref(), issue_id)? {
+            Unblocked::Park
+        } else {
+            Unblocked::Nothing
+        })
     }
 
     /// Stop every in-flight run before the process exits.

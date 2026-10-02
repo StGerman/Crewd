@@ -436,8 +436,8 @@ async fn main() -> anyhow::Result<()> {
                     // outage; a keypress must not take the daemon down with it.
                     UiAction::Unblock(id) => {
                         match sched.unblock(&id) {
-                            Ok(cleared) => tracing::info!(issue_id = %id, cleared, "operator lifted a park"),
-                            Err(e) => tracing::error!(issue_id = %id, error = %e, "unblock failed; the park is kept"),
+                            Ok(done) => tracing::info!(issue_id = %id, unblocked = ?done, "operator unblocked"),
+                            Err(e) => tracing::error!(issue_id = %id, error = %e, "unblock failed; the park or handoff is kept"),
                         }
                         let _ = snap_tx.send(sched.snapshot()?);
                     }
@@ -465,8 +465,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Command::Unblock { issue_id, reply } => {
                         let cleared = sched.unblock(&issue_id);
-                        if let Ok(c) = &cleared {
-                            tracing::info!(issue_id = %issue_id, cleared = c, "api lifted a park");
+                        if let Ok(done) = &cleared {
+                            tracing::info!(issue_id = %issue_id, unblocked = ?done, "api unblocked");
                         }
                         if let Ok(s) = sched.snapshot() { let _ = snap_tx.send(s); }
                         let _ = reply.send(cleared);

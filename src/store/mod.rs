@@ -410,7 +410,8 @@ impl Store {
     /// the branch, or hand it back, in the same tick `dispatch_new` puts an agent on it. So does
     /// a `handed_off` one, which gave the branch to the operator: a dispatch there would end in a
     /// `Done` that restarts delivery, stepping around `max_rounds_per_issue` and the handoff
-    /// itself. Only `redispatched` and `closed` are left out, since neither pushes nor hands
+    /// itself. Its unblock is [`Store::resume_delivery`] instead (#262), which leaves this park to
+    /// the delivery. Only `redispatched` and `closed` are left out, since neither pushes nor hands
     /// back, and a re-dispatched run that ends `Blocked` keeps its row `redispatched`. The
     /// claim is never touched — the next `dispatch_new` takes it the ordinary way. The parked
     /// note goes too, since it names the problem the operator has just resolved.
@@ -434,6 +435,43 @@ impl Store {
                                AND delivery.stage IN ('pending', 'awaiting', 'ready', 'handed_off'))",
             params![issue_id, clock.wall().0, UNBLOCKED],
         )?;
+        Ok(n == 1)
+    }
+
+    /// Hand a handed-off delivery back to crewd, reporting whether there was one (#262): to
+    /// `awaiting` when it has a pull request, to `pending` when it stopped before one, whose
+    /// push is idempotent and whose open adopts a pull request already open on the branch.
+    ///
+    /// The round counts are kept, because a bound reset by an unblock bounds nothing: a pull
+    /// request handed off at `max_rounds_per_pr` is handed off again on its next round. The
+    /// review request and the CI wait are forgotten, or a handoff for a wait that timed out
+    /// would be repeated on the first poll from the same stale start; the request is then
+    /// made and verified again on the current head. Guarded like [`Store::unblock`], so a live
+    /// issue is never touched, and in one transaction with the issue's note, which names the
+    /// handoff just resolved.
+    pub fn resume_delivery(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
+            "UPDATE delivery
+             SET stage = CASE WHEN pr_number IS NULL THEN 'pending' ELSE 'awaiting' END,
+                 handoff_reason = NULL, review_requested = 0, review_error = NULL,
+                 review_requested_at = NULL, ci_pending_head = NULL, ci_pending_since = NULL,
+                 updated_at = ?2
+             WHERE issue_id = ?1 AND stage = 'handed_off'
+               AND EXISTS (SELECT 1 FROM issue_state WHERE issue_state.issue_id = ?1
+                           AND phase = 'released' AND quarantined_at IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)",
+            params![issue_id, clock.wall().0],
+        )?;
+        if n == 1 {
+            tx.execute(
+                "UPDATE issue_state SET last_error = NULL, last_error_class = NULL, updated_at = ?2
+                 WHERE issue_id = ?1",
+                params![issue_id, clock.wall().0],
+            )?;
+        }
+        tx.commit()?;
         Ok(n == 1)
     }
 
