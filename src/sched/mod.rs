@@ -180,6 +180,9 @@ pub struct Scheduler {
     /// then unless `cfg.delivery.enabled` — the config decides, the wiring only enables.
     forge: Option<Arc<dyn Forge>>,
     publisher: Option<Arc<dyn Publisher>>,
+    /// The login the forge posts as, learned by `set_delivery`: every comment it wrote is
+    /// crewd's own, and handing one back would have an agent argue with its own verdicts (#263).
+    own_login: String,
     /// When each open delivery was last polled, so the forge is asked at
     /// `delivery.poll_interval_ms` rather than on every tick. Monotonic, like every interval.
     delivery_polled: HashMap<String, Mono>,
@@ -256,6 +259,7 @@ impl Scheduler {
             gate: None,
             forge: None,
             publisher: None,
+            own_login: String::new(),
             delivery_polled: HashMap::new(),
             ci_waits: HashMap::new(),
             review_waits: HashMap::new(),

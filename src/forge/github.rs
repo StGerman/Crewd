@@ -51,6 +51,38 @@ struct GhUser {
     login: String,
 }
 
+/// `GET /app`: the App's slug, which GitHub writes its comments as `<slug>[bot]`.
+#[derive(Debug, Deserialize)]
+struct GhApp {
+    slug: String,
+}
+
+/// An issue comment, which is what a pull request's conversation is made of.
+#[derive(Debug, Deserialize)]
+struct GhIssueComment {
+    id: u64,
+    user: GhUser,
+    body: String,
+    #[serde(default)]
+    html_url: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCommitPerson {
+    date: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCommitDetail {
+    committer: GhCommitPerson,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCommit {
+    commit: GhCommitDetail,
+}
+
 #[derive(Debug, Deserialize)]
 struct GhHeadRef {
     sha: String,
@@ -775,6 +807,64 @@ impl<H: Http> Forge for GithubForge<H> {
         Ok(CiStatus::Success)
     }
 
+    /// An App's writes carry `<slug>[bot]`, which only the App's own JWT can read; an
+    /// installation token is refused by `GET /user`, and a personal token answers it.
+    fn login(&self) -> Result<String, ForgeError> {
+        let Some(jwt) = self.creds.app_jwt() else {
+            let user: GhUser = self.get_json(&format!("{API_BASE}/user"))?;
+            return Ok(user.login);
+        };
+        let mut headers = http::github_rest_headers();
+        headers.insert(0, ("Authorization", format!("Bearer {}", jwt?)));
+        let resp = self
+            .http
+            .get(&format!("{API_BASE}/app"), &headers)
+            .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
+        let app: GhApp = parse(&classify(resp)?)?;
+        Ok(format!("{}{BOT_SUFFIX}", app.slug))
+    }
+
+    /// "After the head" is after its committer date: the gate's rebase and every commit set it
+    /// when the head is made, and GitHub records no push time a REST read can see.
+    fn conversation_comments(
+        &self,
+        number: u64,
+        after_head: Option<&str>,
+    ) -> Result<Vec<ReviewComment>, ForgeError> {
+        let since = match after_head {
+            Some(sha) => {
+                let c: GhCommit = self.get_json(&format!(
+                    "{API_BASE}/repos/{}/{}/commits/{sha}",
+                    self.owner, self.repo
+                ))?;
+                Some(timestamp_ms(&c.commit.committer.date)?)
+            }
+            None => None,
+        };
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+        let raw: Vec<GhIssueComment> = self.paginate(|page| {
+            format!("{API_BASE}/repos/{owner}/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}")
+        })?;
+        let mut out = Vec::new();
+        for c in raw {
+            if let Some(since) = since
+                && timestamp_ms(&c.created_at)? < since
+            {
+                continue;
+            }
+            out.push(ReviewComment {
+                id: c.id.to_string(),
+                author: c.user.login,
+                path: None,
+                line: None,
+                body: c.body,
+                url: c.html_url,
+            });
+        }
+        Ok(out)
+    }
+
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
         let owner = self.owner.clone();
         let repo = self.repo.clone();
@@ -837,6 +927,14 @@ impl<H: Http> Forge for GithubForge<H> {
             })
             .collect()
     }
+}
+
+/// An RFC 3339 timestamp from GitHub as milliseconds since the epoch. One that does not parse
+/// is permanent: the same response will not parse on a retry.
+fn timestamp_ms(s: &str) -> Result<i128, ForgeError> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map(|t| t.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|e| ForgeError::Permanent(format!("malformed timestamp {s:?}: {e}")))
 }
 
 /// Maps a response onto [`ForgeError`]. 401/404/422 and a bare 403 will not resolve by

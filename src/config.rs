@@ -79,9 +79,6 @@ fn d_delivery_remote() -> String {
 /// The login the reviews endpoint reports for Copilot's automatic review.
 pub const COPILOT_REVIEWER: &str = "copilot-pull-request-reviewer[bot]";
 
-fn d_summary_reviewers() -> Vec<String> {
-    vec![COPILOT_REVIEWER.into()]
-}
 fn d_rounds_per_pr() -> u32 {
     3
 }
@@ -215,15 +212,6 @@ pub struct DeliveryConfig {
     /// means no review is requested and none is waited for.
     #[serde(default)]
     pub reviewers: Vec<String>,
-    /// Logins whose review *summary* is read for findings as well as their inline comments
-    /// (#126): any of their reviews on the current head whose body says more than
-    /// "Findings: None", Copilot's template (#201) and its approval's overview sentence (#234) is
-    /// handed to an agent whole. A review in the `CHANGES_REQUESTED` state
-    /// is read the same way whoever wrote it, so this names only the reviewers whose
-    /// `COMMENTED` summaries count too. Defaults to the Copilot reviewer, which puts findings
-    /// there that it leaves on no line.
-    #[serde(default = "d_summary_reviewers")]
-    pub summary_reviewers: Vec<String>,
     /// Times delivery may hand the *current pull request* back to an agent — for a red CI or
     /// for review comments — before handing it to the operator instead.
     #[serde(default = "d_rounds_per_pr")]
@@ -231,8 +219,9 @@ pub struct DeliveryConfig {
     /// The same bound over the issue's whole life. Survives a new run and a new pull request.
     #[serde(default = "d_rounds_per_issue")]
     pub max_rounds_per_issue: u32,
-    /// How often an open delivery is polled for CI and review. Costs two or three provider
-    /// requests per open pull request per poll, on top of the tracker's own budget.
+    /// How often an open delivery is polled for CI and review. Costs a read of the pull
+    /// request, its CI, reviews and every kind of comment per open pull request per poll, on top
+    /// of the tracker's own budget.
     #[serde(default = "d_delivery_poll")]
     pub poll_interval_ms: u64,
     /// How long to wait for CI to report on a pushed head before handing off. A repository
@@ -252,7 +241,6 @@ impl Default for DeliveryConfig {
             base: d_delivery_base(),
             remote: d_delivery_remote(),
             reviewers: vec![],
-            summary_reviewers: d_summary_reviewers(),
             max_rounds_per_pr: d_rounds_per_pr(),
             max_rounds_per_issue: d_rounds_per_issue(),
             poll_interval_ms: d_delivery_poll(),

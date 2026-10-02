@@ -354,7 +354,9 @@ async fn main() -> anyhow::Result<()> {
     sched.set_transcripts(transcripts);
     sched.set_gate(gate);
     if let Some((forge, publisher)) = delivery {
-        sched.set_delivery(Some(forge), Some(publisher));
+        sched
+            .set_delivery(Some(forge), Some(publisher))
+            .context("delivery on: could not learn the login the forge posts as")?;
     }
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());

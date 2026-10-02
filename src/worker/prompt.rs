@@ -16,6 +16,7 @@
 //! reads the file, so a missing one only costs that advice.
 
 use super::{RateLimitSignal, TokenUsage, ToolEndpoint};
+use crate::forge::CommentKind;
 use crate::model::{Feedback, Issue, ReviewVerdict, Verdict, looks_like_commit};
 use crate::workspace::WipSnapshot;
 
@@ -604,15 +605,21 @@ pub(crate) fn feedback_help(feedback: &[Feedback]) -> String {
                     ));
                 }
                 for c in comments {
-                    let at = match (&c.path, c.line) {
-                        (Some(p), Some(l)) => format!("{p}:{l}"),
-                        (Some(p), None) => p.clone(),
-                        _ if crate::forge::summary_review_id(&c.id).is_some() => {
-                            "(review summary)".into()
+                    let kind = match (CommentKind::of(&c.id), &c.path, c.line) {
+                        (CommentKind::Summary, ..) => "review summary".into(),
+                        (CommentKind::Conversation, ..) => "conversation comment".into(),
+                        (CommentKind::Inline, Some(p), Some(l)) => {
+                            format!("inline comment at {p}:{l}")
                         }
-                        _ => "(general)".into(),
+                        (CommentKind::Inline, Some(p), None) => format!("inline comment on {p}"),
+                        (CommentKind::Inline, None, _) => "inline comment".into(),
                     };
-                    s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
+                    s.push_str(&format!(
+                        "\n[{}] {kind} by {}\n{}\n",
+                        c.id,
+                        c.author,
+                        c.body.trim()
+                    ));
                 }
             }
         }
