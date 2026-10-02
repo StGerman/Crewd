@@ -1,5 +1,5 @@
 # Publishes every workspace package that is not `publish = false` to crates.io (#248), called by
-# `release.yml` after the GitHub release exists. dist has no crates.io publisher, so this is its
+# `v-release.yml` after the GitHub release exists. dist has no crates.io publisher, so this is its
 # custom publish job, named in `dist-workspace.toml`.
 #
 # `cargo publish --workspace` (stable since 1.90; the toolchain is pinned in rust-toolchain.toml)

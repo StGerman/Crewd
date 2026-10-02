@@ -1,5 +1,5 @@
 # Puts GitHub's generated release notes, built from merged pull-request titles, above the install
-# instructions dist wrote into the release body (#248). Called by `release.yml` after the
+# instructions dist wrote into the release body (#248). Called by `v-release.yml` after the
 # announcement, named in `dist-workspace.toml`; without it a release says how to install and not
 # what changed, since there is no CHANGELOG.md for dist to read.
 

@@ -1,4 +1,4 @@
-# The release (#248): `dist generate` writes `.github/workflows/release.yml` from this file, so
+# The release (#248): `dist generate` writes `.github/workflows/v-release.yml` from this file, so
 # change this and regenerate rather than editing that workflow by hand.
 
 [workspace]

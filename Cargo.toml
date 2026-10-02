@@ -84,7 +84,6 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 [lints]
 workspace = true
 
-# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
