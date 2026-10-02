@@ -173,8 +173,8 @@ trait ForgeBackend {
     fn holds_open(&self, open: &PullRequest, spec: &PullRequestSpec);
     /// The provider attaches bot `login` (as reviews spell it) when asked to review `pr`.
     fn attaches_bot(&self, pr: &PullRequest, login: &str);
-    /// The credential posts as `login`, and the provider keeps `body` on `pr`'s conversation,
-    /// written after its head, once the forge comments it.
+    /// The credential posts as `login`, and the provider keeps `body` on `pr`'s conversation
+    /// once the forge comments it.
     fn keeps_comment(&self, pr: &PullRequest, login: &str, body: &str);
 }
 
@@ -262,13 +262,10 @@ impl ForgeBackend for GithubBackend {
     fn keeps_comment(&self, _pr: &PullRequest, login: &str, body: &str) {
         self.http.push(ok(json!({ "login": login })));
         self.http.push(ok(json!({ "id": 9 })));
-        self.http
-            .push(ok(json!({ "commit": { "committer": { "date": "2026-10-03T10:00:00Z" } } })));
         self.http.push(ok(json!([{
             "id": 9,
             "user": { "login": login },
             "body": body,
-            "created_at": "2026-10-03T10:05:00Z",
         }])));
     }
 }
@@ -331,7 +328,7 @@ fn the_forges_own_comment_is_written_by_its_login(b: &dyn ForgeBackend) {
     b.keeps_comment(&pr, FakeForge::LOGIN, "**Accepted** — resolved in abc1234.");
     let login = f.login().unwrap();
     f.comment(pr.number, "**Accepted** — resolved in abc1234.").unwrap();
-    let got = f.conversation_comments(pr.number, Some(&pr.head_sha)).unwrap();
+    let got = f.conversation_comments(pr.number).unwrap();
     let authors: Vec<&str> = got.iter().map(|c| c.author.as_str()).collect();
     assert_eq!(authors, [login.as_str()], "{}", b.name());
     assert_eq!(login, FakeForge::LOGIN, "{}", b.name());

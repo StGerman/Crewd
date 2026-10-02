@@ -62,35 +62,20 @@ struct PrRecord {
     requested: Vec<String>,
     reviews: Vec<Review>,
     comments: Vec<ReviewComment>,
-    /// The conversation, each comment with the index into `heads` of the head it was written on.
-    conversation: Vec<(usize, ReviewComment)>,
-    /// Every head the pull request has had, oldest first: what "written after a head" is
-    /// measured against, as GitHub measures it against the head's commit time.
-    heads: Vec<String>,
+    conversation: Vec<ReviewComment>,
 }
 
 impl PrRecord {
-    fn set_head(&mut self, sha: &str) {
-        self.pr.head_sha = sha.to_string();
-        if self.heads.last().map(String::as_str) != Some(sha) {
-            self.heads.push(sha.to_string());
-        }
-    }
-
     fn converse(&mut self, author: &str, body: &str) -> String {
         let id = format!("{}{}", self.pr.number * 1000, self.conversation.len() + 1);
-        let at = self.heads.len().saturating_sub(1);
-        self.conversation.push((
-            at,
-            ReviewComment {
-                id: id.clone(),
-                author: author.into(),
-                path: None,
-                line: None,
-                body: body.into(),
-                url: Some(format!("{}#issuecomment-{id}", self.pr.url)),
-            },
-        ));
+        self.conversation.push(ReviewComment {
+            id: id.clone(),
+            author: author.into(),
+            path: None,
+            line: None,
+            body: body.into(),
+            url: Some(format!("{}#issuecomment-{id}", self.pr.url)),
+        });
         id
     }
 }
@@ -296,7 +281,7 @@ impl FakeForge {
         id
     }
 
-    /// Someone writes on the pull request's conversation, on its current head. Returns the
+    /// Someone writes on the pull request's conversation. Returns the
     /// comment's id as the provider spells it, unprefixed.
     pub fn add_conversation_comment(&self, number: u64, author: &str, body: &str) -> String {
         let mut g = self.inner.lock().unwrap();
@@ -360,7 +345,7 @@ impl FakeForge {
     /// or the provider's "Update branch" — so the pull request's head is one no `publish` made.
     pub fn push_head(&self, number: u64, head_sha: &str) {
         if let Some(rec) = self.inner.lock().unwrap().prs.get_mut(&number) {
-            rec.set_head(head_sha);
+            rec.pr.head_sha = head_sha.to_string();
         }
     }
 
@@ -382,7 +367,7 @@ impl FakeForge {
         g.foreign.insert(branch.to_string(), sha.to_string());
         for rec in g.prs.values_mut() {
             if rec.spec.head == branch && rec.pr.state == PrState::Open {
-                rec.set_head(sha);
+                rec.pr.head_sha = sha.to_string();
                 rec.pr.mergeable = None;
             }
         }
@@ -515,8 +500,7 @@ impl Publisher for FakeForge {
         let mut replaced = Vec::new();
         for rec in g.prs.values_mut() {
             if rec.spec.head == branch && rec.pr.state == PrState::Open {
-                let old = rec.pr.head_sha.clone();
-                rec.set_head(&head_sha);
+                let old = std::mem::replace(&mut rec.pr.head_sha, head_sha.clone());
                 if old != head_sha {
                     replaced.push((rec.pr.number, old));
                 }
@@ -614,7 +598,6 @@ impl Forge for FakeForge {
                 reviews: vec![],
                 comments: vec![],
                 conversation: vec![],
-                heads: vec![pr.head_sha.clone()],
             },
         );
         Ok(pr)
@@ -686,20 +669,10 @@ impl Forge for FakeForge {
         Ok(g.login.clone())
     }
 
-    fn conversation_comments(
-        &self,
-        number: u64,
-        after_head: Option<&str>,
-    ) -> Result<Vec<ReviewComment>, ForgeError> {
+    fn conversation_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
         let g = self.inner.lock().unwrap();
         Self::gate(&g)?;
-        let Some(rec) = g.prs.get(&number) else { return Ok(vec![]) };
-        // A head the pull request never had is newer than every comment on it.
-        let from = match after_head {
-            Some(sha) => rec.heads.iter().rposition(|h| h == sha).unwrap_or(rec.heads.len()),
-            None => 0,
-        };
-        Ok(rec.conversation.iter().filter(|(at, _)| *at >= from).map(|(_, c)| c.clone()).collect())
+        Ok(g.prs.get(&number).map(|r| r.conversation.clone()).unwrap_or_default())
     }
 
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {

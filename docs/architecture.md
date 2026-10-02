@@ -573,8 +573,9 @@ says more than "Findings: None" and Copilot's template (headings, tags, the "Rev
 section labels; #201), or than the overview sentence under Copilot's `🟢 Approved` status that
 also says "Findings: None" (#234), is handed back whole as one more comment keyed `review-<id>`:
 no parser for its sections, whose format is nobody's contract, and noise costs one `rejected`
-verdict. A conversation comment written after the current head's commit is handed back keyed
-`conversation-<id>`. Neither has a thread, so a verdict on either is a pull request comment
+verdict. A conversation comment is handed back keyed `conversation-<id>`, whenever it was written:
+GitHub records no time a head was pushed, a commit's date is not one, and a cutoff would drop a
+comment nobody answered (#265). Neither has a thread, so a verdict on either is a pull request comment
 quoting it. The round prompt names each comment's kind and author. A red CI or
 an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
 due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or

@@ -4648,7 +4648,7 @@ fn a_commented_review_summary_from_a_person_is_handed_back() {
 
 /// #263: a comment on the pull request's conversation was never read. It is handed back like an
 /// inline one, keyed apart, settled once, and answered with a comment quoting it, since it has
-/// no thread. One written before the current head was about code that head replaced.
+/// no thread. A push after it does not drop it: GitHub records no push time to cut at (#265).
 #[test]
 fn a_conversation_comment_is_handed_back_and_answered_once_settled() {
     let (mut h, forge) = delivery_harness(
@@ -4658,9 +4658,8 @@ fn a_conversation_comment_is_handed_back_and_answered_once_settled() {
     );
     run_once(&mut h);
     let pr = forge.open_prs()[0].number;
-    forge.add_conversation_comment(pr, "alice", "About the head before this one.");
-    forge.push_head(pr, "operator-head");
     let id = forge.add_conversation_comment(pr, "alice", "Please rename the guard.");
+    forge.push_head(pr, "operator-head");
     let key = format!("conversation-{id}");
     h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
         comment_id: key.clone(),

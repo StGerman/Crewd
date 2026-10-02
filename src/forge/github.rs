@@ -65,22 +65,6 @@ struct GhIssueComment {
     body: String,
     #[serde(default)]
     html_url: Option<String>,
-    created_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhCommitPerson {
-    date: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhCommitDetail {
-    committer: GhCommitPerson,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhCommit {
-    commit: GhCommitDetail,
 }
 
 #[derive(Debug, Deserialize)]
@@ -824,45 +808,23 @@ impl<H: Http> Forge for GithubForge<H> {
         Ok(format!("{}{BOT_SUFFIX}", app.slug))
     }
 
-    /// "After the head" is after its committer date: the gate's rebase and every commit set it
-    /// when the head is made, and GitHub records no push time a REST read can see.
-    fn conversation_comments(
-        &self,
-        number: u64,
-        after_head: Option<&str>,
-    ) -> Result<Vec<ReviewComment>, ForgeError> {
-        let since = match after_head {
-            Some(sha) => {
-                let c: GhCommit = self.get_json(&format!(
-                    "{API_BASE}/repos/{}/{}/commits/{sha}",
-                    self.owner, self.repo
-                ))?;
-                Some(timestamp_ms(&c.commit.committer.date)?)
-            }
-            None => None,
-        };
+    fn conversation_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
         let owner = self.owner.clone();
         let repo = self.repo.clone();
         let raw: Vec<GhIssueComment> = self.paginate(|page| {
             format!("{API_BASE}/repos/{owner}/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}")
         })?;
-        let mut out = Vec::new();
-        for c in raw {
-            if let Some(since) = since
-                && timestamp_ms(&c.created_at)? < since
-            {
-                continue;
-            }
-            out.push(ReviewComment {
+        Ok(raw
+            .into_iter()
+            .map(|c| ReviewComment {
                 id: c.id.to_string(),
                 author: c.user.login,
                 path: None,
                 line: None,
                 body: c.body,
                 url: c.html_url,
-            });
-        }
-        Ok(out)
+            })
+            .collect())
     }
 
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
@@ -927,14 +889,6 @@ impl<H: Http> Forge for GithubForge<H> {
             })
             .collect()
     }
-}
-
-/// An RFC 3339 timestamp from GitHub as milliseconds since the epoch. One that does not parse
-/// is permanent: the same response will not parse on a retry.
-fn timestamp_ms(s: &str) -> Result<i128, ForgeError> {
-    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-        .map(|t| t.unix_timestamp_nanos() / 1_000_000)
-        .map_err(|e| ForgeError::Permanent(format!("malformed timestamp {s:?}: {e}")))
 }
 
 /// Maps a response onto [`ForgeError`]. 401/404/422 and a bare 403 will not resolve by
@@ -1540,26 +1494,19 @@ mod tests {
         assert_eq!(f.http.gets(), ["https://api.github.com/app"]);
     }
 
+    /// #265: no cutoff at the head, which would need a push time GitHub does not record.
     #[test]
-    fn conversation_comments_after_a_head_are_those_written_since_it_was_committed() {
+    fn conversation_comments_are_every_comment_on_the_pull_requests_conversation() {
         let http = FakeHttp::new();
-        let comment = |id: u64, at: &str| json!({ "id": id, "user": { "login": "alice" }, "body": "b", "created_at": at });
-        http.push(ok(json!({ "commit": { "committer": { "date": "2026-10-03T10:00:00Z" } } })));
-        http.push(ok(json!([
-            comment(1, "2026-10-03T09:59:59Z"),
-            comment(2, "2026-10-03T10:00:01Z")
-        ])));
+        let comment = |id: u64| json!({ "id": id, "user": { "login": "alice" }, "body": "b" });
+        http.push(ok(json!([comment(1), comment(2)])));
         let f = forge(http);
-        let got = f.conversation_comments(4, Some("abc")).unwrap();
+        let got = f.conversation_comments(4).unwrap();
         let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["2"]);
-        assert_eq!(f.http.gets()[0], "https://api.github.com/repos/o/r/commits/abc");
-
-        f.http.push(ok(json!([comment(1, "2026-10-03T09:59:59Z")])));
+        assert_eq!(ids, ["1", "2"]);
         assert_eq!(
-            f.conversation_comments(4, None).unwrap().len(),
-            1,
-            "every comment without a head"
+            f.http.gets(),
+            ["https://api.github.com/repos/o/r/issues/4/comments?per_page=100&page=1"]
         );
     }
 

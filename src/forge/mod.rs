@@ -230,14 +230,10 @@ pub trait Forge: Send + Sync {
     /// agent as a reviewer's (#263).
     fn login(&self) -> Result<String, ForgeError>;
 
-    /// Comments on the pull request's own conversation, oldest first, with the provider's ids
-    /// unprefixed. With `after_head`, only those written after that commit was made: one written
-    /// before was about code the head replaced, as a review on an earlier head is.
-    fn conversation_comments(
-        &self,
-        number: u64,
-        after_head: Option<&str>,
-    ) -> Result<Vec<ReviewComment>, ForgeError>;
+    /// Every comment on the pull request's own conversation, oldest first, with the provider's
+    /// ids unprefixed. Not cut at the head: GitHub records no time a head was pushed, and a
+    /// commit's own date is not one (#265), so a cutoff would drop a comment nobody answered.
+    fn conversation_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError>;
 
     /// Top-level review comments, oldest first.
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError>;

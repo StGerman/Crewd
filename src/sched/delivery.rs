@@ -557,7 +557,7 @@ impl Scheduler {
         let mut open = forge.review_comments(number)?;
         open.retain(|c| c.author != own);
         open.extend(summary_findings(&reviews, &pr.head_sha, &own));
-        let conversation = forge.conversation_comments(number, Some(&pr.head_sha))?;
+        let conversation = forge.conversation_comments(number)?;
         open.extend(conversation_findings(conversation, &own));
         open.retain(|c| !settled.contains_key(&c.id));
         if !open.is_empty() {
@@ -999,16 +999,15 @@ impl Scheduler {
                 Verdict::Rejected => format!("**Rejected** — {}", v.detail),
             };
             // A summary or a conversation comment has no thread to reply on, so the verdict goes
-            // on the pull request. The conversation is read whole: the fix this verdict names
-            // moved the head, and the comment was written before it.
+            // on the pull request.
             let finding = if let Some(review_id) = summary_review_id(&v.comment_id) {
                 Some(match reviews.get_or_insert_with(|| forge.reviews(pr.number)) {
                     Ok(all) => Ok(all.iter().find(|r| r.id == review_id).map(summary_comment)),
                     Err(e) => Err(e.clone()),
                 })
             } else if let Some(id) = conversation_comment_id(&v.comment_id) {
-                let read = conversation
-                    .get_or_insert_with(|| forge.conversation_comments(pr.number, None));
+                let read =
+                    conversation.get_or_insert_with(|| forge.conversation_comments(pr.number));
                 Some(match read {
                     Ok(all) => Ok(all.iter().find(|c| c.id == id).cloned()),
                     Err(e) => Err(e.clone()),
