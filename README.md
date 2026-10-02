@@ -128,8 +128,9 @@ crewd service install --config ~/.crewd/acme-api/crewd.toml
 ```
 
 The service starts at login, restarts after a crash, and stays down after a clean shutdown. It
-runs in the config's directory, which names it (`dev.crewd.acme-api`), so two deployments on
-one host do not collide. Your shell's `PATH` and `SSL_CERT_FILE` are copied into it, because
+runs in the config's directory, which names it (`dev.crewd.acme-api`), so a second
+deployment gets its own service and its own `crew.db`; give it its own `api.bind` and
+`api.mcp_bind` too, because both shipped configs use the same ports. Your shell's `PATH` and `SSL_CERT_FILE` are copied into it, because
 neither service manager reads your shell; reinstall after changing them. The install prints
 where the logs go: `crewd.log` beside the config on macOS, the user journal on Linux, where it
 also tells you if `loginctl enable-linger` is needed to keep the service up after you log out.
