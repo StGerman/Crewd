@@ -1174,6 +1174,40 @@ mod tests {
     }
 
     #[test]
+    fn resuming_a_handed_off_delivery_does_not_touch_a_live_or_quarantined_issue() {
+        // #262: a resume hands the branch back to delivery, which pushes it; on an issue an
+        // agent holds, or one waiting on a retry, that is two owners of one branch.
+        let (s, c) = setup();
+        s.begin_delivery(&c, "id-1", None).unwrap();
+        s.set_delivery_stage(&c, "id-1", DeliveryStage::HandedOff, Some("round bound")).unwrap();
+        let handed_off = |s: &Store| {
+            let d = s.delivery("id-1").unwrap().unwrap();
+            d.stage == DeliveryStage::HandedOff && d.handoff_reason.is_some()
+        };
+
+        assert!(s.claim(&c, "id-1").unwrap());
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a held claim is live");
+        assert!(handed_off(&s));
+
+        s.release(&c, "id-1").unwrap();
+        s.schedule_retry(&c, "id-1", Wall(0), 1, "retry", None).unwrap();
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a retry row is live");
+        assert!(handed_off(&s));
+        s.clear_retry("id-1").unwrap();
+
+        s.record_failure(&c, "id-1", ErrorClass::AuthFailed, "401", 1).unwrap();
+        s.clear_retry("id-1").unwrap();
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a quarantine is the operator's first");
+        assert!(handed_off(&s));
+
+        assert!(s.unquarantine(&c, "id-1").unwrap());
+        assert!(s.resume_delivery(&c, "id-1").unwrap());
+        let d = s.delivery("id-1").unwrap().unwrap();
+        assert_eq!(d.stage, DeliveryStage::Pending, "no pull request yet: back to the push");
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a second resume has nothing to lift");
+    }
+
+    #[test]
     fn run_history_is_newest_first_and_bounded_per_issue() {
         let (s, c) = setup();
         s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
