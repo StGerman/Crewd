@@ -209,8 +209,9 @@ pub struct DeliveryConfig {
     pub remote: String,
     /// Logins to request a review from on every head delivery pushes, and to wait for: the pull
     /// request is ready only once each has reviewed its current head (#222). Each request is
-    /// verified afterwards: a provider that accepts the request and attaches nobody is reported
-    /// as a failure, not a success. A bot is spelled as reviews report it, `<name>[bot]`. Empty
+    /// verified afterwards: a person or team the provider accepts and attaches nobody for is
+    /// handed off, never a success; a bot is waited for, with the operator told to request it
+    /// (#252). A bot is spelled as reviews report it, `<name>[bot]`. Empty
     /// means no review is requested and none is waited for.
     #[serde(default)]
     pub reviewers: Vec<String>,

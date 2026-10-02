@@ -34,9 +34,12 @@
 //!
 //! A review request is followed by a read. GitHub answers a request for a bot reviewer with
 //! `200` and attaches nobody (GETT-174120), so the provider's own answer is not evidence; the
-//! pull request's outstanding requests and its posted reviews are. A request that verifiably
-//! attached nobody is a handoff with that reason, reported on the issue's row — never a quiet
-//! success that leaves a pull request nobody will look at.
+//! pull request's outstanding requests and its posted reviews are. A person or team request
+//! that verifiably attached nobody is a handoff with that reason, reported on the issue's row —
+//! never a quiet success that leaves a pull request nobody will look at. A bot's request is the one
+//! waiting can fix: an App has no Copilot seat, so only a person can request Copilot, and the
+//! pull request waits for that review with the issue's row telling the operator to request it
+//! (#252). It is never ready in between.
 //!
 //! And it is per head. A fix round pushes a new head to the same pull request, and a reviewer
 //! verified against the old one has not seen it; so a head the request was not made on is
@@ -519,6 +522,25 @@ impl Scheduler {
         // review arriving after `ready` takes the pull request out of it.
         let settled = self.store.verdicts_for(issue_id)?;
         let reviews = forge.reviews(number)?;
+        // The review the operator was told to request has arrived, whoever requested it: the
+        // note is done, and left on the row it would tell them to request it still (#252). The
+        // row's note is cleared first: `review_error` is what finds this again, so a kill between
+        // the two writes is finished on the next poll.
+        if let Some(note) = &d.review_error
+            && self.cfg.delivery.reviewers.iter().all(|r| reviewed_head(&reviews, r, &pr.head_sha))
+        {
+            tracing::info!(issue_id, pr = number, head = %pr.head_sha, "the review the operator was asked to request has arrived");
+            if st.last_error.as_ref() == Some(note) {
+                self.store.clear_note(clock.as_ref(), issue_id)?;
+            }
+            self.store.set_review_requested(
+                clock.as_ref(),
+                issue_id,
+                &pr.head_sha,
+                &d.review_reviewers,
+                None,
+            )?;
+        }
         let mut open = forge.review_comments(number)?;
         open.extend(summary_findings(&reviews, &pr.head_sha, &self.cfg.delivery.summary_reviewers));
         open.retain(|c| !settled.contains_key(&c.id));
@@ -623,9 +645,10 @@ impl Scheduler {
     }
 
     /// Request a review of `pr`'s head from every expected reviewer who has not already given
-    /// one, then read back whether each attached; `true` when one did not and the pull request
-    /// was handed off for it. A refused request names its reviewer in the error, so the handoff
-    /// it becomes says who could not be asked (#222).
+    /// one, then read back whether each attached; `true` when a person or team did not and the
+    /// pull request was handed off for it. A bot that did not attach is waited for as if it had,
+    /// with the operator told to request it (#252). A refused request names its reviewer in the
+    /// error, so the handoff it becomes says who could not be asked (#222).
     fn request_reviews(&mut self, issue_id: &str, pr: &PullRequest) -> Result<bool, StepError> {
         let forge = self.forge.clone().expect("checked by delivery_on");
         let clock = self.clock.clone();
@@ -648,14 +671,30 @@ impl Scheduler {
             .filter(|r| !requested.contains(r) && !reviewed_head(&reviews, r, &pr.head_sha))
             .map(String::as_str)
             .collect();
-        if missing.is_empty() {
-            tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, reviewers = ?reviewers, "review requested and verified attached");
+        // A bot that attached nobody is one crew-bot may not ask: an App has no Copilot seat, so
+        // only a person can request Copilot (#252). Its review is still what delivery waits for,
+        // so the operator is told to request it. A person or team that attached nobody is a
+        // wrong login, which no wait fixes.
+        let (bots, people): (Vec<&str>, Vec<&str>) =
+            missing.iter().partition(|r| r.ends_with("[bot]"));
+        if people.is_empty() {
+            let note =
+                (!bots.is_empty()).then(|| format!("request {} on {}", bots.join(", "), pr.url));
+            match &note {
+                Some(note) => {
+                    tracing::warn!(issue_id, pr = pr.number, head = %pr.head_sha, url = %pr.url, missing = ?bots, "review request did not attach; waiting for the operator to {note}");
+                    self.store.note_error(clock.as_ref(), issue_id, note)?;
+                }
+                None => {
+                    tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, reviewers = ?reviewers, "review requested and verified attached");
+                }
+            }
             self.store.set_review_requested(
                 clock.as_ref(),
                 issue_id,
                 &pr.head_sha,
                 &reviewers,
-                None,
+                note.as_deref(),
             )?;
             if self.review_waits.get(issue_id).is_none_or(|(head, _)| *head != pr.head_sha) {
                 self.review_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), clock.mono()));

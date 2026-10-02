@@ -3875,17 +3875,15 @@ fn a_restart_does_not_forgive_the_ci_wait_already_spent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// GETT-174120: requesting a bot reviewer over REST returns success and adds nobody. The
-/// provider's answer is not evidence; the pull request's own state is, and a request that did
-/// not take must be reported as the failure it is.
+/// #252: crew-bot's request for Copilot is accepted and attaches nobody, because an App has no
+/// Copilot seat. Handing off at once switched the review loop off for every pull request; the
+/// review is still what delivery waits for, so the operator is told to request it.
 #[test]
-fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reported_as_a_failure() {
+fn a_bot_review_request_that_attaches_nobody_waits_for_the_operator_instead_of_handing_off() {
     let (mut h, forge) = delivery_harness(
         vec![issue(1, "In Progress", Some(1))],
         Store::open_in_memory().unwrap(),
-        |c| {
-            c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()];
-        },
+        copilot_expected,
     );
     forge.set_attach_reviewers(false);
 
@@ -3896,37 +3894,87 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
         "the request was made: {:?}",
         forge.ops()
     );
+    let url = forge.open_prs()[0].url.clone();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Awaiting, "{d:?}");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    let note = row.last_error.as_deref().expect("the operator is told what to do");
+    assert!(note.contains(COPILOT), "names the reviewer: {note}");
+    assert!(note.contains(&url), "and the pull request: {note}");
+
+    // Still the review wait: never ready unreviewed, and handed off naming the reviewer.
+    h.clock.advance_ms(REVIEW_TIMEOUT_MS - 1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    h.clock.advance_ms(2_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert!(d.handoff_reason.unwrap().contains(COPILOT));
+}
+
+/// #252: the review the operator requested is read like the one crewd's request attached: its
+/// findings open a round, and a clean one makes the pull request ready.
+#[test]
+fn a_review_the_operator_requested_on_the_head_is_read_like_an_attached_one() {
+    let unattached = || {
+        let (mut h, forge) = delivery_harness(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open_in_memory().unwrap(),
+            copilot_expected,
+        );
+        forge.set_attach_reviewers(false);
+        run_once(&mut h);
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+        (h, forge)
+    };
+
+    let (mut h, forge) = unattached();
+    let pr = forge.open_prs()[0].number;
+    forge.add_summary_review(pr, COPILOT, "COMMENTED", "The dirty-tree failure is misreported.");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
+    match &h.worker.feedback_for("iss-1")[1][..] {
+        [Feedback::Review { comments, .. }] => assert_eq!(comments.len(), 1, "{comments:?}"),
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+
+    let (mut h, forge) = unattached();
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, COPILOT, "APPROVED");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready, "{d:?}");
+    assert!(d.review_error.is_none(), "{d:?}");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(row.last_error.is_none(), "the request note is done: {row:?}");
+}
+
+/// GETT-174120, and #252's boundary: a person or team login the provider accepts without
+/// attaching is a wrong login, which no wait fixes, so it is still handed off at once.
+#[test]
+fn a_person_reviewer_that_attaches_nobody_still_hands_off() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["alice".into()],
+    );
+    forge.set_attach_reviewers(false);
+
+    run_once(&mut h);
+
     let d = delivery_of(&h, "iss-1");
     assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "not a success");
     let why = d.review_error.expect("the failure is recorded on the delivery");
     assert!(why.contains("attached nobody"), "{why}");
-    assert!(why.contains("copilot-pull-request-reviewer[bot]"), "and names who: {why}");
+    assert!(why.contains("alice"), "and names who: {why}");
     let row = &h.sched.snapshot().unwrap().rows[0];
     assert!(
         row.last_error.as_deref().is_some_and(|e| e.contains("attached nobody")),
         "surfaced to the operator: {row:?}"
     );
-
-    // The same request, verifiably attached, is a success — so the check is about attachment,
-    // not about requesting bots.
-    let (mut h2, forge2) = delivery_harness(
-        vec![issue(1, "In Progress", Some(1))],
-        Store::open_in_memory().unwrap(),
-        |c| {
-            c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()];
-        },
-    );
-    run_once(&mut h2);
-    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
-    assert!(delivery_of(&h2, "iss-1").review_error.is_none());
-    forge2.add_review(
-        forge2.open_prs()[0].number,
-        "copilot-pull-request-reviewer[bot]",
-        "COMMENTED",
-    );
-    h2.clock.advance_ms(1_000);
-    h2.sched.tick().unwrap();
-    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
 }
 
 const REVIEW_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -5173,7 +5221,7 @@ fn a_handed_off_pull_request_the_operator_merged_is_reported_closed_not_failed()
     let (mut h, forge) = delivery_harness(
         vec![issue(1, "In Progress", Some(1))],
         Store::open_in_memory().unwrap(),
-        |c| c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()],
+        |c| c.delivery.reviewers = vec!["alice".into()],
     );
     forge.set_attach_reviewers(false);
     run_once(&mut h);
@@ -5200,7 +5248,7 @@ fn a_handed_off_pull_request_that_stays_open_is_polled_for_its_state_only() {
     let (mut h, forge) = delivery_harness(
         vec![issue(1, "In Progress", Some(1))],
         Store::open_in_memory().unwrap(),
-        |c| c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()],
+        |c| c.delivery.reviewers = vec!["alice".into()],
     );
     forge.set_attach_reviewers(false);
     run_once(&mut h);
