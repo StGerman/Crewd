@@ -612,7 +612,7 @@ closes for the broker). At either bound the pull request is handed to the operat
 outstanding items named. A review request is followed by a read of the outstanding review
 requests (`Forge::review_requests`, GraphQL `reviewRequests` on GitHub) and the reviews, because
 GitHub answers a REST request for a bot reviewer with `200` and attaches nobody (GETT-174120); a person or team request that verifiably attached nobody is a handoff with that
-reason on the issue's row, not a success. A bot's is waited for like an attached one, with the
+reason on the issue's row, not a success. A bot's request is waited for like an attached one, with the
 issue's row telling the operator to request it: an App has no Copilot seat, so crew-bot's
 request for Copilot is accepted and attaches nobody, and only a person can make it (#252). `Forge` has no `merge` method, and must not grow one — merging is
 the operator's, and the trait's shape is what enforces it. And a delivery step only runs for an

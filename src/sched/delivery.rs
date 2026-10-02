@@ -36,7 +36,7 @@
 //! `200` and attaches nobody (GETT-174120), so the provider's own answer is not evidence; the
 //! pull request's outstanding requests and its posted reviews are. A person or team request
 //! that verifiably attached nobody is a handoff with that reason, reported on the issue's row —
-//! never a quiet success that leaves a pull request nobody will look at. A bot's is the one
+//! never a quiet success that leaves a pull request nobody will look at. A bot's request is the one
 //! waiting can fix: an App has no Copilot seat, so only a person can request Copilot, and the
 //! pull request waits for that review with the issue's row telling the operator to request it
 //! (#252). It is never ready in between.
