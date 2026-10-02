@@ -716,7 +716,8 @@ platform.
 A **deployment** is one directory holding a config, its `crew.db`, its log and its `workspaces/`,
 pointing at the repository's clone by absolute path. Everything a running crewd owns is in that
 directory, so two deployments on one host share nothing but the clone (and must still pick their
-own `api.bind`/`api.mcp_bind`). `crewd init` (#247) writes one per deployment under `~/.crewd/`.
+own `api.bind`/`api.mcp_bind`). Writing one per deployment under `~/.crewd/` is #247; `crewd
+init` today writes only the GitHub App files.
 
 What makes the directory the unit rather than the shell that started crewd is `Config::parse`
 (#251): every path key (`workspace.repo`, `workspace.root`, `transcripts.root`,
