@@ -476,8 +476,11 @@ It forgets the review request and the CI wait so neither is timed from before th
 keeps both round counts, so a pull request at `max_rounds_per_pr` is handed off again on its next
 round; the turn budget is checked before any round opens, so one past `max_turns_per_issue` is
 handed off rather than dispatched. The
-answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. `Scheduler::unblock`
-also reads the ticket fresh and keeps a park whose ticket is no longer active, since
+answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. Only the unblock
+resumes it: `dispatch_new` keeps a handed-off delivery's park even when its ticket moves between
+active states, since a run dispatched there would restart delivery with its `Done`. `Scheduler::unblock`
+also reads the ticket fresh and keeps a park, or a handoff, whose ticket is no longer active or
+routable, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
 changed into the issue's description first: that is the prompt the next run reads.
 

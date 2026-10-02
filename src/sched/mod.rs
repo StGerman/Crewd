@@ -1568,6 +1568,16 @@ impl Scheduler {
             match st.parked_state.as_deref() {
                 // Still sitting where we left it: nothing new to act on.
                 Some(parked) if parked == key => continue,
+                // A handed-off delivery's park is the operator's to lift: a run dispatched here
+                // would end in a `Done` that restarts delivery with no unblock (#262).
+                Some(_)
+                    if self
+                        .store
+                        .delivery(&issue.id)?
+                        .is_some_and(|d| d.stage == crate::store::DeliveryStage::HandedOff) =>
+                {
+                    continue;
+                }
                 // The state moved, so the park is stale and the issue is live again.
                 Some(_) => self.store.unpark(self.clock.as_ref(), &issue.id)?,
                 None => {}
@@ -2019,15 +2029,17 @@ impl Scheduler {
     ///
     /// The same holds for every other gate `dispatch_new` applies: an issue that has lost its
     /// dispatch marker or spent its per-issue turn budget would be unparked and never
-    /// dispatched, invisible to the sweep, so the park is kept and the answer says no. A resumed
-    /// delivery keeps its park, and the turn budget is checked before it opens a round, so an
-    /// issue past its budget is handed off again rather than dispatched.
+    /// dispatched, invisible to the sweep, so the park is kept and the answer says no. A lost
+    /// dispatch marker refuses a resume as well: a round the delivery opens is a retry that
+    /// `dispatch_due_retries` drops for an unroutable ticket, leaving the delivery `redispatched`
+    /// with nothing running. A resumed delivery keeps its park, and the turn budget is checked
+    /// before it opens a round, so an issue past its budget is handed off again instead.
     pub fn unblock(&mut self, issue_id: &str) -> anyhow::Result<Unblocked> {
         let fresh = self.tracker.by_ids(&[issue_id.to_string()])?;
         let Some(issue) = fresh.iter().find(|i| i.id == issue_id) else {
             return Ok(Unblocked::Nothing);
         };
-        if !self.cfg.is_active(&issue.state_key()) {
+        if !self.cfg.is_active(&issue.state_key()) || !self.routable(issue) {
             return Ok(Unblocked::Nothing);
         }
         if let Some(resumed) = self.resume_delivery(issue_id)? {
@@ -2037,7 +2049,7 @@ impl Scheduler {
             .store
             .get(issue_id)?
             .is_some_and(|st| st.cumulative_turns < self.cfg.agent.max_turns_per_issue);
-        if !self.routable(issue) || !within_budget {
+        if !within_budget {
             return Ok(Unblocked::Nothing);
         }
         Ok(if self.store.unblock(self.clock.as_ref(), issue_id)? {

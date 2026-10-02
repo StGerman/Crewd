@@ -444,7 +444,9 @@ impl Store {
     /// the branch. A fix run's push refused at `pending` has a pull request number from the run
     /// before, so the number alone would resume it at `awaiting` with the fix never pushed;
     /// `handed_off_from` is what tells the two apart, and a row handed off before that column
-    /// existed resumes from the push, which is safe either way.
+    /// existed resumes from the push, which is safe either way. So does one handed off while the
+    /// provider still reported the head its push replaced (`replaced_head`): resumed at
+    /// `awaiting`, it would wait for that push's head while the operator's later one is current.
     ///
     /// The round counts are kept, because a bound reset by an unblock bounds nothing: a pull
     /// request handed off at `max_rounds_per_pr` is handed off again on its next round. The
@@ -458,7 +460,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let n = tx.execute(
             "UPDATE delivery
-             SET stage = CASE WHEN pr_number IS NOT NULL
+             SET stage = CASE WHEN pr_number IS NOT NULL AND replaced_head IS NULL
                                    AND handed_off_from IN ('awaiting', 'ready')
                               THEN 'awaiting' ELSE 'pending' END,
                  handed_off_from = NULL,

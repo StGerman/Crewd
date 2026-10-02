@@ -5467,6 +5467,87 @@ fn a_resumed_delivery_past_the_turn_budget_is_handed_off_rather_than_dispatched(
     assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "and no agent is dispatched");
 }
 
+/// Review on #264: a handed-off delivery resumes only by the operator's unblock. A ticket moved
+/// between active states lifts an ordinary park, and lifting this one would dispatch a run whose
+/// `Done` restarts delivery with no unblock at all.
+#[test]
+fn a_handed_off_ticket_moved_between_active_states_is_not_dispatched() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["alice".into()];
+            c.tracker.active_states = vec!["in progress".into(), "in review".into()];
+        },
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    h.tracker.set_state("iss-1", "In Review");
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "no run is dispatched");
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+}
+
+/// Review on #264: a resumed delivery's round is a retry, and `dispatch_due_retries` drops one
+/// for a ticket that has lost its dispatch marker, leaving the delivery `redispatched` with
+/// nothing running and nothing polling it. So the unblock refuses, and the handoff stands.
+#[test]
+fn a_handed_off_delivery_whose_ticket_lost_its_dispatch_marker_is_not_resumed() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["alice".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].clone();
+    forge.set_attach_reviewers(true);
+    forge.add_review(pr.number, "alice", "COMMENTED");
+    forge.add_comment(pr.number, "alice", "src/lib.rs", "this leaks");
+
+    h.tracker.set_dispatchable("iss-1", false);
+    assert_eq!(h.sched.unblock("iss-1").unwrap(), Unblocked::Nothing);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert_eq!(d.rounds_pr, 0, "no round is opened");
+
+    h.tracker.set_dispatchable("iss-1", true);
+    assert!(h.sched.unblock("iss-1").unwrap().cleared(), "routable again: it resumes");
+}
+
+/// Review on #264: a handoff while the provider still reported the head crewd's push replaced
+/// leaves `replaced_head` on the row. Resumed at `awaiting`, the poll would wait for that push's
+/// head even after the operator pushed another; resumed from the push, the current head is
+/// established again.
+#[test]
+fn a_delivery_handed_off_behind_its_pushed_head_resumes_from_the_push() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["alice".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
+    h.sched.store().note_replaced_head(h.clock.as_ref(), "iss-1", "an-older-head").unwrap();
+    let pr = forge.open_prs()[0].clone();
+    forge.push_head(pr.number, "the-operators-head");
+    forge.set_attach_reviewers(true);
+
+    assert!(h.sched.unblock("iss-1").unwrap().cleared());
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+}
+
 /// The stack is gate first, delivery second (#44). A `Done` with both attached goes to the gate
 /// before anything is pushed: a failing gate sends the issue back to an agent and the forge sees
 /// nothing at all, and only the gate's pass hands the branch — rebased and re-gated — to
