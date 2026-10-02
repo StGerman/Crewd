@@ -439,8 +439,12 @@ impl Store {
     }
 
     /// Hand a handed-off delivery back to crewd, reporting whether there was one (#262): to
-    /// `awaiting` when it has a pull request, to `pending` when it stopped before one, whose
-    /// push is idempotent and whose open adopts a pull request already open on the branch.
+    /// `awaiting` when it was handed off waiting on its pull request, and otherwise to
+    /// `pending`, whose push is idempotent and whose open adopts a pull request already open on
+    /// the branch. A fix run's push refused at `pending` has a pull request number from the run
+    /// before, so the number alone would resume it at `awaiting` with the fix never pushed;
+    /// `handed_off_from` is what tells the two apart, and a row handed off before that column
+    /// existed resumes from the push, which is safe either way.
     ///
     /// The round counts are kept, because a bound reset by an unblock bounds nothing: a pull
     /// request handed off at `max_rounds_per_pr` is handed off again on its next round. The
@@ -454,7 +458,10 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let n = tx.execute(
             "UPDATE delivery
-             SET stage = CASE WHEN pr_number IS NULL THEN 'pending' ELSE 'awaiting' END,
+             SET stage = CASE WHEN pr_number IS NOT NULL
+                                   AND handed_off_from IN ('awaiting', 'ready')
+                              THEN 'awaiting' ELSE 'pending' END,
+                 handed_off_from = NULL,
                  handoff_reason = NULL, review_requested = 0, review_error = NULL,
                  review_requested_at = NULL, ci_pending_head = NULL, ci_pending_since = NULL,
                  updated_at = ?2
@@ -1588,7 +1595,7 @@ impl Store {
              VALUES (?1, 'pending', ?2, ?3)
              ON CONFLICT(issue_id) DO UPDATE SET
                stage = 'pending', pending_verdicts = ?2, pending_feedback = NULL,
-               handoff_reason = NULL, updated_at = ?3",
+               handoff_reason = NULL, handed_off_from = NULL, updated_at = ?3",
             params![issue_id, verdicts_json, clock.wall().0],
         )?;
         Ok(())
@@ -1715,7 +1722,10 @@ impl Store {
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE delivery SET stage = ?2, handoff_reason = ?3, updated_at = ?4
+            "UPDATE delivery SET stage = ?2, handoff_reason = ?3, updated_at = ?4,
+               handed_off_from = CASE WHEN ?2 <> 'handed_off' THEN NULL
+                                      WHEN stage = 'handed_off' THEN handed_off_from
+                                      ELSE stage END
              WHERE issue_id = ?1",
             params![issue_id, stage.label(), handoff_reason, clock.wall().0],
         )?;

@@ -5392,6 +5392,47 @@ fn a_resumed_delivery_keeps_its_round_counts() {
     assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "and no agent is dispatched");
 }
 
+/// Review on #264: a fix run's `Done` sets the delivery back to `pending` with the pull request
+/// number of the run before. A push refused there is handed off with that number on the row, and
+/// resuming it at `awaiting` would judge the old head while the fix stayed local. The unblock
+/// resumes it at the push it was handed off from.
+#[test]
+fn a_fix_round_whose_push_was_refused_is_pushed_when_unblocked() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].clone();
+    forge.red_ci(&pr.head_sha, "a test fails");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1, "the red CI opened a round");
+
+    forge.fail_with(Some(ForgeError::Permanent("push refused".into())));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert_eq!(d.pr_number, Some(pr.number), "the row keeps the pull request it is fixing");
+    forge.fail_with(None);
+    let publishes = forge.ops().iter().filter(|o| matches!(o, Op::Publish { .. })).count();
+
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Delivery { pr_url: Some(pr.url.clone()) }
+    );
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+    h.sched.tick().unwrap();
+
+    let after = forge.ops().iter().filter(|o| matches!(o, Op::Publish { .. })).count();
+    assert_eq!(after, publishes + 1, "the fix is pushed");
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.head_sha.as_deref(), Some(pr.head_sha.as_str()), "onto the same pull request");
+    assert_eq!(d.pr_number, Some(pr.number));
+}
+
 /// The stack is gate first, delivery second (#44). A `Done` with both attached goes to the gate
 /// before anything is pushed: a failing gate sends the issue back to an agent and the forge sees
 /// nothing at all, and only the gate's pass hands the branch — rebased and re-gated — to

@@ -470,9 +470,11 @@ running, gating (a held claim is phase `running`), retry-queued, quarantined, or
 delivery still `pending`, `awaiting` or `ready` — which would push or hand back the branch in the
 tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. A
 `handed_off` delivery is what the same unblock hands back instead (#262): `Store::resume_delivery`
-moves it to `awaiting`, or to `pending` when it stopped before its pull request, forgets the
-review request and the CI wait so neither is timed from before the handoff, and keeps both round
-counts, so a pull request at `max_rounds_per_pr` is handed off again on its next round. The
+moves it back to `awaiting` when it was handed off waiting on its pull request, and otherwise
+to `pending`, so a fix run whose push was refused is pushed rather than judged on the old head.
+It forgets the review request and the CI wait so neither is timed from before the handoff, and
+keeps both round counts, so a pull request at `max_rounds_per_pr` is handed off again on its next
+round. The
 answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. `Scheduler::unblock`
 also reads the ticket fresh and keeps a park whose ticket is no longer active, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
