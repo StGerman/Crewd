@@ -1,0 +1,32 @@
+# Puts GitHub's generated release notes, built from merged pull-request titles, above the install
+# instructions dist wrote into the release body (#248). Called by `release.yml` after the
+# announcement, named in `dist-workspace.toml`; without it a release says how to install and not
+# what changed, since there is no CHANGELOG.md for dist to read.
+
+name: Release notes
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+    steps:
+      - name: Prepend the generated notes
+        run: |
+          gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > "$RUNNER_TEMP/notes.md"
+          printf '\n' >> "$RUNNER_TEMP/notes.md"
+          gh release view "$TAG" --json body --jq .body >> "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

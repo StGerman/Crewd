@@ -8,6 +8,18 @@ resolver = "3"
 # One version for every package, so the build string each binary prints cannot drift (#244).
 [workspace.package]
 version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/StGerman/crewd"
+homepage = "https://github.com/StGerman/crewd"
+readme = "README.md"
+keywords = ["claude", "agent", "orchestrator", "github", "jira"]
+categories = ["command-line-utilities", "development-tools"]
+
+# `cargo package` refuses a path dependency without a version, so each workspace package names
+# its version here once (#248). A dev-dependency stays path-only: Cargo strips it on publish.
+[workspace.dependencies]
+libcrew = { path = "libcrew", version = "0.1.0" }
 
 # `deny`, not `forbid`: `forbid` cannot be lifted locally, and one test must set an environment
 # variable, which Rust 2024 makes `unsafe` (#50). Every other `unsafe` is a build error.
@@ -17,7 +29,16 @@ unsafe_code = "deny"
 [package]
 name = "crewd"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Agent tooling and CI, which a crate built from crates.io never runs.
+exclude = [".claude", ".github"]
+description = "Tracker-driven orchestrator for Claude Code agents: a worktree, a session and a pull request per issue. The `crew` library inside is internal, with no API promise."
 # `cargo run` means the daemon, as the quickstart in CLAUDE.md and the README assumes, even
 # though `default-members` also builds `crewctl`.
 default-run = "crewd"
@@ -28,7 +49,7 @@ default-run = "crewd"
 name = "crew"
 
 [dependencies]
-libcrew = { path = "libcrew" }
+libcrew.workspace = true
 anyhow = "1.0.104"
 base64 = "0.23.1"
 blake3 = "1.8.7"
@@ -62,3 +83,8 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 
 [lints]
 workspace = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

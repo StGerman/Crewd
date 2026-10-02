@@ -1,0 +1,25 @@
+# The release (#248): `dist generate` writes `.github/workflows/release.yml` from this file, so
+# change this and regenerate rather than editing that workflow by hand.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+installers = ["shell", "homebrew"]
+# One formula per binary package: `brew install stgerman/tap/crewd stgerman/tap/crewctl`.
+tap = "StGerman/homebrew-tap"
+# dist has no crates.io publisher; `publish-crates.yml` runs `cargo publish --workspace`.
+publish-jobs = ["homebrew", "./publish-crates"]
+# A pull request plans the release and nothing else: building, hosting and publishing wait for a
+# version tag. `release.rs` in `tests/` fails if this or the workflow stops saying so.
+pr-run-mode = "plan"
+install-path = "CARGO_HOME"
+install-updater = false
+# Only `v<semver>` tags trigger a release; a tag without the `v` is not a release.
+tag-namespace = "v"
+# dist writes the install instructions as the release body; this job adds GitHub's notes, built
+# from the merged pull requests' titles, so there is no CHANGELOG.md to keep.
+post-announce-jobs = ["./release-notes"]

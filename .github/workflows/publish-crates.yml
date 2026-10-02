@@ -1,0 +1,35 @@
+# Publishes every workspace package that is not `publish = false` to crates.io (#248), called by
+# `release.yml` after the GitHub release exists. dist has no crates.io publisher, so this is its
+# custom publish job, named in `dist-workspace.toml`.
+#
+# `cargo publish --workspace` (stable since 1.90; the toolchain is pinned in rust-toolchain.toml)
+# orders the packages by their dependencies itself, so a new package needs no edit here.
+#
+# Builds the packages only. DO NOT run an example here: see the note at the top of ci.yml.
+
+name: Publish crates
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve pinned toolchain
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - name: cargo publish --workspace
+        run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
