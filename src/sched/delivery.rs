@@ -62,7 +62,7 @@ use crate::forge::{
     CiStatus, CommentKind, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review,
     ReviewComment, Synced, conversation_comment_id, summary_review_id,
 };
-use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Verdict};
+use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Unblocked, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState, PushedHead};
 use crate::worker::{KillResult, Progress, RunHandle};
 
@@ -277,6 +277,33 @@ impl Scheduler {
                 Ok(())
             }
         }
+    }
+
+    /// The operator's unblock of a handed-off delivery (#262): `None` when the issue has none,
+    /// so the unblock goes on to its park. Never resumed by anything else — not a restart, not a
+    /// cause that looks fixed — since only the operator knows the handoff's cause is gone.
+    ///
+    /// The in-memory waits go with the persisted ones [`Store::resume_delivery`] clears, or the
+    /// first poll would time the CI or review wait from before the handoff and hand it off
+    /// again; the poll timer goes too, so that poll is the next tick's.
+    ///
+    /// [`Store::resume_delivery`]: crate::store::Store::resume_delivery
+    pub(super) fn resume_delivery(&mut self, issue_id: &str) -> anyhow::Result<Option<Unblocked>> {
+        let handed_off =
+            self.store.delivery(issue_id)?.is_some_and(|d| d.stage == DeliveryStage::HandedOff);
+        if !handed_off || !self.delivery_on() {
+            return Ok(None);
+        }
+        if !self.store.resume_delivery(self.clock.as_ref(), issue_id)? {
+            return Ok(Some(Unblocked::Nothing));
+        }
+        self.delivery_polled.remove(issue_id);
+        self.ci_waits.remove(issue_id);
+        self.review_waits.remove(issue_id);
+        let d = self.store.delivery(issue_id)?;
+        let pr_url = d.as_ref().and_then(|d| d.pr_url.clone());
+        tracing::info!(issue_id, stage = ?d.map(|d| d.stage), pr = ?pr_url, "operator resumed a handed-off delivery");
+        Ok(Some(Unblocked::Delivery { pr_url }))
     }
 
     /// The operator merged or closed the pull request, which ends the delivery however it got
@@ -824,7 +851,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Whether either round bound is reached, handing the pull request to the operator if so.
+    /// Whether either round bound or the issue's turn budget is reached, handing the pull
+    /// request to the operator if so. The budget is checked here because a round is dispatched
+    /// through a retry row, and neither `dispatch_due_retries` nor `launch` reads
+    /// `cumulative_turns`: without it a round, or an unblock's resumed delivery, would start an
+    /// agent past `max_turns_per_issue` (#262).
     fn rounds_spent(
         &mut self,
         issue_id: &str,
@@ -832,13 +863,19 @@ impl Scheduler {
         what: &str,
     ) -> Result<bool, StepError> {
         let cfg = &self.cfg.delivery;
-        if d.rounds_pr < cfg.max_rounds_per_pr && d.rounds_issue < cfg.max_rounds_per_issue {
+        let budget = self.cfg.agent.max_turns_per_issue;
+        let turns = self.store.get(issue_id)?.map_or(0, |st| st.cumulative_turns);
+        let reason = if turns >= budget {
+            format!("turn budget exhausted ({turns} of {budget} turns on this issue); {what}")
+        } else if d.rounds_pr >= cfg.max_rounds_per_pr || d.rounds_issue >= cfg.max_rounds_per_issue
+        {
+            format!(
+                "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
+                d.rounds_pr, d.rounds_issue
+            )
+        } else {
             return Ok(false);
-        }
-        let reason = format!(
-            "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
-            d.rounds_pr, d.rounds_issue
-        );
+        };
         tracing::warn!(issue_id, pr = ?d.pr_number, "{reason}; handing off");
         self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
         Ok(true)

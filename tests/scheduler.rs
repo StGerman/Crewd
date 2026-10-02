@@ -14,7 +14,7 @@ use crew::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceC
 use crew::gate::Verdict as GateVerdict;
 use crew::gate::fake::{FakeGate, GateScript};
 use crew::gate::{Gate, GateHandle, GitGate};
-use crew::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
+use crew::model::{ErrorClass, Issue, Outcome, Phase, Unblocked, worktree_key};
 use crew::project::{NoopProjector, Projector, TasksProjector};
 use crew::sched::{HaltReason, HaltedWorker, Scheduler, WorkerPool};
 use crew::store::Store;
@@ -5378,6 +5378,283 @@ fn a_handed_off_pull_request_that_stays_open_is_polled_for_its_state_only() {
     assert_eq!(after.handoff_reason, d.handoff_reason, "the operator's reason is kept");
 }
 
+/// #262: seven pull requests were handed off within seconds of opening because the review
+/// request attached nobody, and the comments that arrived after were never read. Once the cause
+/// is fixed, the operator's unblock hands the pull request back to crewd, and the first poll after
+/// it reads the review as it would for a pull request never handed off.
+#[test]
+fn unblocking_a_handed_off_pull_request_resumes_its_delivery_and_reads_its_review() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["alice".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    let pr = forge.open_prs()[0].clone();
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    forge.set_attach_reviewers(true);
+    forge.add_review(pr.number, "alice", "COMMENTED");
+    let comment = forge.add_comment(pr.number, "alice", "src/lib.rs", "this leaks");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "a handoff alone reads nothing");
+
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Delivery { pr_url: Some(pr.url.clone()) },
+        "the answer names the pull request handed back"
+    );
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Awaiting, "{d:?}");
+    assert!(d.handoff_reason.is_none(), "{d:?}");
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().last_error.is_none());
+
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (1, 1), "the comment opened a round: {d:?}");
+    let fed = h.worker.feedback_for("iss-1");
+    assert_eq!(fed.len(), sessions + 1, "and the round was dispatched");
+    match fed.last().unwrap().as_slice() {
+        [Feedback::Review { comments, .. }] => assert_eq!(comments[0].id, comment),
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+}
+
+/// #262: #248's push was refused, so its delivery stopped before it had a pull request, and the
+/// operator opened one by hand on the branch. The unblock sends the delivery back to its push,
+/// and the open adopts that pull request rather than tracking none.
+#[test]
+fn a_delivery_stopped_before_its_pull_request_adopts_the_open_one_on_its_branch_when_unblocked() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.fail_with(Some(ForgeError::Permanent("push refused".into())));
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert_eq!(d.pr_number, None);
+    forge.fail_with(None);
+
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    let by_hand = crew::forge::Forge::open_pull_request(
+        forge.as_ref(),
+        &crew::forge::PullRequestSpec {
+            title: "opened by the operator".into(),
+            body: String::new(),
+            head: branch,
+            base: "master".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(h.sched.unblock("iss-1").unwrap(), Unblocked::Delivery { pr_url: None });
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.pr_number, Some(by_hand.number), "the open pull request is adopted: {d:?}");
+    assert_eq!(forge.open_prs().len(), 1, "and no second one is opened");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready, "{d:?}");
+}
+
+/// #262: an unblock is not a way around the round bounds. A pull request handed off at
+/// `max_rounds_per_pr` comes back with its counts, and the first round it would open hands it
+/// off again with the reason restated and no agent dispatched.
+#[test]
+fn a_resumed_delivery_keeps_its_round_counts() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.max_rounds_per_pr = 1,
+    );
+    forge.set_ci_default(Some(CiStatus::Failure {
+        failures: vec![crew::forge::CiFailure {
+            name: "gate".into(),
+            url: None,
+            detail: "still red".into(),
+        }],
+    }));
+    for _ in 0..6 {
+        h.sched.tick().unwrap();
+        h.clock.advance_ms(1_000);
+    }
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (1, 1));
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    assert!(h.sched.unblock("iss-1").unwrap().cleared());
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "handed off again at once: {d:?}");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (1, 1), "the counts carried over");
+    let reason = d.handoff_reason.unwrap();
+    assert!(reason.contains("fix rounds exhausted") && reason.contains("gate"), "{reason}");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "and no agent is dispatched");
+}
+
+/// Review on #264: a fix run's `Done` sets the delivery back to `pending` with the pull request
+/// number of the run before. A push refused there is handed off with that number on the row, and
+/// resuming it at `awaiting` would judge the old head while the fix stayed local. The unblock
+/// resumes it at the push it was handed off from.
+#[test]
+fn a_fix_round_whose_push_was_refused_is_pushed_when_unblocked() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].clone();
+    forge.red_ci(&pr.head_sha, "a test fails");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1, "the red CI opened a round");
+
+    forge.fail_with(Some(ForgeError::Permanent("push refused".into())));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert_eq!(d.pr_number, Some(pr.number), "the row keeps the pull request it is fixing");
+    forge.fail_with(None);
+    let publishes = forge.ops().iter().filter(|o| matches!(o, Op::Publish { .. })).count();
+
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Delivery { pr_url: Some(pr.url.clone()) }
+    );
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+    h.sched.tick().unwrap();
+
+    let after = forge.ops().iter().filter(|o| matches!(o, Op::Publish { .. })).count();
+    assert_eq!(after, publishes + 1, "the fix is pushed");
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.head_sha.as_deref(), Some(pr.head_sha.as_str()), "onto the same pull request");
+    assert_eq!(d.pr_number, Some(pr.number));
+}
+
+/// Review on #264: a delivery round is dispatched through a retry row, and nothing on that path
+/// reads the issue's turn total, so a resumed delivery could start an agent past
+/// `max_turns_per_issue`. The budget is checked before the round opens: the pull request is
+/// handed off again naming it, and nothing is dispatched.
+#[test]
+fn a_resumed_delivery_past_the_turn_budget_is_handed_off_rather_than_dispatched() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["alice".into()];
+            c.agent.max_turns_per_issue = 3; // the fake burns 3 turns per run
+        },
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    let pr = forge.open_prs()[0].clone();
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    forge.set_attach_reviewers(true);
+    forge.add_review(pr.number, "alice", "COMMENTED");
+    forge.add_comment(pr.number, "alice", "src/lib.rs", "this leaks");
+    assert!(h.sched.unblock("iss-1").unwrap().cleared());
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    let reason = d.handoff_reason.unwrap();
+    assert!(reason.starts_with("turn budget exhausted"), "{reason}");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (0, 0), "no round is charged");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "and no agent is dispatched");
+}
+
+/// Review on #264: a handed-off delivery resumes only by the operator's unblock. A ticket moved
+/// between active states lifts an ordinary park, and lifting this one would dispatch a run whose
+/// `Done` restarts delivery with no unblock at all.
+#[test]
+fn a_handed_off_ticket_moved_between_active_states_is_not_dispatched() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["alice".into()];
+            c.tracker.active_states = vec!["in progress".into(), "in review".into()];
+        },
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    h.tracker.set_state("iss-1", "In Review");
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "no run is dispatched");
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+}
+
+/// Review on #264: a resumed delivery's round is a retry, and `dispatch_due_retries` drops one
+/// for a ticket that has lost its dispatch marker, leaving the delivery `redispatched` with
+/// nothing running and nothing polling it. So the unblock refuses, and the handoff stands.
+#[test]
+fn a_handed_off_delivery_whose_ticket_lost_its_dispatch_marker_is_not_resumed() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["alice".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].clone();
+    forge.set_attach_reviewers(true);
+    forge.add_review(pr.number, "alice", "COMMENTED");
+    forge.add_comment(pr.number, "alice", "src/lib.rs", "this leaks");
+
+    h.tracker.set_dispatchable("iss-1", false);
+    assert_eq!(h.sched.unblock("iss-1").unwrap(), Unblocked::Nothing);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "{d:?}");
+    assert_eq!(d.rounds_pr, 0, "no round is opened");
+
+    h.tracker.set_dispatchable("iss-1", true);
+    assert!(h.sched.unblock("iss-1").unwrap().cleared(), "routable again: it resumes");
+}
+
+/// Review on #264: a handoff while the provider still reported the head crewd's push replaced
+/// leaves `replaced_head` on the row. Resumed at `awaiting`, the poll would wait for that push's
+/// head even after the operator pushed another; resumed from the push, the current head is
+/// established again.
+#[test]
+fn a_delivery_handed_off_behind_its_pushed_head_resumes_from_the_push() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["alice".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
+    h.sched.store().note_replaced_head(h.clock.as_ref(), "iss-1", "an-older-head").unwrap();
+    let pr = forge.open_prs()[0].clone();
+    forge.push_head(pr.number, "the-operators-head");
+    forge.set_attach_reviewers(true);
+
+    assert!(h.sched.unblock("iss-1").unwrap().cleared());
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
+}
+
 /// The stack is gate first, delivery second (#44). A `Done` with both attached goes to the gate
 /// before anything is pushed: a failing gate sends the issue back to an agent and the forge sees
 /// nothing at all, and only the gate's pass hands the branch — rebased and re-gated — to
@@ -5546,7 +5823,11 @@ fn unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch() {
     assert_eq!(h.sched.running_count(), 0, "and it stays parked while nothing has changed");
 
     gate.set_default(GateScript::passes_in(1_000));
-    assert!(h.sched.unblock("iss-1").unwrap(), "a parked issue is unblocked, and says so");
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Park,
+        "a parked issue is unblocked, and says so"
+    );
     let st = h.sched.store().get("iss-1").unwrap().unwrap();
     assert_eq!(st.parked_state.as_deref(), Some(crew::store::UNBLOCKED));
     assert_eq!(st.phase, Phase::Released, "unblock lifts the park; it takes no claim");
@@ -5602,11 +5883,19 @@ fn unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim() {
     // the guard must not rely on that.
     for id in ["iss-1", "iss-2", "iss-3"] {
         h.sched.store().park(h.clock.as_ref(), id, "in progress").unwrap();
-        assert!(!h.sched.unblock(id).unwrap(), "{id}: nothing to unblock, and it says so");
+        assert_eq!(
+            h.sched.unblock(id).unwrap(),
+            Unblocked::Nothing,
+            "{id}: nothing to unblock, and it says so"
+        );
         let st = h.sched.store().get(id).unwrap().unwrap();
         assert_eq!(st.parked_state.as_deref(), Some("in progress"), "{id}: untouched");
     }
-    assert!(!h.sched.unblock("iss-404").unwrap(), "an unknown id is a no-op too");
+    assert_eq!(
+        h.sched.unblock("iss-404").unwrap(),
+        Unblocked::Nothing,
+        "an unknown id is a no-op too"
+    );
 
     assert_eq!(phase(&h, "iss-1"), Phase::Running, "the claim must stand");
     assert_eq!(phase(&h, "iss-2"), Phase::Running, "a gate holds its claim");
@@ -5640,7 +5929,11 @@ fn unblocking_an_issue_whose_ticket_closed_leaves_it_for_the_parked_sweep() {
     h.tracker.fail_by_ids(None);
 
     h.tracker.set_state("iss-1", "Done");
-    assert!(!h.sched.unblock("iss-1").unwrap(), "a closed ticket's park is kept, and says so");
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Nothing,
+        "a closed ticket's park is kept, and says so"
+    );
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
 
     h.clock.advance_ms(60_000);
@@ -5666,17 +5959,29 @@ fn unblocking_an_issue_dispatch_would_refuse_keeps_its_park() {
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
 
     h.tracker.set_dispatchable("iss-1", false);
-    assert!(!h.sched.unblock("iss-1").unwrap(), "no dispatch marker, no unblock");
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Nothing,
+        "no dispatch marker, no unblock"
+    );
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
     h.tracker.set_dispatchable("iss-1", true);
 
-    assert!(h.sched.unblock("iss-1").unwrap(), "eligible again: the park lifts");
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Park,
+        "eligible again: the park lifts"
+    );
     h.sched.tick().unwrap();
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().cumulative_turns >= 5);
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
-    assert!(!h.sched.unblock("iss-1").unwrap(), "a spent turn budget keeps the park");
+    assert_eq!(
+        h.sched.unblock("iss-1").unwrap(),
+        Unblocked::Nothing,
+        "a spent turn budget keeps the park"
+    );
 }
 
 /// Review on #112: the unblock reads the ticket, then lifts the park, and the next dispatch is
@@ -5696,7 +6001,7 @@ fn a_ticket_that_closes_between_an_unblock_and_the_next_tick_is_still_swept() {
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
 
-    assert!(h.sched.unblock("iss-1").unwrap());
+    assert_eq!(h.sched.unblock("iss-1").unwrap(), Unblocked::Park);
     h.tracker.set_state("iss-1", "Done");
     h.clock.advance_ms(60_000);
     h.sched.tick().unwrap();
@@ -5799,7 +6104,7 @@ fn a_remote_branch_conflicting_outside_resolvable_paths_blocks_before_the_run() 
     assert!(note.contains("src/sched/mod.rs"), "names the path: {note}");
 
     // A human unblocks without resolving it: the agent is handed the conflict, not re-blocked.
-    assert!(h.sched.unblock("iss-1").unwrap());
+    assert_eq!(h.sched.unblock("iss-1").unwrap(), Unblocked::Park);
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
     let fb = h.worker.feedback_for("iss-1");

@@ -9,7 +9,7 @@
 //! | `/issues/:identifier` | `GET` | one [`Row`], run history included |
 //! | `/refresh` | `POST` | the snapshot the forced tick published |
 //! | `/unquarantine/:identifier` | `POST` | whether a quarantine was actually cleared |
-//! | `/unblock/:identifier` | `POST` | whether a park was actually lifted (#108) |
+//! | `/unblock/:identifier` | `POST` | whether a park or a handoff was lifted, and which (#108, #262) |
 //!
 //! Four properties decide the shape of everything below:
 //!
@@ -54,6 +54,7 @@ pub mod mcp;
 pub use libcrew::render;
 
 use crate::config::ApiConfig;
+use crate::model::Unblocked;
 use crate::sched::{Row, Snapshot};
 
 /// How long a connection has to deliver a complete request head. A client that opens a socket
@@ -79,8 +80,8 @@ pub enum Command {
     Tick(oneshot::Sender<anyhow::Result<Snapshot>>),
     /// Clear a quarantine, answering whether there was one to clear.
     Unquarantine { issue_id: String, reply: oneshot::Sender<anyhow::Result<bool>> },
-    /// Lift a park, answering whether there was one to lift.
-    Unblock { issue_id: String, reply: oneshot::Sender<anyhow::Result<bool>> },
+    /// Lift a park or a delivery's handoff, answering which was lifted (#262).
+    Unblock { issue_id: String, reply: oneshot::Sender<anyhow::Result<Unblocked>> },
 }
 
 /// Bind the API's listener, refusing an exposure nobody asked for.
@@ -252,7 +253,7 @@ impl Api {
 
     async fn act(&self, action: Action, key: &str) -> Response {
         match self.request_action(action, key) {
-            Ok((target, rx)) => target.reply(rx.await),
+            Ok((target, rx)) => target.reply(rx.recv().await),
             Err(refused) => refused,
         }
     }
@@ -287,10 +288,19 @@ impl Api {
         // Sent even when this snapshot says there is nothing to clear: the snapshot is as old
         // as the last tick, and the store decides the question without a race anyway. Its
         // answer, not this row, is what the operator is told.
-        let (tx, rx) = oneshot::channel();
-        let cmd = match action {
-            Action::Unquarantine => Command::Unquarantine { issue_id: issue_id.clone(), reply: tx },
-            Action::Unblock => Command::Unblock { issue_id: issue_id.clone(), reply: tx },
+        let (cmd, rx) = match action {
+            Action::Unquarantine => {
+                let (tx, rx) = oneshot::channel();
+                let cmd = Command::Unquarantine { issue_id: issue_id.clone(), reply: tx };
+                (cmd, ActionReply::Unquarantine(rx))
+            }
+            Action::Unblock => {
+                let (tx, rx) = oneshot::channel();
+                (
+                    Command::Unblock { issue_id: issue_id.clone(), reply: tx },
+                    ActionReply::Unblock(rx),
+                )
+            }
         };
         if self.commands.send(cmd).is_err() {
             return Err(Response::error(503, "the scheduler is no longer accepting commands"));
@@ -307,7 +317,66 @@ fn tick_reply(answer: Result<anyhow::Result<Snapshot>, oneshot::error::RecvError
     }
 }
 
-type ActionReply = oneshot::Receiver<anyhow::Result<bool>>;
+/// The scheduler's answer to one action, on the channel that action's command carries.
+enum ActionReply {
+    Unquarantine(oneshot::Receiver<anyhow::Result<bool>>),
+    Unblock(oneshot::Receiver<anyhow::Result<Unblocked>>),
+}
+
+type Answered = Result<anyhow::Result<Answer>, oneshot::error::RecvError>;
+
+impl ActionReply {
+    async fn recv(self) -> Answered {
+        Ok(match self {
+            ActionReply::Unquarantine(rx) => rx.await?.map(Answer::unquarantine),
+            ActionReply::Unblock(rx) => rx.await?.map(Answer::unblock),
+        })
+    }
+
+    fn blocking_recv(self) -> Answered {
+        Ok(match self {
+            ActionReply::Unquarantine(rx) => rx.blocking_recv()?.map(Answer::unquarantine),
+            ActionReply::Unblock(rx) => rx.blocking_recv()?.map(Answer::unblock),
+        })
+    }
+}
+
+/// What an action did, as the operator is told it.
+struct Answer {
+    cleared: bool,
+    detail: String,
+}
+
+impl Answer {
+    fn unquarantine(cleared: bool) -> Self {
+        let detail = if cleared {
+            "quarantine cleared; the issue is dispatchable again"
+        } else {
+            "not quarantined; nothing to clear"
+        };
+        Answer { cleared, detail: detail.to_string() }
+    }
+
+    /// Names which of the two an unblock lifted, since a park and a handoff hand the issue back
+    /// to different paths (#262).
+    fn unblock(done: Unblocked) -> Self {
+        let detail = match &done {
+            Unblocked::Park => {
+                "park lifted; the next tick dispatches the issue onto its existing branch".into()
+            }
+            Unblocked::Delivery { pr_url: Some(url) } => {
+                format!("delivery resumed on {url}; the next poll reads its CI and review")
+            }
+            Unblocked::Delivery { pr_url: None } => "delivery resumed before its pull request; \
+                 the next poll pushes the branch and opens or adopts one"
+                .into(),
+            Unblocked::Nothing => "nothing to unblock: not parked, still live, owned by its \
+                 delivery, or its ticket is not active"
+                .into(),
+        };
+        Answer { cleared: done.cleared(), detail }
+    }
+}
 
 /// The guarded operator actions on one issue. One type, so the routes and the MCP tools
 /// share a resolution, a `409` and an answer shape rather than each growing its own.
@@ -318,23 +387,10 @@ enum Action {
 }
 
 impl Action {
-    fn detail(self, cleared: bool) -> &'static str {
-        match (self, cleared) {
-            (Action::Unquarantine, true) => "quarantine cleared; the issue is dispatchable again",
-            (Action::Unquarantine, false) => "not quarantined; nothing to clear",
-            (Action::Unblock, true) => {
-                "park lifted; the next tick dispatches the issue onto its existing branch"
-            }
-            (Action::Unblock, false) => {
-                "nothing to unblock: not parked, still live, owned by its delivery, or its ticket is not active"
-            }
-        }
-    }
-
     fn failed(self) -> &'static str {
         match self {
             Action::Unquarantine => "clearing the quarantine failed",
-            Action::Unblock => "lifting the park failed",
+            Action::Unblock => "unblocking failed",
         }
     }
 }
@@ -347,15 +403,15 @@ struct Target {
 }
 
 impl Target {
-    fn reply(self, answer: Result<anyhow::Result<bool>, oneshot::error::RecvError>) -> Response {
+    fn reply(self, answer: Answered) -> Response {
         match answer {
-            Ok(Ok(cleared)) => Response::json(
+            Ok(Ok(Answer { cleared, detail })) => Response::json(
                 200,
                 json!({
                     "issue_id": self.issue_id,
                     "identifier": self.identifier,
                     "cleared": cleared,
-                    "detail": self.action.detail(cleared),
+                    "detail": detail,
                 }),
             ),
             Ok(Err(e)) => Response::error(500, &format!("{}: {e}", self.action.failed())),
@@ -588,6 +644,22 @@ mod tests {
 
     fn snapshot(rows: Vec<Row>) -> Snapshot {
         Snapshot { rows, ..Default::default() }
+    }
+
+    #[test]
+    fn an_unblock_answer_says_whether_it_lifted_a_park_or_resumed_a_delivery() {
+        // #262: the two hand the issue to different paths, so the operator is told which.
+        let park = Answer::unblock(Unblocked::Park);
+        assert!(park.cleared);
+        insta::assert_snapshot!(park.detail, @"park lifted; the next tick dispatches the issue onto its existing branch");
+        let url = "https://github.com/o/r/pull/7".to_string();
+        let resumed = Answer::unblock(Unblocked::Delivery { pr_url: Some(url) });
+        assert!(resumed.cleared);
+        insta::assert_snapshot!(resumed.detail, @"delivery resumed on https://github.com/o/r/pull/7; the next poll reads its CI and review");
+        let before = Answer::unblock(Unblocked::Delivery { pr_url: None });
+        assert!(before.cleared);
+        insta::assert_snapshot!(before.detail, @"delivery resumed before its pull request; the next poll pushes the branch and opens or adopts one");
+        assert!(!Answer::unblock(Unblocked::Nothing).cleared);
     }
 
     #[test]

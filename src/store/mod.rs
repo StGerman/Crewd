@@ -410,7 +410,8 @@ impl Store {
     /// the branch, or hand it back, in the same tick `dispatch_new` puts an agent on it. So does
     /// a `handed_off` one, which gave the branch to the operator: a dispatch there would end in a
     /// `Done` that restarts delivery, stepping around `max_rounds_per_issue` and the handoff
-    /// itself. Only `redispatched` and `closed` are left out, since neither pushes nor hands
+    /// itself. Its unblock is [`Store::resume_delivery`] instead (#262), which leaves this park to
+    /// the delivery. Only `redispatched` and `closed` are left out, since neither pushes nor hands
     /// back, and a re-dispatched run that ends `Blocked` keeps its row `redispatched`. The
     /// claim is never touched — the next `dispatch_new` takes it the ordinary way. The parked
     /// note goes too, since it names the problem the operator has just resolved.
@@ -434,6 +435,52 @@ impl Store {
                                AND delivery.stage IN ('pending', 'awaiting', 'ready', 'handed_off'))",
             params![issue_id, clock.wall().0, UNBLOCKED],
         )?;
+        Ok(n == 1)
+    }
+
+    /// Hand a handed-off delivery back to crewd, reporting whether there was one (#262): to
+    /// `awaiting` when it was handed off waiting on its pull request, and otherwise to
+    /// `pending`, whose push is idempotent and whose open adopts a pull request already open on
+    /// the branch. A fix run's push refused at `pending` has a pull request number from the run
+    /// before, so the number alone would resume it at `awaiting` with the fix never pushed;
+    /// `handed_off_from` is what tells the two apart, and a row handed off before that column
+    /// existed resumes from the push, which is safe either way. So does one handed off while the
+    /// provider still reported the head its push replaced (`replaced_head`): resumed at
+    /// `awaiting`, it would wait for that push's head while the operator's later one is current.
+    ///
+    /// The round counts are kept, because a bound reset by an unblock bounds nothing: a pull
+    /// request handed off at `max_rounds_per_pr` is handed off again on its next round. The
+    /// review request and the CI wait are forgotten, or a handoff for a wait that timed out
+    /// would be repeated on the first poll from the same stale start; the request is then
+    /// made and verified again on the current head. Guarded like [`Store::unblock`], so a live
+    /// issue is never touched, and in one transaction with the issue's note, which names the
+    /// handoff just resolved.
+    pub fn resume_delivery(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
+            "UPDATE delivery
+             SET stage = CASE WHEN pr_number IS NOT NULL AND replaced_head IS NULL
+                                   AND handed_off_from IN ('awaiting', 'ready')
+                              THEN 'awaiting' ELSE 'pending' END,
+                 handed_off_from = NULL,
+                 handoff_reason = NULL, review_requested = 0, review_error = NULL,
+                 review_requested_at = NULL, ci_pending_head = NULL, ci_pending_since = NULL,
+                 updated_at = ?2
+             WHERE issue_id = ?1 AND stage = 'handed_off'
+               AND EXISTS (SELECT 1 FROM issue_state WHERE issue_state.issue_id = ?1
+                           AND phase = 'released' AND quarantined_at IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)",
+            params![issue_id, clock.wall().0],
+        )?;
+        if n == 1 {
+            tx.execute(
+                "UPDATE issue_state SET last_error = NULL, last_error_class = NULL, updated_at = ?2
+                 WHERE issue_id = ?1",
+                params![issue_id, clock.wall().0],
+            )?;
+        }
+        tx.commit()?;
         Ok(n == 1)
     }
 
@@ -1136,6 +1183,40 @@ mod tests {
     }
 
     #[test]
+    fn resuming_a_handed_off_delivery_does_not_touch_a_live_or_quarantined_issue() {
+        // #262: a resume hands the branch back to delivery, which pushes it; on an issue an
+        // agent holds, or one waiting on a retry, that is two owners of one branch.
+        let (s, c) = setup();
+        s.begin_delivery(&c, "id-1", None).unwrap();
+        s.set_delivery_stage(&c, "id-1", DeliveryStage::HandedOff, Some("round bound")).unwrap();
+        let handed_off = |s: &Store| {
+            let d = s.delivery("id-1").unwrap().unwrap();
+            d.stage == DeliveryStage::HandedOff && d.handoff_reason.is_some()
+        };
+
+        assert!(s.claim(&c, "id-1").unwrap());
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a held claim is live");
+        assert!(handed_off(&s));
+
+        s.release(&c, "id-1").unwrap();
+        s.schedule_retry(&c, "id-1", Wall(0), 1, "retry", None).unwrap();
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a retry row is live");
+        assert!(handed_off(&s));
+        s.clear_retry("id-1").unwrap();
+
+        s.record_failure(&c, "id-1", ErrorClass::AuthFailed, "401", 1).unwrap();
+        s.clear_retry("id-1").unwrap();
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a quarantine is the operator's first");
+        assert!(handed_off(&s));
+
+        assert!(s.unquarantine(&c, "id-1").unwrap());
+        assert!(s.resume_delivery(&c, "id-1").unwrap());
+        let d = s.delivery("id-1").unwrap().unwrap();
+        assert_eq!(d.stage, DeliveryStage::Pending, "no pull request yet: back to the push");
+        assert!(!s.resume_delivery(&c, "id-1").unwrap(), "a second resume has nothing to lift");
+    }
+
+    #[test]
     fn run_history_is_newest_first_and_bounded_per_issue() {
         let (s, c) = setup();
         s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
@@ -1516,7 +1597,7 @@ impl Store {
              VALUES (?1, 'pending', ?2, ?3)
              ON CONFLICT(issue_id) DO UPDATE SET
                stage = 'pending', pending_verdicts = ?2, pending_feedback = NULL,
-               handoff_reason = NULL, updated_at = ?3",
+               handoff_reason = NULL, handed_off_from = NULL, updated_at = ?3",
             params![issue_id, verdicts_json, clock.wall().0],
         )?;
         Ok(())
@@ -1643,7 +1724,10 @@ impl Store {
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE delivery SET stage = ?2, handoff_reason = ?3, updated_at = ?4
+            "UPDATE delivery SET stage = ?2, handoff_reason = ?3, updated_at = ?4,
+               handed_off_from = CASE WHEN ?2 <> 'handed_off' THEN NULL
+                                      WHEN stage = 'handed_off' THEN handed_off_from
+                                      ELSE stage END
              WHERE issue_id = ?1",
             params![issue_id, stage.label(), handoff_reason, clock.wall().0],
         )?;

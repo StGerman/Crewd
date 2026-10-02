@@ -234,6 +234,25 @@ pub fn looks_like_commit(s: &str) -> bool {
     (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// What an operator's unblock handed back. A park and a handoff never both apply, since a
+/// handed-off delivery owns its issue's park, so the answer names the one acted on (#262).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unblocked {
+    /// Nothing to hand back: not parked, still live, or not eligible for dispatch.
+    Nothing,
+    /// The park is lifted, and the next tick dispatches the issue.
+    Park,
+    /// The handoff is lifted, and the next poll goes on with the delivery. `pr_url` is `None`
+    /// for a delivery that stopped before its pull request.
+    Delivery { pr_url: Option<String> },
+}
+
+impl Unblocked {
+    pub fn cleared(&self) -> bool {
+        !matches!(self, Unblocked::Nothing)
+    }
+}
+
 /// The agent's settlement of one review comment. Either a fix, named by the commit that
 /// carries it, or a refusal, named by its reason — never a bare acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

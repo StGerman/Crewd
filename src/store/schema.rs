@@ -243,6 +243,14 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE delivery ADD COLUMN review_requested_at INTEGER;
     ALTER TABLE delivery ADD COLUMN review_reviewers TEXT;
     "#,
+    // v17
+    r#"
+    -- The stage a handoff interrupted (#262). An unblock resumes the delivery there: a fix run's
+    -- push refused at `pending` keeps its pull request number, and resuming it as `awaiting`
+    -- would judge the old head while the fix stayed local. NULL while not handed off, and for a
+    -- row handed off before this column, which the unblock resumes from the push.
+    ALTER TABLE delivery ADD COLUMN handed_off_from TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -341,6 +349,7 @@ mod tests {
         "520562198a072368e0c51621f67c99d360a8e0f4201dc3f0d9b94330499bbf2e", // v14
         "52c5243e127d8c5571d26806596277fd07c7ef125cf8e2cfed3dc95ffb9b7067", // v15
         "329182dbac3862b45fe5c572e621f2ea5c6f3589dbd6abd2b52c998cb2a3f620", // v16
+        "69ba227b19404f993ef2b93ce9ddfe8cdd296d66b925cae57c00cc552c693662", // v17
     ];
 
     #[test]

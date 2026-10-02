@@ -468,8 +468,19 @@ it, since with `active_states = ["open"]` the tracker has no state to move it th
 ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
 running, gating (a held claim is phase `running`), retry-queued, quarantined, or parked under a
 delivery still `pending`, `awaiting` or `ready` — which would push or hand back the branch in the
-tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. `Scheduler::unblock`
-also reads the ticket fresh and keeps a park whose ticket is no longer active, since
+tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. A
+`handed_off` delivery is what the same unblock hands back instead (#262): `Store::resume_delivery`
+moves it back to `awaiting` when it was handed off waiting on its pull request, and otherwise
+to `pending`, so a fix run whose push was refused is pushed rather than judged on the old head.
+It forgets the review request and the CI wait so neither is timed from before the handoff, and
+keeps both round counts, so a pull request at `max_rounds_per_pr` is handed off again on its next
+round; the turn budget is checked before any round opens, so one past `max_turns_per_issue` is
+handed off rather than dispatched. The
+answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. Only the unblock
+resumes it: `dispatch_new` keeps a handed-off delivery's park even when its ticket moves between
+active states, since a run dispatched there would restart delivery with its `Done`. `Scheduler::unblock`
+also reads the ticket fresh and keeps a park, or a handoff, whose ticket is no longer active or
+routable, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
 changed into the issue's description first: that is the prompt the next run reads.
 
