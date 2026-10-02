@@ -173,12 +173,10 @@ enabled = true
 base = "master"
 remote = "origin"
 reviewers = ["copilot-pull-request-reviewer[bot]"]
-# Whose `COMMENTED` review summaries are read for findings as well as their inline comments; a
-# `CHANGES_REQUESTED` summary is read whoever wrote it. The default, spelled out (#126).
-summary_reviewers = ["copilot-pull-request-reviewer[bot]"]
 max_rounds_per_pr = 3
 max_rounds_per_issue = 6
-# Two or three requests per open pull request per poll, on top of the tracker budget above.
+# A read of the pull request, its CI, reviews and comments per open pull request per poll, on
+# top of the tracker budget above.
 poll_interval_ms = 120000
 # A head CI never reports on is handed off after this long rather than waited on forever.
 ci_timeout_ms = 3600000
