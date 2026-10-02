@@ -62,10 +62,28 @@ struct PrRecord {
     requested: Vec<String>,
     reviews: Vec<Review>,
     comments: Vec<ReviewComment>,
+    conversation: Vec<ReviewComment>,
+}
+
+impl PrRecord {
+    fn converse(&mut self, author: &str, body: &str) -> String {
+        let id = format!("{}{}", self.pr.number * 1000, self.conversation.len() + 1);
+        self.conversation.push(ReviewComment {
+            id: id.clone(),
+            author: author.into(),
+            path: None,
+            line: None,
+            body: body.into(),
+            url: Some(format!("{}#issuecomment-{id}", self.pr.url)),
+        });
+        id
+    }
 }
 
 #[derive(Default)]
 struct Inner {
+    /// What [`Forge::login`] answers, and the author of every comment `comment` posts.
+    login: String,
     prs: BTreeMap<u64, PrRecord>,
     next_number: u64,
     /// CI verdict per head sha; absent means [`CiStatus::Pending`].
@@ -135,9 +153,13 @@ impl Default for FakeForge {
 }
 
 impl FakeForge {
+    /// The login the fake posts as unless a test sets another.
+    pub const LOGIN: &str = "crew-bot[bot]";
+
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
+                login: Self::LOGIN.into(),
                 next_number: 100,
                 ci_default: Some(CiStatus::Success),
                 attach_reviewers: true,
@@ -257,6 +279,13 @@ impl FakeForge {
             url: None,
         });
         id
+    }
+
+    /// Someone writes on the pull request's conversation. Returns the
+    /// comment's id as the provider spells it, unprefixed.
+    pub fn add_conversation_comment(&self, number: u64, author: &str, body: &str) -> String {
+        let mut g = self.inner.lock().unwrap();
+        g.prs.get_mut(&number).expect("no such pull request").converse(author, body)
     }
 
     /// A reviewer submits a review on the current head, which also clears their request.
@@ -568,6 +597,7 @@ impl Forge for FakeForge {
                 requested: vec![],
                 reviews: vec![],
                 comments: vec![],
+                conversation: vec![],
             },
         );
         Ok(pr)
@@ -633,6 +663,18 @@ impl Forge for FakeForge {
             .unwrap_or(CiStatus::Pending { running: vec![] }))
     }
 
+    fn login(&self) -> Result<String, ForgeError> {
+        let g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        Ok(g.login.clone())
+    }
+
+    fn conversation_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
+        let g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        Ok(g.prs.get(&number).map(|r| r.conversation.clone()).unwrap_or_default())
+    }
+
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
         let g = self.inner.lock().unwrap();
         Self::gate(&g)?;
@@ -657,6 +699,10 @@ impl Forge for FakeForge {
             return Err(e.clone());
         }
         g.ops.push(Op::Comment { number, body: body.into() });
+        let login = g.login.clone();
+        if let Some(rec) = g.prs.get_mut(&number) {
+            rec.converse(&login, body);
+        }
         Ok(())
     }
 

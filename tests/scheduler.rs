@@ -3491,7 +3491,7 @@ fn delivery_harness_with(
         tune(c);
     });
     let publisher: Arc<dyn Publisher> = forge.clone();
-    h.sched.set_delivery(Some(forge.clone()), Some(publisher));
+    h.sched.set_delivery(Some(forge.clone()), Some(publisher)).unwrap();
     h.worker.set_default(Script::succeeds_in(1_000));
     (h, forge)
 }
@@ -4613,8 +4613,6 @@ fn a_changes_requested_review_with_only_a_summary_is_handed_back() {
     );
     run_once(&mut h);
     let pr = forge.open_prs()[0].number;
-    // A human's plain comment summary is not a finding; their request for changes is.
-    forge.add_summary_review(pr, "alice", "COMMENTED", "Nice work overall.");
     let review =
         forge.add_summary_review(pr, "alice", "CHANGES_REQUESTED", "Split the migration out.");
     h.clock.advance_ms(1_000);
@@ -4622,6 +4620,115 @@ fn a_changes_requested_review_with_only_a_summary_is_handed_back() {
 
     assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
     assert_eq!(handed_ids(&h, "iss-1", 1), [format!("review-{review}")]);
+}
+
+/// #263: the operator's own `COMMENTED` summary was never handed back, because only a
+/// `summary_reviewers` login's was read. Whoever wrote it, it is a finding; an approval is not.
+#[test]
+fn a_commented_review_summary_from_a_person_is_handed_back() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let review = forge.add_summary_review(pr, "alice", "COMMENTED", "Rename the guard.");
+    forge.add_summary_review(pr, "bob", "APPROVED", "Looks fine, ship it.");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
+    assert_eq!(handed_ids(&h, "iss-1", 1), [format!("review-{review}")]);
+    match &h.worker.feedback_for("iss-1")[1][..] {
+        [Feedback::Review { comments, .. }] => assert_eq!(comments[0].author, "alice"),
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+}
+
+/// #263: a comment on the pull request's conversation was never read. It is handed back like an
+/// inline one, keyed apart, settled once, and answered with a comment quoting it, since it has
+/// no thread. A push after it does not drop it: GitHub records no push time to cut at (#265).
+#[test]
+fn a_conversation_comment_is_handed_back_and_answered_once_settled() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let id = forge.add_conversation_comment(pr, "alice", "Please rename the guard.");
+    forge.push_head(pr, "operator-head");
+    let key = format!("conversation-{id}");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: key.clone(),
+        verdict: Verdict::Rejected,
+        detail: "the name is the one the spec uses".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(handed_ids(&h, "iss-1", 1), std::slice::from_ref(&key));
+    match &h.worker.feedback_for("iss-1")[1][..] {
+        [Feedback::Review { comments, .. }] => assert_eq!(comments[0].author, "alice"),
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let verdicts = h.sched.store().verdicts_for("iss-1").unwrap();
+    assert_eq!(verdicts[&key].0, Verdict::Rejected);
+    let posted = forge.comments_on(pr);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert!(posted[0].contains("> Please rename the guard."), "quotes it: {}", posted[0]);
+    assert!(posted[0].contains("by alice"), "names who wrote it: {}", posted[0]);
+    assert!(posted[0].contains("**Rejected** — the name is the one the spec uses"));
+    assert!(forge.replies_to(pr, &key).is_empty(), "there is no thread to reply on");
+    assert!(
+        forge.ops().iter().all(|o| !matches!(o, Op::Resolve { .. })),
+        "nor one to resolve: {:?}",
+        forge.ops()
+    );
+
+    for _ in 0..5 {
+        h.clock.advance_ms(2_000);
+        h.sched.tick().unwrap();
+    }
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(d.rounds_pr, 1);
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "no round over a settled comment");
+    assert_eq!(forge.comments_on(pr).len(), 1, "answered once, ever");
+}
+
+/// #263: crewd's own verdict comments land in the same conversation as a reviewer's, and one
+/// handed back would have an agent settle its own answer. Nothing crew-bot wrote is a finding:
+/// not a reply, not a root comment, not a summary, not a conversation comment.
+#[test]
+fn crew_bots_own_comments_are_never_handed_back() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let me = FakeForge::LOGIN;
+    forge.add_comment(pr, me, "src/lib.rs", "Noting the reason for this branch.");
+    forge.add_summary_review(pr, me, "COMMENTED", "Summary of the round.");
+    forge.add_conversation_comment(pr, me, "**Rejected** — the name is the one the spec uses");
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+
+    // Delivery that cannot learn whose comments are its own is not attached at all.
+    let blind = Arc::new(FakeForge::new());
+    blind.fail_with(Some(crew::forge::ForgeError::Permanent("401".into())));
+    let publisher: Arc<dyn Publisher> = blind.clone();
+    assert!(h.sched.set_delivery(Some(blind), Some(publisher)).is_err());
 }
 
 /// Finding 4 on #47, end to end: the reviewer approves the first head, CI sends the issue round,
@@ -5931,7 +6038,7 @@ fn a_commit_pushed_to_the_branch_by_someone_else_reaches_the_worktree_before_the
     );
     let forge = Arc::new(FakeForge::new());
     let publisher: Arc<dyn Publisher> = ws;
-    h.sched.set_delivery(Some(forge.clone()), Some(publisher));
+    h.sched.set_delivery(Some(forge.clone()), Some(publisher)).unwrap();
     h.worker.set_default(Script::succeeds_in(1_000));
 
     h.sched.tick().unwrap();

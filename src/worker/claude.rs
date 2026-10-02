@@ -1062,7 +1062,10 @@ mod tests {
             unanswered_before: vec!["4059939600".into()],
         };
         let prompt = build_prompt(&issue(), None, std::slice::from_ref(&fb), &[]);
-        assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
+        assert!(
+            prompt.contains("[4059939692] inline comment at src/config.rs:79 by Copilot"),
+            "{prompt}"
+        );
         assert!(prompt.contains("missing `#[serde(default)]`"));
         assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");
         assert!(prompt.contains("accepted: <commit sha"), "an acceptance must name its commit");
@@ -1070,6 +1073,34 @@ mod tests {
         assert!(
             prompt.contains("4059939600"),
             "an earlier round's silence is named, not forgotten"
+        );
+    }
+
+    /// #263: a summary and a conversation comment arrive beside inline ones, from anyone, and
+    /// the agent is told which is which and who wrote it.
+    #[test]
+    fn the_round_prompt_names_each_comments_kind_and_author() {
+        let c =
+            |id: &str, author: &str, path: Option<&str>, body: &str| crate::forge::ReviewComment {
+                id: id.into(),
+                author: author.into(),
+                path: path.map(Into::into),
+                line: path.map(|_| 79),
+                body: body.into(),
+                url: None,
+            };
+        let fb = Feedback::Review {
+            pr_url: "https://github.com/o/r/pull/9".into(),
+            comments: vec![
+                c("4059939692", "Copilot", Some("src/config.rs"), "Missing `#[serde(default)]`."),
+                c("review-77", "alice", None, "Split the migration out."),
+                c("conversation-88", "bob", None, "Please rename the guard."),
+            ],
+            unanswered_before: vec![],
+        };
+        insta::assert_snapshot!(
+            "round_prompt_names_each_comments_kind_and_author",
+            build_continuation_prompt(&issue(), None, std::slice::from_ref(&fb), &[], false)
         );
     }
 

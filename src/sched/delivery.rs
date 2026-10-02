@@ -53,12 +53,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::review_summary::{summary_findings, verdict_comment};
+use super::review_summary::{
+    conversation_findings, summary_comment, summary_findings, verdict_comment,
+};
 use super::{Gating, Running, Scheduler, log_tracker_failure};
 use crate::clock::{Clock, Mono, Wall};
 use crate::forge::{
-    CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, Synced,
-    summary_review_id,
+    CiStatus, CommentKind, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review,
+    ReviewComment, Synced, conversation_comment_id, summary_review_id,
 };
 use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Unblocked, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState, PushedHead};
@@ -128,13 +130,22 @@ impl Scheduler {
     /// Attach the forge and the publisher. A setter, like the broker's: optional by nature,
     /// and every caller without it — the scheduler's whole existing test suite — is correct
     /// without it. `delivery.enabled` in the config is what turns the attached pair on.
+    ///
+    /// Asks the forge which login it posts as, and fails if it cannot say: without it delivery
+    /// cannot tell its own verdict comments from a reviewer's and would hand them back (#263),
+    /// so `main` exits at startup naming the failure rather than delivering without it.
     pub fn set_delivery(
         &mut self,
         forge: Option<std::sync::Arc<dyn Forge>>,
         publisher: Option<std::sync::Arc<dyn crate::forge::Publisher>>,
-    ) {
+    ) -> Result<(), ForgeError> {
+        self.own_login = match &forge {
+            Some(f) => f.login()?,
+            None => String::new(),
+        };
         self.forge = forge;
         self.publisher = publisher;
+        Ok(())
     }
 
     pub(super) fn delivery_on(&self) -> bool {
@@ -544,9 +555,10 @@ impl Scheduler {
             CiStatus::Success => {}
         }
 
-        // Inline comments, then the findings reviewers left only in a review's summary (#126):
-        // both are settled by the same verdict table, so a summary is handed back once and a
-        // review arriving after `ready` takes the pull request out of it.
+        // Inline comments, then the findings left only in a review's summary (#126) or on the
+        // conversation (#263), whoever wrote them but crewd: all are settled by the same verdict
+        // table, so each is handed back once and one arriving after `ready` takes the pull
+        // request out of it.
         let settled = self.store.verdicts_for(issue_id)?;
         let reviews = forge.reviews(number)?;
         // The review the operator was told to request has arrived, whoever requested it: the
@@ -568,8 +580,12 @@ impl Scheduler {
                 None,
             )?;
         }
+        let own = self.own_login.clone();
         let mut open = forge.review_comments(number)?;
-        open.extend(summary_findings(&reviews, &pr.head_sha, &self.cfg.delivery.summary_reviewers));
+        open.retain(|c| c.author != own);
+        open.extend(summary_findings(&reviews, &pr.head_sha, &own));
+        let conversation = forge.conversation_comments(number)?;
+        open.extend(conversation_findings(conversation, &own));
         open.retain(|c| !settled.contains_key(&c.id));
         if !open.is_empty() {
             let handed_before: Vec<String> = d
@@ -585,10 +601,11 @@ impl Scheduler {
             let ids: Vec<String> = open.iter().map(|c| c.id.clone()).collect();
             let named: Vec<String> = open
                 .iter()
-                .map(|c| match &c.path {
-                    Some(p) => format!("{} ({p})", c.id),
-                    None if summary_review_id(&c.id).is_some() => format!("{} (summary)", c.id),
-                    None => c.id.clone(),
+                .map(|c| match (&c.path, CommentKind::of(&c.id)) {
+                    (Some(p), _) => format!("{} ({p})", c.id),
+                    (None, CommentKind::Summary) => format!("{} (summary)", c.id),
+                    (None, CommentKind::Conversation) => format!("{} (conversation)", c.id),
+                    (None, CommentKind::Inline) => c.id.clone(),
                 })
                 .collect();
             let fb = Feedback::Review { pr_url: pr.url.clone(), comments: open, unanswered_before };
@@ -1006,8 +1023,9 @@ impl Scheduler {
         let settled = self.store.verdicts_for(issue_id)?;
         let mut unapplied: Vec<ReviewVerdict> = Vec::new();
         let mut failure: Option<ForgeError> = None;
-        // Read once, and only if a summary is answered: its verdict quotes the finding.
+        // Each read once, and only if a finding of its kind is answered: the verdict quotes it.
         let mut reviews: Option<Result<Vec<Review>, ForgeError>> = None;
+        let mut conversation: Option<Result<Vec<ReviewComment>, ForgeError>> = None;
         for v in verdicts {
             if settled.contains_key(&v.comment_id) {
                 // Settled by an earlier round; the first verdict stands and is not re-argued.
@@ -1017,15 +1035,28 @@ impl Scheduler {
                 Verdict::Accepted => format!("**Accepted** — resolved in {}.", v.detail),
                 Verdict::Rejected => format!("**Rejected** — {}", v.detail),
             };
-            let posted = match summary_review_id(&v.comment_id) {
-                // A summary has no thread to reply on, so the verdict goes on the pull request.
-                Some(review_id) => match reviews.get_or_insert_with(|| forge.reviews(pr.number)) {
-                    Ok(all) => {
-                        let r = all.iter().find(|r| r.id == review_id);
-                        forge.comment(pr.number, &verdict_comment(&v.comment_id, r, &body))
-                    }
+            // A summary or a conversation comment has no thread to reply on, so the verdict goes
+            // on the pull request.
+            let finding = if let Some(review_id) = summary_review_id(&v.comment_id) {
+                Some(match reviews.get_or_insert_with(|| forge.reviews(pr.number)) {
+                    Ok(all) => Ok(all.iter().find(|r| r.id == review_id).map(summary_comment)),
                     Err(e) => Err(e.clone()),
-                },
+                })
+            } else if let Some(id) = conversation_comment_id(&v.comment_id) {
+                let read =
+                    conversation.get_or_insert_with(|| forge.conversation_comments(pr.number));
+                Some(match read {
+                    Ok(all) => Ok(all.iter().find(|c| c.id == id).cloned()),
+                    Err(e) => Err(e.clone()),
+                })
+            } else {
+                None
+            };
+            let posted = match finding {
+                Some(Ok(c)) => {
+                    forge.comment(pr.number, &verdict_comment(&v.comment_id, c.as_ref(), &body))
+                }
+                Some(Err(e)) => Err(e),
                 None => forge.reply(pr.number, &v.comment_id, &body),
             };
             match posted {
@@ -1074,8 +1105,9 @@ impl Scheduler {
             .store
             .unresolved_verdicts(issue_id, number)?
             .into_iter()
-            .partition(|c| summary_review_id(c).is_some());
-        // A review's summary has no thread; its verdict's comment is all there is to see.
+            .partition(|c| CommentKind::of(c) != CommentKind::Inline);
+        // A summary or a conversation comment has no thread; its verdict's comment is all there
+        // is to see.
         for s in summaries {
             self.store.mark_thread_resolved(self.clock.as_ref(), issue_id, &s)?;
         }
