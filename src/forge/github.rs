@@ -1511,6 +1511,59 @@ mod tests {
     }
 
     #[test]
+    fn a_token_credential_posts_as_its_users_login() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "login": "operator" })));
+        let f = forge(http);
+        assert_eq!(f.login().unwrap(), "operator");
+        assert_eq!(f.http.gets(), ["https://api.github.com/user"]);
+    }
+
+    /// An installation token cannot read `GET /user`; the App's own JWT reads `GET /app`, and
+    /// GitHub writes the App's comments as its slug with the bot suffix (#263).
+    #[test]
+    fn an_app_credential_posts_as_its_slug_with_the_bot_suffix() {
+        use crate::credentials::CredentialError;
+        struct App;
+        impl Credentials for App {
+            fn token(&self) -> Result<String, CredentialError> {
+                Ok("installation".into())
+            }
+            fn app_jwt(&self) -> Option<Result<String, CredentialError>> {
+                Some(Ok("jwt".into()))
+            }
+        }
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "slug": "crew-bot" })));
+        let f = forge(http).with_credentials(Arc::new(App));
+        assert_eq!(f.login().unwrap(), "crew-bot[bot]");
+        assert_eq!(f.http.gets(), ["https://api.github.com/app"]);
+    }
+
+    #[test]
+    fn conversation_comments_after_a_head_are_those_written_since_it_was_committed() {
+        let http = FakeHttp::new();
+        let comment = |id: u64, at: &str| json!({ "id": id, "user": { "login": "alice" }, "body": "b", "created_at": at });
+        http.push(ok(json!({ "commit": { "committer": { "date": "2026-10-03T10:00:00Z" } } })));
+        http.push(ok(json!([
+            comment(1, "2026-10-03T09:59:59Z"),
+            comment(2, "2026-10-03T10:00:01Z")
+        ])));
+        let f = forge(http);
+        let got = f.conversation_comments(4, Some("abc")).unwrap();
+        let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["2"]);
+        assert_eq!(f.http.gets()[0], "https://api.github.com/repos/o/r/commits/abc");
+
+        f.http.push(ok(json!([comment(1, "2026-10-03T09:59:59Z")])));
+        assert_eq!(
+            f.conversation_comments(4, None).unwrap().len(),
+            1,
+            "every comment without a head"
+        );
+    }
+
+    #[test]
     fn a_reply_with_a_non_numeric_comment_id_is_refused_before_any_request() {
         let f = forge(FakeHttp::new());
         let err = f.reply(1, "not-a-number", "done").unwrap_err();

@@ -564,14 +564,18 @@ before the dispatch gate, at `delivery.poll_interval_ms` — through: push the b
 (`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
 request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
 reviewers on the current head *and read back whether they attached*, read CI, read the review threads — and the
-reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
-current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
-`CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" and Copilot's template
-(headings, tags, the "Review effort" line, section labels; #201), or than the overview sentence
-under Copilot's `🟢 Approved` status that also says "Findings: None" (#234), is handed back whole
-as one more comment keyed `review-<id>`: no parser for its sections, whose format is nobody's
-contract, and noise costs one `rejected` verdict, posted as a pull request comment since a
-summary has no thread. A red CI or
+reviews' summaries and the conversation, since a reviewer can leave a finding on no line (#126,
+#263). Every comment is worked whoever wrote it, except crewd itself: its verdict comments land
+in the same conversation, so the login the forge posts as is learned when delivery is attached
+(`GET /app`'s slug as `<slug>[bot]` for an App, `GET /user` for a token), and startup fails if it
+cannot be. A summary on the current head in the `COMMENTED` or `CHANGES_REQUESTED` state that
+says more than "Findings: None" and Copilot's template (headings, tags, the "Review effort" line,
+section labels; #201), or than the overview sentence under Copilot's `🟢 Approved` status that
+also says "Findings: None" (#234), is handed back whole as one more comment keyed `review-<id>`:
+no parser for its sections, whose format is nobody's contract, and noise costs one `rejected`
+verdict. A conversation comment written after the current head's commit is handed back keyed
+`conversation-<id>`. Neither has a thread, so a verdict on either is a pull request comment
+quoting it. The round prompt names each comment's kind and author. A red CI or
 an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
 due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 `Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".

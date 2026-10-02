@@ -1415,6 +1415,17 @@ root = "PREFIX/transcripts"
         assert!(c.preflight().is_ok());
     }
 
+    /// #263 removed `delivery.summary_reviewers`; a deployment's config that still names it
+    /// must start rather than be refused over a key that now means nothing.
+    #[test]
+    fn a_config_that_still_sets_summary_reviewers_loads() {
+        let text = "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n\
+                    terminal_states = [\"closed\"]\n\
+                    [delivery]\nenabled = true\nsummary_reviewers = [\"someone\"]\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert!(c.delivery.enabled);
+    }
+
     #[test]
     fn workers_are_listed_in_dispatch_order_and_capacity_is_their_sum() {
         let text = "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n\
