@@ -204,6 +204,7 @@ this file.
 | `toml` | Config file | |
 | `tracing`, `tracing-subscriber` | Logs, always to stderr | stdout belongs to the TUI |
 | `ureq` | Blocking HTTP client over `rustls` | Chosen for the blocking API and for needing no C toolchain |
+| `vergen-gitcl` (build) | The commit in the build string, from `libcrew/build.rs` (#244) | A build dependency only, so it is in neither binary |
 
 `ring`, `rustls-pki-types` and `base64` arrived with `crewd init` (#65), which signs one JWT with
 the key GitHub hands back to read the new App as itself. The first two were already compiled into
@@ -222,6 +223,15 @@ passed through the crate's `contents` override. The one `systemctl` call crewd s
 `daemon-reload`, after writing or removing a unit, because the crate does not reload and a
 reinstall would otherwise start the cached definition (`Reloading` in `src/service.rs`).
 
+`vergen-gitcl` arrived with the build string (#244). It replaces a hand-written build script
+that shells out to `git rev-parse` and `git status` and has to get the no-git case right:
+vergen's git-command backend leaves the variables unset when git is absent or the tree is not a
+repository, which is what lets a crates.io build print the version alone and never fail. The
+`gix` and `git2` backends would compile a git implementation or link libgit2 into the build; the
+command-line one adds `vergen`, `vergen-lib` and `bon` (already approved for #60) with its
+macro crates to the build graph and nothing to either binary, so `crewctl`'s
+`cargo tree -e normal` check is unchanged.
+
 ### Approved to add
 
 Pre-approved by the quality plan. Adding one needs no justification paragraph, only the
@@ -236,6 +246,7 @@ linked issue.
 | `bon` | Builders for signatures over the parameter limit | #60 |
 | `serde_rusqlite` | Derived row mapping in the store | #61 |
 | `strum` | Derived enum labels | #62 |
+| `vergen-gitcl` (build) | The commit in the build string | #244 |
 
 ### Needs an ADR first
 

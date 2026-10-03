@@ -52,7 +52,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
-#[command(name = "crewd", about = "Tracker-driven orchestrator for coding agents")]
+#[command(name = "crewd", version = libcrew::build(), about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -324,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!(
+        build = libcrew::build(),
         config = %args.config.display(),
         db = %db_path.display(),
         workspaces = %ws_root.display(),
