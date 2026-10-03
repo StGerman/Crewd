@@ -21,6 +21,7 @@ pub mod init;
 pub mod model;
 pub mod project;
 pub mod sched;
+pub mod service;
 pub mod store;
 pub mod tracker;
 pub mod transcript;

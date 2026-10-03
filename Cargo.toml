@@ -70,6 +70,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.4.2"
 nix = { version = "0.30", default-features = false, features = ["signal", "fs"] }
+service-manager = { version = "0.11.0", default-features = false }
+plist = "1.10.1"
 
 [dev-dependencies]
 insta = "1.48.0"

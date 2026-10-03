@@ -642,6 +642,30 @@ impl Config {
         self.forge.github_app.as_deref().or(self.tracker.github_app.as_deref())
     }
 
+    /// Whether this config reads a GitHub credential, the App's or `GITHUB_TOKEN`: a GitHub
+    /// tracker for its own reads, any other real tracker only to deliver (#99).
+    pub fn needs_forge_credential(&self) -> Result<bool, ConfigError> {
+        let kind = self.tracker.kind()?;
+        Ok(kind == TrackerKind::Github || (kind != TrackerKind::Fake && self.delivery.enabled))
+    }
+
+    /// The environment variables the daemon would read a credential from, because no file in
+    /// the config names one: `GITHUB_TOKEN` without a GitHub App, `JIRA_EMAIL` and
+    /// `JIRA_API_TOKEN` without `tracker.jira.credentials`. Empty when every credential is a
+    /// file.
+    pub fn credentials_from_env(&self) -> Result<Vec<&'static str>, ConfigError> {
+        let mut vars = Vec::new();
+        if self.needs_forge_credential()? && self.forge_github_app().is_none() {
+            vars.push("GITHUB_TOKEN");
+        }
+        if self.tracker.kind()? == TrackerKind::Jira
+            && self.tracker.jira.as_ref().is_some_and(|j| j.credentials.is_none())
+        {
+            vars.extend(["JIRA_EMAIL", "JIRA_API_TOKEN"]);
+        }
+        Ok(vars)
+    }
+
     /// Parse and preflight a config, then check the host has what `tracker.github_app` and
     /// `tracker.jira.credentials` name.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
