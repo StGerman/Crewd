@@ -7,8 +7,10 @@
 //! `service-manager` crate's [`ServiceManager`] trait, which the tests fake.
 //!
 //! Choices a reader would otherwise re-derive:
-//! - The program is `crewd` where `PATH` finds it, not the canonical `current_exe()`: under
-//!   Homebrew that resolves into `Cellar/<version>/`, which `brew upgrade` deletes.
+//! - The program is `crewd` where `PATH` finds it, never `current_exe()`: under Homebrew that
+//!   resolves into `Cellar/<version>/`, which `brew upgrade` deletes.
+//! - A tracker credential read from the environment is refused rather than captured: the
+//!   definition is a plain file, and a token in it outlives its rotation.
 //! - `PATH` and `SSL_CERT_FILE` are captured at install time: neither manager reads the
 //!   operator's shell, and without them the service cannot resolve `claude` or `git`, or trusts
 //!   the wrong roots behind a TLS proxy (#150).
@@ -47,6 +49,18 @@ pub enum ServiceError {
     Path { path: PathBuf, source: io::Error },
     #[error("PATH is not set; the service needs it to find the worker binaries and git")]
     NoPath,
+    #[error(
+        "no crewd on this PATH; install it where PATH finds it (`cargo install --path .`, \
+         Homebrew) so the service survives an upgrade of the binary"
+    )]
+    NoCrewdOnPath,
+    #[error(
+        "the config reads {} from the environment, which the service does not have and must not \
+         hold in its definition; name a credentials file in the config instead \
+         (tracker.github_app, tracker.jira.credentials)",
+        .0.join(", ")
+    )]
+    CredentialFromEnv(Vec<&'static str>),
     #[error("HOME is not set; it names where the service definition goes")]
     NoHome,
     #[error("per-user services are supported on macOS (launchd) and Linux (systemd) only")]
@@ -81,9 +95,63 @@ impl Platform {
     pub fn manager(self) -> Box<dyn ServiceManager> {
         match self {
             Self::Launchd => Box::new(service_manager::LaunchdServiceManager::user()),
-            Self::Systemd => Box::new(service_manager::SystemdServiceManager::user()),
+            Self::Systemd => Box::new(Reloading {
+                inner: service_manager::SystemdServiceManager::user(),
+                reload: Box::new(daemon_reload),
+            }),
         }
     }
+}
+
+/// A systemd manager that reloads the user manager after writing a unit. The crate does not,
+/// and a reinstall over a loaded unit would otherwise start it with the cached `ExecStart` and
+/// environment, not the ones just written.
+pub struct Reloading<M> {
+    pub inner: M,
+    pub reload: Box<dyn Fn() -> io::Result<()>>,
+}
+
+impl<M: ServiceManager> ServiceManager for Reloading<M> {
+    fn available(&self) -> io::Result<bool> {
+        self.inner.available()
+    }
+    fn install(&self, ctx: ServiceInstallCtx) -> io::Result<()> {
+        self.inner.install(ctx)?;
+        (self.reload)()
+    }
+    fn uninstall(&self, ctx: ServiceUninstallCtx) -> io::Result<()> {
+        self.inner.uninstall(ctx)?;
+        (self.reload)()
+    }
+    fn start(&self, ctx: ServiceStartCtx) -> io::Result<()> {
+        self.inner.start(ctx)
+    }
+    fn stop(&self, ctx: ServiceStopCtx) -> io::Result<()> {
+        self.inner.stop(ctx)
+    }
+    fn level(&self) -> service_manager::ServiceLevel {
+        self.inner.level()
+    }
+    fn set_level(&mut self, level: service_manager::ServiceLevel) -> io::Result<()> {
+        self.inner.set_level(level)
+    }
+    fn status(
+        &self,
+        ctx: service_manager::ServiceStatusCtx,
+    ) -> io::Result<service_manager::ServiceStatus> {
+        self.inner.status(ctx)
+    }
+}
+
+fn daemon_reload() -> io::Result<()> {
+    let out = Command::new("systemctl").args(["--user", "daemon-reload"]).output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "systemctl --user daemon-reload: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
 }
 
 /// What the installing shell had that the service will not: read once, so a test can pass its
@@ -92,7 +160,6 @@ impl Platform {
 pub struct Host {
     pub path: Option<OsString>,
     pub ssl_cert_file: Option<OsString>,
-    pub current_exe: PathBuf,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
     /// systemd's `--user` unit directory, which honours `XDG_CONFIG_HOME`.
@@ -104,7 +171,6 @@ impl Host {
         Ok(Self {
             path: std::env::var_os("PATH"),
             ssl_cert_file: std::env::var_os("SSL_CERT_FILE"),
-            current_exe: std::env::current_exe()?,
             cwd: std::env::current_dir()?,
             home: std::env::var_os("HOME").map(PathBuf::from),
             systemd_user_dir: service_manager::systemd_user_dir_path().ok(),
@@ -166,13 +232,18 @@ impl Deployment {
 }
 
 /// A launchd label and a systemd unit name both accept this set; anything else in a directory's
-/// name becomes `-`.
+/// name becomes `-`. A name that had to change gets a digest of the original, or `acme api` and
+/// `acme-api` would share one service and installing either would replace the other.
 fn unit_safe(name: &str) -> String {
     let safe: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' })
         .collect();
-    if safe.trim_matches('.').is_empty() { "default".into() } else { safe }
+    if safe == name && !safe.trim_matches('.').is_empty() {
+        return safe;
+    }
+    let digest: String = blake3::hash(name.as_bytes()).to_hex().chars().take(8).collect();
+    format!("{}-{digest}", safe.trim_matches('.'))
 }
 
 /// Everything the service definition says, before anything is written.
@@ -250,12 +321,21 @@ impl Plan {
 }
 
 /// The service definition for the config at `config`, which must load: a service started on a
-/// config `Config::load` refuses would only restart into the same error.
+/// config `Config::load` refuses would only restart into the same error. Its relative paths
+/// resolve against its own directory (#251), which is the service's working directory too.
 pub fn plan(config: &Path, host: &Host, platform: Platform) -> Result<Plan, ServiceError> {
     let deployment = Deployment::locate(config, &host.cwd)?;
-    Config::load(&deployment.config)?;
+    let cfg = Config::load(&deployment.config)?;
+    // The same reason as a broken config: it passes here from a shell holding the token, then
+    // exits at every restart under a manager that has none.
+    let from_env = cfg.credentials_from_env()?;
+    if !from_env.is_empty() {
+        return Err(ServiceError::CredentialFromEnv(from_env));
+    }
     let path = host.path.clone().filter(|p| !p.is_empty()).ok_or(ServiceError::NoPath)?;
-    let program = resolve_bin("crewd", Some(&path)).unwrap_or_else(|_| host.current_exe.clone());
+    // No fallback to `current_exe()`: on Linux it is the resolved path, under Homebrew the
+    // `Cellar/<version>/` one an upgrade deletes.
+    let program = resolve_bin("crewd", Some(&path)).map_err(|_| ServiceError::NoCrewdOnPath)?;
     let mut environment = vec![("PATH".to_string(), path.to_string_lossy().into_owned())];
     if let Some(cert) = host.ssl_cert_file.as_ref().filter(|c| !c.is_empty()) {
         // Against the installing shell's cwd: the service starts in the deployment directory.
@@ -382,11 +462,12 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::fs::PermissionsExt;
+    use std::rc::Rc;
 
     /// Records what would have reached `launchctl` or `systemctl`.
     #[derive(Default)]
     struct FakeManager {
-        calls: RefCell<Vec<String>>,
+        calls: Rc<RefCell<Vec<String>>>,
     }
 
     impl FakeManager {
@@ -447,7 +528,6 @@ mod tests {
         let host = Host {
             path: Some(std::env::join_paths([root.join("bin"), "/usr/bin".into()]).unwrap()),
             ssl_cert_file: None,
-            current_exe: PathBuf::from("/somewhere/target/debug/crewd"),
             cwd: root.clone(),
             home: Some(root.join("home")),
             systemd_user_dir: Some(root.join("home/.config/systemd/user")),
@@ -504,8 +584,8 @@ mod tests {
         assert_eq!(argv, [Some(program.as_str()), Some("--config"), Some(config.as_str())]);
 
         host.path = Some("/usr/bin".into());
-        let fallback = super::plan(&dir.join("crew.toml"), &host, Platform::Launchd).unwrap();
-        assert_eq!(fallback.program, host.current_exe, "no crewd on PATH: the running binary");
+        let err = super::plan(&dir.join("crew.toml"), &host, Platform::Launchd).unwrap_err();
+        assert!(matches!(err, ServiceError::NoCrewdOnPath), "never the running binary: {err}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -583,7 +663,65 @@ mod tests {
         let err = plan(&config, &host, Platform::Systemd).unwrap_err();
         assert!(matches!(err, ServiceError::Unquotable { ch: ' ', .. }), "{err}");
         let launchd = plan(&config, &host, Platform::Launchd).unwrap();
-        assert_eq!(launchd.deployment.label, "dev.crewd.acme-api", "the name is made unit-safe");
+        let label = &launchd.deployment.label;
+        assert!(label.starts_with("dev.crewd.acme-api-"), "made unit-safe: {label}");
+        assert_ne!(
+            label, "dev.crewd.acme-api",
+            "and distinct from the deployment it now resembles"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A GitHub tracker over `tracker.github_app = "app.toml"`, written into the deployment.
+    fn github_config(root: &Path, app: Option<&str>) {
+        let app = app.map(|a| format!("github_app = {a:?}\n")).unwrap_or_default();
+        let text = format!(
+            "[tracker]\nkind = \"github\"\nowner = \"o\"\nrepo = \"r\"\n{app}\
+             active_states = [\"open\"]\nterminal_states = [\"closed\"]\n"
+        );
+        std::fs::write(root.join("acme-api/crew.toml"), text).unwrap();
+    }
+
+    #[test]
+    fn install_refuses_a_config_whose_credential_would_come_from_the_shell() {
+        let (root, host) = sandbox("env-cred");
+        github_config(&root, None);
+        let err = plan(Path::new("acme-api/crew.toml"), &host, Platform::Launchd).unwrap_err();
+        assert!(matches!(&err, ServiceError::CredentialFromEnv(v) if v == &["GITHUB_TOKEN"]));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_config_is_checked_against_its_own_directory_not_the_installing_shells() {
+        let (root, host) = sandbox("cred-dir");
+        github_config(&root, Some("app.toml"));
+        // Present where the shell stands, absent where the service will run: refused, naming
+        // the file the service would have read.
+        std::fs::write(root.join("app.toml"), "").unwrap();
+        let err = plan(Path::new("acme-api/crew.toml"), &host, Platform::Launchd).unwrap_err();
+        let expected = root.join("acme-api/app.toml").display().to_string();
+        assert!(err.to_string().contains(&expected), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_systemd_reinstall_reloads_the_unit_before_starting_it() {
+        let (root, host) = sandbox("reload");
+        let inner = FakeManager::default();
+        let calls = inner.calls.clone();
+        let reloads = calls.clone();
+        let manager = Reloading {
+            inner,
+            reload: Box::new(move || {
+                reloads.borrow_mut().push("daemon-reload".into());
+                Ok(())
+            }),
+        };
+        install(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Systemd).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            ["install dev.crewd.acme-api", "daemon-reload", "start dev.crewd.acme-api"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

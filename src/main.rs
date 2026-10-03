@@ -194,9 +194,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
     let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     // A Jira dry run with delivery off must not need a GitHub App on disk: delivery is the
-    // forge's only consumer. A GitHub tracker needs this credential for its own reads (#99).
-    let needs_forge_credential = tracker_kind == TrackerKind::Github
-        || (tracker_kind != TrackerKind::Fake && cfg.delivery.enabled);
+    // forge's only consumer.
+    let needs_forge_credential = cfg.needs_forge_credential()?;
     // One source for a GitHub tracker, the forge and the push, so they mint one installation
     // token between them rather than one each. `None` is the `GITHUB_TOKEN` path, and there the
     // push rides the operator's ambient git credential exactly as before. It is the forge's
