@@ -429,6 +429,32 @@ mod tests {
         out
     }
 
+    /// Every `Phase`, in declaration order. `next` matches with no wildcard, so a new variant
+    /// does not compile until it is given a place in this chain, and so in the pinned snapshot.
+    fn every_phase() -> Vec<Phase> {
+        fn next(p: Phase) -> Option<Phase> {
+            match p {
+                Phase::Queued => Some(Phase::Running),
+                Phase::Running => Some(Phase::RetryQueued),
+                Phase::RetryQueued => Some(Phase::Quarantined),
+                Phase::Quarantined => Some(Phase::Released),
+                Phase::Released => None,
+            }
+        }
+        std::iter::successors(Some(Phase::Queued), |&p| next(p)).collect()
+    }
+
+    /// Every `HaltReason`, kept exhaustive the way [`every_phase`] is.
+    fn every_halt_reason() -> Vec<HaltReason> {
+        fn next(r: HaltReason) -> Option<HaltReason> {
+            match r {
+                HaltReason::BinaryNotFound => Some(HaltReason::AccountExhausted),
+                HaltReason::AccountExhausted => None,
+            }
+        }
+        std::iter::successors(Some(HaltReason::BinaryNotFound), |&r| next(r)).collect()
+    }
+
     /// The v1 promise (docs/api-v1.md, #245): `/api/v1/snapshot` and `/api/v1/issues/:id` only
     /// grow. Renaming or removing a field, or changing its JSON type, rewrites a line here, and
     /// that diff is the review question "does this need `/api/v2`?". A new field adds a line,
@@ -437,17 +463,10 @@ mod tests {
     #[test]
     fn the_v1_snapshot_shape_only_grows() {
         let mut lines = snapshot_shape();
-        let phases = [
-            Phase::Queued,
-            Phase::Running,
-            Phase::RetryQueued,
-            Phase::Quarantined,
-            Phase::Released,
-        ];
-        for p in phases {
+        for p in every_phase() {
             lines.push(format!("enum phase: {}", serde_json::to_value(p).unwrap()));
         }
-        for r in [HaltReason::BinaryNotFound, HaltReason::AccountExhausted] {
+        for r in every_halt_reason() {
             lines.push(format!("enum reason: {}", serde_json::to_value(r).unwrap()));
         }
         insta::assert_snapshot!(lines.join("\n"));
@@ -477,16 +496,44 @@ mod tests {
         assert!(empty.is_empty(), "give these lists an entry in fully_populated(): {empty:?}");
     }
 
+    /// The docs/api-v1.md section that documents the object a key path's last key sits in.
+    /// Unknown parents fail rather than default, so a new nested object needs a section here.
+    fn section_of(path: &str) -> &'static str {
+        let parent = path.rsplit_once('.').map_or("", |(p, _)| p);
+        match parent {
+            "" => "Snapshot",
+            "rows[]" => "Row",
+            "rows[].runs[]" => "RunRecord",
+            "rows[].delivery" => "DeliveryView",
+            "tokens" | "rows[].tokens" => "TokenUsage",
+            "rate_limit_pause" | "rate_limit_pauses[]" => "RateLimitPause",
+            "missing_binaries[]" => "HaltedWorker",
+            other => panic!("no docs/api-v1.md section for the object at {other:?}"),
+        }
+    }
+
     /// docs/api-v1.md is the contract a client reads, so a field the shape pins and the table
-    /// leaves out is a promise nobody wrote down.
+    /// leaves out is a promise nobody wrote down. Checked per section, since `issue_id`, `turns`,
+    /// `transcript` and `worker` each appear in more than one object.
     #[test]
     fn api_v1_md_names_every_pinned_field() {
         let doc = include_str!("../../docs/api-v1.md");
+        let section = |name: &str| -> &str {
+            let start = doc
+                .find(&format!("\n## {name}\n"))
+                .unwrap_or_else(|| panic!("docs/api-v1.md has no section {name}"));
+            let body = &doc[start + 1..];
+            &body[..body[3..].find("\n## ").map_or(body.len(), |e| e + 3)]
+        };
         let missing: Vec<String> = snapshot_shape()
             .iter()
-            .filter_map(|l| l.split(':').next()?.rsplit(['.', '[']).find(|s| !s.is_empty()))
-            .map(|k| k.trim_end_matches(']').to_string())
-            .filter(|k| !k.is_empty() && !doc.contains(&format!("| `{k}` |")))
+            .filter_map(|l| l.split(':').next())
+            .filter(|path| !path.ends_with("[]"))
+            .filter(|path| {
+                let key = path.rsplit('.').next().unwrap().trim_end_matches("[]");
+                !section(section_of(path)).contains(&format!("| `{key}` |"))
+            })
+            .map(|path| format!("{} in {}", path, section_of(path)))
             .collect();
         assert!(missing.is_empty(), "add these to docs/api-v1.md: {missing:?}");
     }

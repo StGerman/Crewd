@@ -15,8 +15,9 @@ v1 changes only by addition.
 - A field is never removed, renamed, given another JSON type, or given another meaning. Nor is
   a spelling of `phase` or `reason`. A change that needs any of those opens `/api/v2` beside
   v1, and v1 keeps answering as it did.
-- A new value for `phase` or `reason` is an addition, and a client must treat a value it does not
-  know as "something other than the ones I know", not as an error.
+- The spellings of `phase` and `reason` are closed sets. A new value is not an addition: the
+  `Snapshot` and `Row` types in `libcrew`, which `crewctl` reads with, refuse a spelling they do
+  not know, so a new one opens `/api/v2` like a rename does.
 
 `the_v1_snapshot_shape_only_grows` in [libcrew/src/snapshot.rs](../libcrew/src/snapshot.rs)
 enforces the field half of this: it pins every key path of a fully populated `Snapshot`, with its
@@ -72,8 +73,8 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `tokens` | `TokenUsage` | Summed over every run that reported a total |
 | `uncounted_runs` | integer | Finished runs that reported no total, so `tokens` is a lower bound |
 | `ticks` | integer | Ticks run since startup |
-| `last_tick_at` | optional integer | When the last tick ran |
-| `last_error` | optional string | The last tick's failure, if it failed |
+| `last_tick_at` | optional integer | When the last tick started; `null` before the first, since a snapshot is published before it |
+| `last_error` | optional string | A failure the last tick recorded and carried on past, such as a failed preflight or tracker read; a tick that stopped on an error leaves it unset, and `POST /refresh` answers that one with `500` |
 | `rate_limit_pauses` | array of `RateLimitPause` | Workers paused for an account-wide rate limit, in dispatch order |
 | `rate_limit_pause` | optional `RateLimitPause` | The first of `rate_limit_pauses`, kept for clients from before the list |
 | `missing_binaries` | array of `HaltedWorker` | Workers that take nothing until the daemon restarts; the key predates `reason` |
@@ -84,9 +85,9 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 |---|---|---|
 | `issue_id` | string | The dispatch id, unique |
 | `identifier` | string | The tracker's identifier, not guaranteed unique |
-| `title` | string | The issue's title |
-| `url` | optional string | The issue in the tracker |
-| `tracker_state` | string | The tracker's state for it |
+| `title` | string | The issue's title; empty until the daemon has read the issue since it started, as in the snapshot published before the first tick |
+| `url` | optional string | The issue in the tracker; `null` on the same terms as an empty `title` |
+| `tracker_state` | string | The tracker's state for it; empty on the same terms as `title` |
 | `phase` | string | The claim state: `queued`, `running`, `retry`, `quarantine` or `released` |
 | `attempt` | integer | Attempts charged to it |
 | `turns` | integer | Turns of the running run; with none running, the issue's total across its runs |
@@ -96,7 +97,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `holds_slot` | bool | A continuation holding its concurrency slot through its delay |
 | `quarantined` | bool | Whether it is quarantined |
 | `last_error` | optional string | Its last failure, or why it is parked |
-| `last_event` | optional string | The last event its run reported |
+| `last_event` | optional string | The last event its run reported; while the run is gating, `gate: <step>` naming the gate's current step |
 | `workspace` | optional string | Its worktree path while a run or gate holds it; `null` otherwise, even if the worktree is still on disk |
 | `branch` | optional string | The branch its latest dispatch checked out; `null` once cleanup deleted a branch that carried nothing |
 | `runs` | array of `RunRecord` | Its most recent runs, newest first |
