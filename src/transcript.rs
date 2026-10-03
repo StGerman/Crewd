@@ -111,7 +111,13 @@ impl Transcripts {
                     self.max_bytes_per_run
                 );
                 let remaining = self.max_bytes_per_run.saturating_sub(marker.len() as u64);
-                Some(TranscriptWriter { path, file: Some(file), remaining, marker })
+                Some(TranscriptWriter {
+                    path,
+                    file: Some(file),
+                    remaining,
+                    marker,
+                    redactor: Default::default(),
+                })
             }
             Err(e) => {
                 tracing::warn!(
@@ -163,6 +169,7 @@ pub struct TranscriptWriter {
     /// Dropped once the byte cap is spent, which is what stops further writes.
     file: Option<File>,
     remaining: u64,
+    redactor: crate::redact::LineRedactor,
 }
 
 impl TranscriptWriter {
@@ -177,7 +184,7 @@ impl TranscriptWriter {
             return;
         }
         // Redacted before the cost is charged, so the cap bounds the bytes actually written.
-        let line = crate::redact::redact(line);
+        let line = self.redactor.redact(line);
 
         let cost = line.len() as u64 + 1;
         if cost > self.remaining {
@@ -288,6 +295,29 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains(&token), "the token reached the transcript: {text}");
         assert!(text.contains(r#""type":"tool_result","content":"GH=[REDACTED]\n""#), "{text}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_raw_pem_block_written_line_by_line_leaves_no_key_material() {
+        let root = tmp("pem");
+        let t = Transcripts::new(&root, 1 << 20, 10).unwrap();
+        let mut w = t.open("stderr-key").unwrap();
+        for line in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn",
+            "-----END RSA PRIVATE KEY-----",
+            "exit 1",
+        ] {
+            w.write_line(line);
+        }
+        let path = w.path().to_path_buf();
+        drop(w);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("MIIEow"), "the key body reached the transcript: {text}");
+        assert!(text.ends_with("exit 1\n"), "{text}");
 
         std::fs::remove_dir_all(&root).ok();
     }

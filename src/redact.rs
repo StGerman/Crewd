@@ -38,7 +38,8 @@ static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
     let url_params = r"(?i)([?&](?:access_token|refresh_token|id_token|token|api_key|apikey|key|password|passwd|pwd|secret|client_secret|state|code|sig|signature|auth|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\s#\x22'\\]+";
     let table: Vec<(String, String)> = vec![
         // Multi-line in a log, `\n`-escaped inside a JSON stream line; an unterminated block
-        // runs to the end of the line rather than leaving its tail in place.
+        // runs to the end of the line rather than leaving its tail in place, and
+        // [`LineRedactor`] carries it into the lines after.
         (
             r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?s:.*?)(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)"
                 .into(),
@@ -82,6 +83,37 @@ pub fn redact(line: &str) -> Cow<'_, str> {
         }
     }
     out
+}
+
+static PEM_BEGIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----").expect("a literal the tests compile")
+});
+static PEM_END: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY-----").expect("a literal the tests compile")
+});
+
+/// [`redact`] across a sequence of lines, for a writer handed one line at a time.
+///
+/// A raw PEM block written line by line (a worker's stderr, a line the parser could not read)
+/// reaches [`redact`] as a `BEGIN` line with no `END`, then a base64 body that matches no shape
+/// on its own. Without the state carried here, every line after the first is stored whole.
+#[derive(Default)]
+pub struct LineRedactor {
+    in_pem: bool,
+}
+
+impl LineRedactor {
+    pub fn redact<'a>(&mut self, line: &'a str) -> Cow<'a, str> {
+        if self.in_pem {
+            let Some(end) = PEM_END.find(line) else { return Cow::Borrowed(MARKER) };
+            self.in_pem = false;
+            return Cow::Owned(format!("{MARKER}{}", redact(&line[end.end()..])));
+        }
+        if let Some(begin) = PEM_BEGIN.find_iter(line).last() {
+            self.in_pem = !PEM_END.is_match(&line[begin.end()..]);
+        }
+        redact(line)
+    }
 }
 
 /// A `tracing_subscriber` writer that redacts each formatted event before it reaches `W`.
@@ -199,6 +231,24 @@ mod tests {
         assert_eq!(redact(raw), format!("key:\n{MARKER}\ndone"));
         let cut = "-----BEGIN PRIVATE KEY-----\nMIIEow";
         assert_eq!(redact(cut), MARKER);
+    }
+
+    #[test]
+    fn a_pem_block_handed_over_one_line_at_a_time_is_replaced_to_its_end_line() {
+        let mut r = LineRedactor::default();
+        let lines = [
+            "key follows",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ",
+            "AAAAMwAAAAtzc2gtZWQyNTUxOQAAACD",
+            "-----END OPENSSH PRIVATE KEY----- tail",
+            "after",
+        ];
+        let out: Vec<String> = lines.iter().map(|l| r.redact(l).into_owned()).collect();
+        assert_eq!(
+            out,
+            ["key follows", MARKER, MARKER, MARKER, &format!("{MARKER} tail"), "after"]
+        );
     }
 
     #[test]
