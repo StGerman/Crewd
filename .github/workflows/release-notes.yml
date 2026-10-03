@@ -24,9 +24,15 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ fromJson(inputs.plan).announcement_tag }}
     steps:
+      # The generated notes sit between markers and are dropped from the current body before it
+      # is rebuilt, so a rerun replaces them rather than stacking a second copy above the first.
       - name: Prepend the generated notes
         run: |
-          gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > "$RUNNER_TEMP/notes.md"
-          printf '\n' >> "$RUNNER_TEMP/notes.md"
-          gh release view "$TAG" --json body --jq .body >> "$RUNNER_TEMP/notes.md"
-          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          notes="$RUNNER_TEMP/notes.md"
+          echo '<!-- generated-notes -->' > "$notes"
+          gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body >> "$notes"
+          printf '%s\n\n' '<!-- /generated-notes -->' >> "$notes"
+          gh release view "$TAG" --json body --jq .body \
+            | sed '/^<!-- generated-notes -->$/,/^<!-- \/generated-notes -->$/d' \
+            | sed '/./,$!d' >> "$notes"
+          gh release edit "$TAG" --notes-file "$notes"
