@@ -72,7 +72,7 @@ bounds nothing here. At ten concurrent issues the refresh before each respawn al
 tracker requests a minute, enough to rate-limit the orchestrator off most providers, and every
 respawn spends model tokens.
 
-**crewd** closes the three paths into that loop separately, because each holds while the others
+**crewd** brakes that loop with four separate mechanisms, because each holds while the others
 fail:
 
 - The run returns an explicit verdict, `Outcome` in [src/model.rs](../src/model.rs): `Done`,
@@ -121,7 +121,8 @@ not compile until it is placed on one side. A non-retryable class such as `Templ
 `ConfigInvalid`, `ModelNotFound`, `WorkspaceOutsideRoot` or `AuthFailed` quarantines the issue
 on its first occurrence, with no retry row, and it stays out of rotation until an operator
 clears it. A failure that disables a whole worker rather than one issue, a missing binary or an
-exhausted account, pauses that worker instead and charges the issue nothing.
+exhausted account, pauses that worker instead: the issue is charged no attempt and no failure,
+though any turns the interrupted run took still count against its turn budget.
 
 **Invariant:** "Permanent failures stop". **Guard test:**
 `a_permanent_failure_quarantines_immediately_rather_than_retrying_forever`
