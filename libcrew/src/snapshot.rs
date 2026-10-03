@@ -463,8 +463,9 @@ mod tests {
             .collect()
     }
 
-    /// A newer client must read an older daemon (docs/api-v1.md, #245). A field added without
-    /// `#[serde(default)]`, or an `Option` made required, fails to read this payload.
+    /// A newer client must read an older daemon (docs/api-v1.md, #245). A new field that does not
+    /// read when absent (neither an `Option` nor `#[serde(default)]`), or an `Option` made
+    /// required, fails to read this payload.
     #[test]
     fn a_v1_payload_from_before_any_addition_still_reads() {
         let read: Snapshot = serde_json::from_str(FROZEN_V1)
@@ -502,8 +503,8 @@ mod tests {
     /// The v1 promise (docs/api-v1.md, #245): `/api/v1/snapshot` and `/api/v1/issues/:id` only
     /// grow. Renaming or removing a field, or changing its JSON type, rewrites a line here, and
     /// that diff is the review question "does this need `/api/v2`?". A new field adds a line,
-    /// which is allowed only with `#[serde(default)]` and a row in docs/api-v1.md. The enum
-    /// spellings are pinned too, because a client matches on them.
+    /// allowed only for a field that reads when absent and has a row in docs/api-v1.md. The
+    /// enum spellings are pinned too, because a client matches on them.
     #[test]
     fn the_v1_snapshot_shape_only_grows() {
         let mut lines = snapshot_shape();

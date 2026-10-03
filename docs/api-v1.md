@@ -9,9 +9,9 @@ HTTP is hand-rolled, how `:identifier` resolves) is in
 
 v1 changes only by addition.
 
-- A new field may appear in any object below. It is optional on the wire and carries
-  `#[serde(default)]`, so a client built against an older daemon, or a daemon older than the
-  client, still parses. A client must ignore keys it does not know.
+- A new field may appear in any object below. It must read when absent, so a client newer than
+  the daemon still parses: an `Option`, which serde reads as `null` when missing, or a field
+  carrying `#[serde(default)]`. A client must ignore keys it does not know.
 - A field is never removed, renamed, given another JSON type, or given another meaning. Nor is
   a spelling of `phase` or `reason`. A change that needs any of those opens `/api/v2` beside
   v1, and v1 keeps answering as it did.
@@ -25,7 +25,7 @@ JSON type, whether it may be `null`, and every enum spelling, as an `insta` snap
 removing a field fails it; adding one changes the snapshot visibly, and that diff is where a
 reviewer asks whether the change is an addition. `a_v1_payload_from_before_any_addition_still_reads`
 reads a v1 payload frozen when this promise was made, with every optional field `null`, so a field
-added without `#[serde(default)]`, or an optional one made required, fails it. The meanings below
+that does not read when absent, or an optional one made required, fails it. The meanings below
 are kept by review, not by those tests.
 
 Out of this promise: the store schema, the MCP tools' argument shapes beyond what these routes
@@ -108,7 +108,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `workspace` | optional string | Its worktree path while a run or gate holds it; `null` otherwise, even if the worktree is still on disk |
 | `branch` | optional string | The branch its latest dispatch checked out; `null` once cleanup deleted a branch that carried nothing |
 | `runs` | array of `RunRecord` | Its most recent runs, newest first |
-| `transcript` | optional string | The latest run's transcript path |
+| `transcript` | optional string | The running run's transcript path, else the newest one any of its runs wrote, which need not be `runs[0]`'s: a run that wrote none is skipped |
 | `delivery` | optional `DeliveryView` | Its pull request's progress, once a run reported done with delivery on |
 | `worker` | optional string | The worker running it, else the one that ran its latest run |
 
