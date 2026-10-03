@@ -354,8 +354,9 @@ pub fn plan(config: &Path, host: &Host, platform: Platform) -> Result<Plan, Serv
 /// or a `%` specifier there would reach the daemon as something else. Refused by name instead.
 fn check_systemd_quoting(plan: &Plan) -> Result<(), ServiceError> {
     let in_exec = |c: char| c.is_whitespace() || "\"'\\%$;".contains(c);
-    // Inside the crate's quotes a space survives; a quote, a backslash or a `%` does not.
-    let in_env = |c: char| "\"\\%".contains(c);
+    // Inside the crate's quotes a space survives; a quote, a backslash or a `%` does not, and a
+    // line break ends the directive, starting a new one from the rest of the value.
+    let in_env = |c: char| c.is_control() || "\"\\%".contains(c);
     let check = |what, value: &OsStr, bad: &dyn Fn(char) -> bool| {
         let value = value.to_string_lossy();
         match value.chars().find(|c| bad(*c)) {
@@ -669,6 +670,12 @@ mod tests {
             label, "dev.crewd.acme-api",
             "and distinct from the deployment it now resembles"
         );
+        let mut broken = host.clone();
+        broken.path =
+            Some(format!("{}:/opt\nExecStartPre=/bin/false", root.join("bin").display()).into());
+        let config = root.join("acme-api/crew.toml");
+        let err = plan(&config, &broken, Platform::Systemd).unwrap_err();
+        assert!(matches!(err, ServiceError::Unquotable { ch: '\n', .. }), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
 
