@@ -2,6 +2,7 @@
 source: libcrew/src/snapshot.rs
 expression: "lines.join(\"\\n\")"
 ---
+build: string
 generated_at: integer
 last_error: string
 last_tick_at: integer

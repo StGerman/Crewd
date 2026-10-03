@@ -373,6 +373,7 @@ mod tests {
             worker: Some("claude".into()),
         };
         Snapshot {
+            build: "0.1.0 (abc1234)".into(),
             generated_at: 1,
             rows: vec![row],
             running: 1,

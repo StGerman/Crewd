@@ -66,6 +66,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 
 | Field | Type | Meaning |
 |---|---|---|
+| `build` | string | The running daemon's build, `<version> (<short sha>[-dirty])`, or the version alone when git reported no commit; empty from a daemon older than the field |
 | `generated_at` | integer | When the scheduler published this snapshot |
 | `rows` | array of `Row` | Every issue the scheduler holds a view of |
 | `running` | integer | Runs holding a slot, gating ones included |
