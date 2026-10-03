@@ -192,6 +192,7 @@ this file.
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
+| `regex` | Secret shapes redacted from transcript and log lines in `src/redact.rs` (#138) | `regex-automata` and `regex-syntax` were already compiled in under `tracing-subscriber`'s `env-filter` |
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
 | `rustls` (dev) | The TLS listener the CA-bundle test (#150) serves a real handshake from | Already in the tree under `ureq`; `default-features = false` with only the `ring` and `std` features, never `aws-lc-rs`, which needs a C toolchain |
 | `rustls-pki-types` | PEM parsing of the GitHub App private key | Already in the tree under `rustls` |
@@ -211,6 +212,12 @@ the key GitHub hands back to read the new App as itself. The first two were alre
 the tree by `ureq`'s TLS, so they add nothing to the build; `jsonwebtoken` was the alternative, and
 its crypto backends would add a second RSA implementation for one signature. #64 adds the same
 three for the same reason, and whichever lands second keeps one JWT signer.
+
+`regex` arrived with redaction (#138). It replaces a hand-written scanner for a dozen secret
+shapes, each with its own prefix, alphabet and length, which would pass fifty lines on the PEM
+block alone. `regex-automata` and `regex-syntax`, its engine and parser, were already in the build
+under `tracing-subscriber`'s `env-filter`, and `aho-corasick` and `memchr` under it as well, so it
+adds the one crate; the lock already pinned it for `ratatui`'s optional `termwiz` backend.
 
 `service-manager` and `plist` arrived with `crewd service install` (#246). The crate replaces
 driving `launchctl` and `systemctl` directly, which is a second copy of each manager's load,

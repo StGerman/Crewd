@@ -388,6 +388,7 @@ dependencies = [
  "parking_lot",
  "plist",
  "ratatui",
+ "regex",
  "ring",
  "rusqlite",
  "rustls",

@@ -146,9 +146,10 @@ enum ServiceCmd {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // In TUI mode the alternate screen owns stdout, so logs go to stderr only.
+    // In TUI mode the alternate screen owns stdout, so logs go to stderr only. Redacted, because
+    // a line can carry a token a worker printed or a URL with one in its query (#138).
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(crew::redact::RedactingMakeWriter(std::io::stderr))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "crew=info".into()),

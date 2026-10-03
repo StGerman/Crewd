@@ -90,7 +90,7 @@
 //!
 //! [`run_reader`] parses a handful of things out of the stream and drops the rest. Everything
 //! it drops — `system`, every tool call the agent made — is what a post-mortem actually wants,
-//! so the same loop copies each line verbatim to this run's [`TranscriptWriter`] *before*
+//! so the same loop copies each line, secrets redacted (#138), to this run's [`TranscriptWriter`] *before*
 //! deciding whether the parser has a use for it. Lines that fail to parse are written too: a
 //! stream the parser choked on is the single most interesting one to still have afterwards. See
 //! [`crate::transcript`] for the retention bounds and for why the file does not live in the
@@ -527,6 +527,9 @@ fn run_reader(
     // scheduler reuse the worktree while this process is still in it.
     let mut budget_hit = false;
 
+    // Each warning below is its own log event, so the log writer's redaction cannot see that a
+    // base64 line belongs to a PEM block a previous line opened.
+    let mut log_redactor = crate::redact::LineRedactor::default();
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
         // Before the parse and before the trim: a line this module cannot read is exactly the
@@ -549,7 +552,7 @@ fn run_reader(
             Err(e) => {
                 // Malformed JSON on a line is logged and skipped, not fatal — only a stream
                 // that is entirely unparseable ends in Failed.
-                tracing::warn!(error = %e, line, "malformed stream-json line; skipping");
+                tracing::warn!(error = %e, line = %log_redactor.redact(line), "malformed stream-json line; skipping");
                 continue;
             }
         };
