@@ -1,0 +1,17 @@
+---
+source: src/service.rs
+expression: plan.unit().unwrap()
+---
+[Unit]
+Description=dev.crewd.acme-api-100--1a2b3c4d
+
+[Service]
+WorkingDirectory=/home/op/.crewd/acme api 100%%
+Environment="PATH=/opt/my tools:/a\"b\\c:$HOME/bin"
+Environment="SSL_CERT_FILE=/etc/ca%%h.pem"
+ExecStart="/opt/my $$tools/crewd" "--config" "/home/op/.crewd/acme api 100%%/crew.toml"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
