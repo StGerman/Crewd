@@ -2,8 +2,9 @@
 //!
 //! The worktree used to never read its own remote branch: a continuation resumed on the branch
 //! as it was left, the gate rebased that, and the push, leased against a remote-tracking ref any
-//! fetch in `workspace.repo` moves, replaced the operator's commit. So an agent run, a re-gate
-//! and a push each start from [`Publisher::sync`](crate::forge::Publisher::sync). A head the
+//! fetch in `workspace.repo` moves, replaced the operator's commit. So an agent run, a re-gate,
+//! a push and the gate after an agent's `Done` (#269) each start from
+//! [`Publisher::sync`](crate::forge::Publisher::sync). A head the
 //! lease does not name is fast-forwarded or merged, never rebased. A head the lease already
 //! names has not moved since the last sync or publish: the worktree already held it, whoever
 //! pushed it, the gate rewrote it (#227), and merging it back is the conflict delivery was
@@ -62,6 +63,36 @@ impl Scheduler {
         }
         let publisher = self.publisher.clone().expect("checked by delivery_on");
         publisher.sync(worktree, branch, &self.cfg.delivery.remote).map(Some)
+    }
+
+    /// Sync the worktree of a run that reported `Done`, before the gate rebases it (#269).
+    ///
+    /// The lease names only heads crewd synced or published, and an agent can push its branch
+    /// itself: once the gate rewrote that push, the next sync read it as someone else's and
+    /// merged the pre-rebase copy back, so every later rebase replayed both. Synced now, while
+    /// the push is still an ancestor of the worktree's head, it is recorded as incorporated. A
+    /// conflict or a failure leaves the lease where it was, and the sync before the next run or
+    /// push reports it.
+    pub(super) fn sync_before_gate(&self, issue_id: &str, worktree: &Path) {
+        let branch = match self.store.get(issue_id) {
+            Ok(st) => st.and_then(|s| s.branch),
+            Err(e) => {
+                tracing::warn!(issue_id, error = %e, "could not read the branch to sync before the gate");
+                return;
+            }
+        };
+        let Some(branch) = branch else { return };
+        match self.sync_branch(worktree, &branch) {
+            Ok(Some(Synced::Advanced { remote_head, merged })) => tracing::info!(
+                issue_id, branch, head = %remote_head, merged,
+                "took in commits someone else pushed to the branch before gating it"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                issue_id, branch, error = %e,
+                "could not sync the branch before the gate; the push lease still holds"
+            ),
+        }
     }
 
     /// Sync the worktree `launch` just prepared, before the agent is spawned into it.
