@@ -1,0 +1,108 @@
+{
+  "build": "",
+  "generated_at": 1,
+  "rows": [
+    {
+      "issue_id": "1",
+      "identifier": "#1",
+      "title": "",
+      "url": null,
+      "tracker_state": "",
+      "phase": "queued",
+      "attempt": 0,
+      "turns": 0,
+      "tokens": null,
+      "age_ms": 0,
+      "retry_in_ms": null,
+      "holds_slot": false,
+      "quarantined": false,
+      "last_error": null,
+      "last_event": null,
+      "workspace": null,
+      "branch": null,
+      "runs": [],
+      "transcript": null,
+      "delivery": null,
+      "worker": null
+    },
+    {
+      "issue_id": "2",
+      "identifier": "#2",
+      "title": "",
+      "url": null,
+      "tracker_state": "",
+      "phase": "running",
+      "attempt": 0,
+      "turns": 0,
+      "tokens": {
+        "input": 1,
+        "output": 2
+      },
+      "age_ms": 0,
+      "retry_in_ms": null,
+      "holds_slot": false,
+      "quarantined": false,
+      "last_error": null,
+      "last_event": null,
+      "workspace": null,
+      "branch": null,
+      "runs": [
+        {
+          "run_id": "r1",
+          "issue_id": "2",
+          "started_at": 1,
+          "ended_at": null,
+          "outcome": null,
+          "session_id": null,
+          "turns": 0,
+          "in_tok": null,
+          "out_tok": null,
+          "transcript": null,
+          "model": null,
+          "effort": null,
+          "worker": null
+        }
+      ],
+      "transcript": null,
+      "delivery": {
+        "stage": "pending",
+        "pr_number": null,
+        "pr_url": null,
+        "base": null,
+        "rounds_pr": 0,
+        "rounds_issue": 0,
+        "review_error": null,
+        "handoff_reason": null
+      },
+      "worker": null
+    }
+  ],
+  "running": 1,
+  "reserved": 0,
+  "limit": 1,
+  "retrying": 0,
+  "quarantined": 0,
+  "tokens": {
+    "input": 0,
+    "output": 0
+  },
+  "uncounted_runs": 0,
+  "ticks": 1,
+  "last_tick_at": null,
+  "last_error": null,
+  "rate_limit_pauses": [
+    {
+      "worker": "claude",
+      "kind": "five_hour",
+      "resets_at": 2
+    }
+  ],
+  "rate_limit_pause": null,
+  "missing_binaries": [
+    {
+      "worker": "grok",
+      "binary": "/bin/grok",
+      "reason": "binary_not_found"
+    }
+  ]
+}

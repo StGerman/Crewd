@@ -426,12 +426,51 @@ mod tests {
         }
     }
 
-    fn snapshot_shape() -> Vec<String> {
+    fn populated_shape() -> Vec<String> {
         let mut out = Vec::new();
         shape("", &serde_json::to_value(fully_populated()).unwrap(), &mut out);
         out.sort();
         out.dedup();
         out
+    }
+
+    /// A v1 payload as the API wrote it when the promise was made (#245), with every optional
+    /// field `null`. **Never edit it for an addition**: it stands for a daemon older than the
+    /// addition, which a newer client still has to read.
+    const FROZEN_V1: &str = include_str!("testdata/snapshot_v1_frozen.json");
+
+    /// Key paths that may be `null`: those [`FROZEN_V1`] sends as `null`, and those the current
+    /// types write back as `null` after reading it, which is how a new `Option` field shows up.
+    fn nullable_paths() -> std::collections::BTreeSet<String> {
+        let raw: serde_json::Value = serde_json::from_str(FROZEN_V1).unwrap();
+        let read: Snapshot = serde_json::from_str(FROZEN_V1).unwrap();
+        let mut lines = Vec::new();
+        shape("", &raw, &mut lines);
+        shape("", &serde_json::to_value(read).unwrap(), &mut lines);
+        lines.iter().filter_map(|l| l.strip_suffix(": null")).map(String::from).collect()
+    }
+
+    /// [`populated_shape`] with `| null` on each path that may be `null`, so making a field
+    /// required, or a new one optional, rewrites a line of the pinned snapshot.
+    fn snapshot_shape() -> Vec<String> {
+        let nullable = nullable_paths();
+        populated_shape()
+            .into_iter()
+            .map(|l| {
+                let path = l.split_once(": ").unwrap().0;
+                if nullable.contains(path) { format!("{l} | null") } else { l }
+            })
+            .collect()
+    }
+
+    /// A newer client must read an older daemon (docs/api-v1.md, #245). A field added without
+    /// `#[serde(default)]`, or an `Option` made required, fails to read this payload.
+    #[test]
+    fn a_v1_payload_from_before_any_addition_still_reads() {
+        let read: Snapshot = serde_json::from_str(FROZEN_V1)
+            .unwrap_or_else(|e| panic!("a v1 payload no longer reads: {e}"));
+        assert_eq!(read.rows.len(), 2);
+        assert_eq!(read.rows[1].runs.len(), 1);
     }
 
     /// Every `Phase`, in declaration order. `next` matches with no wildcard, so a new variant
@@ -481,7 +520,7 @@ mod tests {
     /// later rename of it would pass. Every `Option` and list in [`fully_populated`] must be set.
     #[test]
     fn fully_populated_leaves_no_path_unpinned() {
-        let lines = snapshot_shape();
+        let lines = populated_shape();
         let unset: Vec<&String> = lines.iter().filter(|l| l.ends_with(": null")).collect();
         assert!(unset.is_empty(), "set these in fully_populated(): {unset:?}");
         let mut empty = Vec::new();
@@ -530,17 +569,31 @@ mod tests {
             let body = &doc[start + 1..];
             &body[..body[3..].find("\n## ").map_or(body.len(), |e| e + 3)]
         };
-        let missing: Vec<String> = snapshot_shape()
-            .iter()
-            .filter_map(|l| l.split(':').next())
-            .filter(|path| !path.ends_with("[]"))
-            .filter(|path| {
-                let key = path.rsplit('.').next().unwrap().trim_end_matches("[]");
-                !section(section_of(path)).contains(&format!("| `{key}` |"))
-            })
-            .map(|path| format!("{} in {}", path, section_of(path)))
-            .collect();
+        let nullable = nullable_paths();
+        let mut missing = Vec::new();
+        let mut optionality = Vec::new();
+        for path in populated_shape().iter().filter_map(|l| l.split(':').next()) {
+            if path.ends_with("[]") {
+                continue;
+            }
+            let key = path.rsplit('.').next().unwrap().trim_end_matches("[]");
+            let row =
+                section(section_of(path)).lines().find(|l| l.starts_with(&format!("| `{key}` |")));
+            let Some(row) = row else {
+                missing.push(format!("{path} in {}", section_of(path)));
+                continue;
+            };
+            let documented = row.split('|').nth(2).unwrap().trim().starts_with("optional");
+            if documented != nullable.contains(path) {
+                optionality.push(path.to_string());
+            }
+        }
         assert!(missing.is_empty(), "add these to docs/api-v1.md: {missing:?}");
+        assert!(
+            optionality.is_empty(),
+            "docs/api-v1.md says optional exactly where the wire may send null; these disagree: \
+             {optionality:?}"
+        );
     }
 
     /// A daemon from before #237 sends no `reason`; every worker it halted had a missing binary.

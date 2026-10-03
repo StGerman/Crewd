@@ -21,9 +21,12 @@ v1 changes only by addition.
 
 `the_v1_snapshot_shape_only_grows` in [libcrew/src/snapshot.rs](../libcrew/src/snapshot.rs)
 enforces the field half of this: it pins every key path of a fully populated `Snapshot`, with its
-JSON type, and every enum spelling, as an `insta` snapshot. Renaming or removing a field fails it;
-adding one changes the snapshot visibly, and that diff is where a reviewer asks whether the change
-is an addition. The meanings below are kept by review, not by that test.
+JSON type, whether it may be `null`, and every enum spelling, as an `insta` snapshot. Renaming or
+removing a field fails it; adding one changes the snapshot visibly, and that diff is where a
+reviewer asks whether the change is an addition. `a_v1_payload_from_before_any_addition_still_reads`
+reads a v1 payload frozen when this promise was made, with every optional field `null`, so a field
+added without `#[serde(default)]`, or an optional one made required, fails it. The meanings below
+are kept by review, not by those tests.
 
 Out of this promise: the store schema, the MCP tools' argument shapes beyond what these routes
 already promise, the text of an `error` or `detail` message, and the order of `rows`.

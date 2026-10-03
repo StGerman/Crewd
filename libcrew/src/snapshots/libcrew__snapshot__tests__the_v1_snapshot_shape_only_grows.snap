@@ -4,8 +4,8 @@ expression: "lines.join(\"\\n\")"
 ---
 build: string
 generated_at: integer
-last_error: string
-last_tick_at: integer
+last_error: string | null
+last_tick_at: integer | null
 limit: integer
 missing_binaries: array
 missing_binaries[].binary: string
@@ -16,7 +16,7 @@ quarantined: integer
 rate_limit_pause.kind: string
 rate_limit_pause.resets_at: integer
 rate_limit_pause.worker: string
-rate_limit_pause: object
+rate_limit_pause: object | null
 rate_limit_pauses: array
 rate_limit_pauses[].kind: string
 rate_limit_pauses[].resets_at: integer
@@ -27,49 +27,49 @@ retrying: integer
 rows: array
 rows[].age_ms: integer
 rows[].attempt: integer
-rows[].branch: string
-rows[].delivery.base: string
-rows[].delivery.handoff_reason: string
-rows[].delivery.pr_number: integer
-rows[].delivery.pr_url: string
-rows[].delivery.review_error: string
+rows[].branch: string | null
+rows[].delivery.base: string | null
+rows[].delivery.handoff_reason: string | null
+rows[].delivery.pr_number: integer | null
+rows[].delivery.pr_url: string | null
+rows[].delivery.review_error: string | null
 rows[].delivery.rounds_issue: integer
 rows[].delivery.rounds_pr: integer
 rows[].delivery.stage: string
-rows[].delivery: object
+rows[].delivery: object | null
 rows[].holds_slot: bool
 rows[].identifier: string
 rows[].issue_id: string
-rows[].last_error: string
-rows[].last_event: string
+rows[].last_error: string | null
+rows[].last_event: string | null
 rows[].phase: string
 rows[].quarantined: bool
-rows[].retry_in_ms: integer
+rows[].retry_in_ms: integer | null
 rows[].runs: array
-rows[].runs[].effort: string
-rows[].runs[].ended_at: integer
-rows[].runs[].in_tok: integer
+rows[].runs[].effort: string | null
+rows[].runs[].ended_at: integer | null
+rows[].runs[].in_tok: integer | null
 rows[].runs[].issue_id: string
-rows[].runs[].model: string
-rows[].runs[].out_tok: integer
-rows[].runs[].outcome: string
+rows[].runs[].model: string | null
+rows[].runs[].out_tok: integer | null
+rows[].runs[].outcome: string | null
 rows[].runs[].run_id: string
-rows[].runs[].session_id: string
+rows[].runs[].session_id: string | null
 rows[].runs[].started_at: integer
-rows[].runs[].transcript: string
+rows[].runs[].transcript: string | null
 rows[].runs[].turns: integer
-rows[].runs[].worker: string
+rows[].runs[].worker: string | null
 rows[].runs[]: object
 rows[].title: string
 rows[].tokens.input: integer
 rows[].tokens.output: integer
-rows[].tokens: object
+rows[].tokens: object | null
 rows[].tracker_state: string
-rows[].transcript: string
+rows[].transcript: string | null
 rows[].turns: integer
-rows[].url: string
-rows[].worker: string
-rows[].workspace: string
+rows[].url: string | null
+rows[].worker: string | null
+rows[].workspace: string | null
 rows[]: object
 running: integer
 ticks: integer
