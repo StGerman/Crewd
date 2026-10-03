@@ -26,6 +26,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use super::{
     CiFailure, CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review,
@@ -144,8 +146,12 @@ struct GhCheckOutput {
 
 #[derive(Debug, Deserialize)]
 struct GhCheckRun {
+    #[serde(default)]
+    id: u64,
     name: String,
     status: String,
+    #[serde(default)]
+    started_at: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
     #[serde(default)]
@@ -770,6 +776,7 @@ impl<H: Http> Forge for GithubForge<H> {
         if runs.is_empty() {
             return Ok(CiStatus::Pending { running: vec![] });
         }
+        let runs = newest_of_each_name(runs);
 
         const FAILING: &[&str] =
             &["failure", "timed_out", "cancelled", "action_required", "startup_failure"];
@@ -918,6 +925,37 @@ fn parse<T: DeserializeOwned>(resp: &HttpResponse) -> Result<T, ForgeError> {
 fn body_snippet(resp: &HttpResponse) -> String {
     let text = String::from_utf8_lossy(&resp.body);
     text.chars().take(200).collect()
+}
+
+/// Keeps only the newest check run of each name, by `started_at` and then by id, in the order
+/// each name first appears. A workflow with `concurrency: cancel-in-progress` cancels the older
+/// run when the same head gets a second event, and that cancelled run is not this head's CI
+/// (#268); a newest run that is itself cancelled is still kept, and still fails. When any run of
+/// a name has no readable `started_at`, such as one still queued, that whole name is ordered by
+/// id alone, which GitHub assigns in creation order: one ordering per name, so the run chosen
+/// never depends on the order the response lists them in.
+fn newest_of_each_name(runs: Vec<GhCheckRun>) -> Vec<GhCheckRun> {
+    fn started(r: &GhCheckRun) -> Option<OffsetDateTime> {
+        r.started_at.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+    }
+    let mut groups: Vec<Vec<GhCheckRun>> = Vec::new();
+    for run in runs {
+        match groups.iter_mut().find(|g| g[0].name == run.name) {
+            Some(g) => g.push(run),
+            None => groups.push(vec![run]),
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let timed: Option<Vec<(OffsetDateTime, u64)>> =
+                group.iter().map(|r| started(r).map(|t| (t, r.id))).collect();
+            match timed {
+                Some(keys) => group.into_iter().zip(keys).max_by_key(|(_, k)| *k).map(|(r, _)| r),
+                None => group.into_iter().max_by_key(|r| r.id),
+            }
+        })
+        .collect()
 }
 
 /// Extracts the job id from a `details_url` shaped like
@@ -1370,6 +1408,93 @@ mod tests {
             !failures[0].detail.contains("2024-01-15T10:30:00"),
             "the timestamp must be stripped"
         );
+    }
+
+    fn timed_run(
+        id: u64,
+        name: &str,
+        started_at: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> Value {
+        let mut run = gh_check_run(name, status, conclusion, None);
+        run["id"] = json!(id);
+        run["started_at"] = json!(started_at);
+        run
+    }
+
+    #[test]
+    fn a_check_run_superseded_by_a_newer_run_of_the_same_name_is_not_a_failure() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "check_runs": [
+            timed_run(2, "test", "2026-10-03T08:30:05Z", "in_progress", None),
+            timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("cancelled")),
+            timed_run(3, "fmt", "2026-10-03T08:30:00Z", "completed", Some("success")),
+        ] })));
+        let f = forge(http);
+        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending { running: vec!["test".into()] });
+    }
+
+    #[test]
+    fn the_newest_run_of_a_check_decides_its_state() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "check_runs": [
+            timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("cancelled")),
+            timed_run(2, "test", "2026-10-03T08:31:00Z", "completed", Some("success")),
+            // Same start second: the higher id is the newer run.
+            timed_run(3, "fmt", "2026-10-03T08:30:00Z", "completed", Some("cancelled")),
+            timed_run(4, "fmt", "2026-10-03T08:30:00Z", "completed", Some("success")),
+        ] })));
+        let f = forge(http);
+        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Success);
+    }
+
+    #[test]
+    fn a_queued_rerun_with_no_start_time_supersedes_the_older_run() {
+        let http = FakeHttp::new();
+        let mut queued = gh_check_run("test", "queued", None, None);
+        queued["id"] = json!(2);
+        http.push(ok(json!({ "check_runs": [
+            queued,
+            timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("success")),
+        ] })));
+        let f = forge(http);
+        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending { running: vec!["test".into()] });
+    }
+
+    #[test]
+    fn the_run_chosen_does_not_depend_on_the_order_the_response_lists_them() {
+        let mut queued = gh_check_run("test", "queued", None, None);
+        queued["id"] = json!(2);
+        let runs = [
+            timed_run(1, "test", "2026-10-03T08:32:00Z", "completed", Some("success")),
+            queued,
+            timed_run(3, "test", "2026-10-03T08:31:00Z", "completed", Some("cancelled")),
+        ];
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let http = FakeHttp::new();
+            let listed: Vec<Value> = order.iter().map(|&i| runs[i].clone()).collect();
+            http.push(ok(json!({ "check_runs": listed })));
+            let f = forge(http);
+            let CiStatus::Failure { failures } = f.ci_status("sha").unwrap() else {
+                panic!("order {order:?}: the highest id, the cancelled run, must decide")
+            };
+            assert_eq!(failures.len(), 1, "order {order:?}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_run_with_no_newer_run_is_still_a_failure() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "check_runs": [
+            timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("success")),
+            timed_run(2, "test", "2026-10-03T08:31:00Z", "completed", Some("cancelled")),
+        ] })));
+        let f = forge(http);
+        let CiStatus::Failure { failures } = f.ci_status("sha").unwrap() else {
+            panic!("expected Failure")
+        };
+        assert_eq!(failures.len(), 1);
     }
 
     #[test]
