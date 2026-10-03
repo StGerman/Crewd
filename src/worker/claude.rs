@@ -90,7 +90,7 @@
 //!
 //! [`run_reader`] parses a handful of things out of the stream and drops the rest. Everything
 //! it drops — `system`, every tool call the agent made — is what a post-mortem actually wants,
-//! so the same loop copies each line verbatim to this run's [`TranscriptWriter`] *before*
+//! so the same loop copies each line, secrets redacted (#138), to this run's [`TranscriptWriter`] *before*
 //! deciding whether the parser has a use for it. Lines that fail to parse are written too: a
 //! stream the parser choked on is the single most interesting one to still have afterwards. See
 //! [`crate::transcript`] for the retention bounds and for why the file does not live in the

@@ -30,7 +30,7 @@
 //!   (`grok-4.7`); `end.modelUsage` named `grok-4.7-build` for that same run.
 //! * **A `tool_call_update` is stored once per call** (#172). The latest `in_progress` update
 //!   is held until that call completes or the stream ends, and `rawOutput.output` is dropped.
-//!   `text`, `usage`, `end` and `error` are copied unchanged.
+//!   `text`, `usage`, `end` and `error` are copied unchanged but for redaction (#138).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
