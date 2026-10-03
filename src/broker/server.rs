@@ -311,7 +311,7 @@ fn handle_rpc<S: McpService>(service: &S, path: &str, rpc: &Value) -> Option<Val
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": service.name(), "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": { "name": service.name(), "version": libcrew::build() }
             })
         }
         "ping" => json!({}),

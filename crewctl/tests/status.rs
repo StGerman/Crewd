@@ -90,11 +90,13 @@ async fn crewctl(cwd: &Path, db: &Path, args: &[&str]) -> Output {
     .unwrap()
 }
 
-/// What a person reads, with the parts that differ per run — the port the OS handed out and the
-/// temporary root, in both its given and canonical spelling — named rather than printed.
-/// Everything else comes from the fake clock and is stable.
+/// What a person reads, with the parts that differ per run — the port the OS handed out, the
+/// build string and the temporary root, in both its given and canonical spelling — named
+/// rather than printed. Everything else comes from the fake clock and is stable.
 fn stdout(out: &Output, addr: &str, root: &Path) -> String {
-    let mut text = String::from_utf8_lossy(&out.stdout).replace(addr, "[ADDR]");
+    let mut text = String::from_utf8_lossy(&out.stdout)
+        .replace(addr, "[ADDR]")
+        .replace(libcrew::build(), "[BUILD]");
     if let Ok(canonical) = root.canonicalize() {
         text = text.replace(&canonical.display().to_string(), "[ROOT]");
     }

@@ -13,7 +13,7 @@ use libcrew::client::{Client, endpoint};
 use libcrew::render;
 
 #[derive(Parser, Debug)]
-#[command(name = "crewctl", about = "Query a running crewd over its ops API")]
+#[command(name = "crewctl", version = libcrew::build(), about = "Query a running crewd over its ops API")]
 struct Args {
     /// The daemon's config, read only for `[api] bind` and leniently: a config the daemon would
     /// refuse to start with still says where to look.
