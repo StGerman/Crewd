@@ -1,14 +1,21 @@
 [package]
 name = "crewctl"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Client for crewd: reads what a running daemon is doing over its ops API."
 
 # The client. Its dependency graph is the guarantee that it cannot open the daemon's store:
 # `libcrew` and `clap`, and nothing that links SQLite, a terminal UI, an async runtime or an
 # HTTP stack. CI fails the build if `cargo tree -p crewctl -e normal` ever shows one (#45).
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-libcrew = { path = "../libcrew" }
+libcrew.workspace = true
 
 [dev-dependencies]
 crewd = { path = ".." }

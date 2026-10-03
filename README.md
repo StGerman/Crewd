@@ -76,8 +76,22 @@ crewd.
 
 ## Installation
 
-There is no release yet ([#90]), so you build from source. You need Rust, `git`, and the
-[Claude Code CLI](https://claude.com/claude-code) logged in.
+You need `git` and the [Claude Code CLI](https://claude.com/claude-code) logged in. Releases
+are built for Apple Silicon macOS and x86_64 Linux. With Homebrew:
+
+```bash
+brew install stgerman/tap/crewd stgerman/tap/crewctl
+```
+
+Without it, each binary has a shell installer on the
+[latest release](https://github.com/StGerman/crewd/releases/latest), or `cargo install crewd
+crewctl` builds both from crates.io. Then:
+
+```bash
+crewd --tui
+```
+
+From source, with Rust installed:
 
 ```bash
 git clone https://github.com/StGerman/crewd.git
@@ -86,7 +100,7 @@ cargo build
 cargo run -- --tui
 ```
 
-That last command runs against fake demo data: no tracker is contacted and no agent is
+`crewd --tui` (or `cargo run -- --tui`) runs against fake demo data: no tracker is contacted and no agent is
 spawned, so it is safe to explore. `q` quits.
 
 Run headless with the ops API on, and ask it what it is doing from another terminal:
@@ -205,6 +219,10 @@ keyboard, and the documentation is split to match:
 The commit gate is `cargo test`, `cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --check`. CI runs all three on every push and pull request.
 
+A release is a `v` tag cut by hand when a milestone closes. It publishes the binaries, the
+Homebrew formulae and the crates, and versions stay `0.x` until the v1 promise and the store
+schema are declared stable.
+
 Open an issue with the `issue-authoring` skill. Triage adds `agent`
 when the daemon should pick it up. The issue needs enough context to act on. The invariant
 table in `docs/invariants.md` is the standard the codebase holds itself to, and an issue that
@@ -230,5 +248,4 @@ coding-agent sessions, the way systemd runs services and containerd runs contain
 [docs/vision.md](docs/vision.md) maps each guarantee to crewd and marks what is not built yet.
 
 [#26]: https://github.com/StGerman/crewd/issues/26
-[#90]: https://github.com/StGerman/crewd/issues/90
 [#135]: https://github.com/StGerman/crewd/issues/135

@@ -1,7 +1,14 @@
 [package]
 name = "libcrew"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "The snapshot types and ops-API client shared by crewd and crewctl."
 
 # What the daemon and `crewctl` both need, and nothing else: the published snapshot types, the
 # ops API's address and wire constants, and the client that reads them (#45). Its dependency list

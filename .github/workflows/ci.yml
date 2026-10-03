@@ -107,3 +107,21 @@ jobs:
           if cargo tree --locked -p crewctl -e normal --prefix none | grep -E '^(rusqlite|ratatui|tokio|ureq) '; then
             echo "crewctl must not depend on the crates above"; exit 1
           fi
+
+  # What `cargo publish --workspace` will do on a version tag, short of uploading (#248): a
+  # missing `description` or an unversioned path dependency fails here rather than after the
+  # GitHub release is already out. Verifying builds each package from its packaged sources only;
+  # no example runs.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve pinned toolchain
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo package --workspace
+        run: cargo package --workspace --locked

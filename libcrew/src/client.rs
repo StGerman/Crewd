@@ -484,16 +484,26 @@ mod tests {
     #[test]
     fn a_closed_port_reads_as_no_daemon_rather_than_a_refused_request() {
         // The distinction issue #24 asks for, against a real closed port: bind one to learn a
-        // number the OS just handed out, then drop it so nothing is there.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap().to_string();
-        drop(probe);
+        // number the OS just handed out, then drop it so nothing is there. That port is in the
+        // ephemeral range, so Linux can pick it as the connecting socket's own source port and
+        // the connect succeeds against itself (TCP self-connect), failing later with a reset. A
+        // connection that got through says nothing about a closed port, so take another one; a
+        // refusal reported as anything but NotListening still fails on the first try.
+        let mut attempt = 0;
+        let (addr, client) = loop {
+            attempt += 1;
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = probe.local_addr().unwrap().to_string();
+            drop(probe);
 
-        let client = Client::new(Endpoint { addr: addr.clone(), source: Source::Flag });
-        match client.snapshot() {
-            Err(StatusError::NotListening { .. }) => {}
-            other => panic!("a closed port must read as NotListening, got {other:?}"),
-        }
+            let client = Client::new(Endpoint { addr: addr.clone(), source: Source::Flag });
+            match client.snapshot() {
+                Err(StatusError::NotListening { .. }) => break (addr, client),
+                Err(StatusError::Unreachable { why, .. })
+                    if attempt < 5 && !why.contains("refused") => {}
+                other => panic!("a closed port must read as NotListening, got {other:?}"),
+            }
+        };
 
         // And the message has to be actionable, not just correct.
         let rendered = client.snapshot().unwrap_err().to_string();

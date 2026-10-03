@@ -1,0 +1,62 @@
+# Publishes every workspace package that is not `publish = false` to crates.io (#248), called by
+# `v-release.yml` after the GitHub release exists. dist has no crates.io publisher, so this is its
+# custom publish job, named in `dist-workspace.toml`.
+#
+# `cargo publish --workspace` (stable since 1.90; the toolchain is pinned in rust-toolchain.toml)
+# orders the packages by their dependencies itself, so a new package needs no edit here. It
+# refuses a version crates.io already holds, so a rerun after a partial upload would stop at the
+# first package that made it; every package whose version is already in the index is excluded.
+#
+# Builds the packages only. DO NOT run an example here: see the note at the top of ci.yml.
+
+name: Publish crates
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve pinned toolchain
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - name: cargo publish --workspace
+        run: |
+          exclude=()
+          total=0
+          while read -r name version; do
+            lower=$(printf %s "$name" | tr "[:upper:]" "[:lower:]")
+            case ${#lower} in
+              1) path=1/$lower ;;
+              2) path=2/$lower ;;
+              3) path=3/${lower:0:1}/$lower ;;
+              *) path=${lower:0:2}/${lower:2:2}/$lower ;;
+            esac
+            # A crate never published is a 404, and any other failure reads the same way: publishing
+            # that version again then fails loudly rather than being skipped.
+            total=$((total + 1))
+            if curl -fsS "https://index.crates.io/$path" 2>/dev/null \
+                | jq -e --arg v "$version" 'select(.vers == $v)' > /dev/null; then
+              echo "$name $version is already on crates.io"
+              exclude+=(--exclude "$name")
+            fi
+          done < <(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | "\(.name) \(.version)"')
+          if (( ${#exclude[@]} / 2 == total )); then
+            echo "every package is already on crates.io"
+            exit 0
+          fi
+          cargo publish --workspace --locked "${exclude[@]}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
