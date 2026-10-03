@@ -53,8 +53,11 @@ Every error body is `{"error": string}`. A `409` adds `issue_ids`, an array of s
 dispatch ids to retry with.
 
 An action answer is `{"issue_id", "identifier", "cleared", "detail"}`: the issue it resolved to,
-`cleared` a bool saying whether the quarantine or park was there to clear, and `detail` a
-sentence for a person. A `200` with `cleared: false` is not an error: there was nothing to clear.
+`cleared` a bool saying whether the action took effect, and `detail` a sentence for a person
+naming which. For `unquarantine` that is a quarantine cleared. For `unblock` it is either a park
+lifted, so the next tick dispatches the issue onto its branch, or a delivery handed off to a human
+resumed, so the next poll reads its pull request again or pushes and opens one. A `200` with
+`cleared: false` is not an error: there was nothing to clear.
 
 ## Snapshot
 
@@ -133,7 +136,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `base` | optional string | The branch it merges into |
 | `rounds_pr` | integer | Fix rounds handed back to an agent on this pull request |
 | `rounds_issue` | integer | Fix rounds handed back on this issue, across its pull requests |
-| `review_error` | optional string | Why the review could not be read |
+| `review_error` | optional string | What the last review request on this head left undone: a bot reviewer that request did not attach, for the operator to request by hand, or the people and teams it attached nobody for, which also hands the delivery off. `null` once every reviewer attached or answered. Not a failure to read reviews, which fails the poll or lands in `handoff_reason` |
 | `handoff_reason` | optional string | Why it was handed to a human |
 
 ## TokenUsage
