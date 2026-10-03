@@ -109,8 +109,10 @@ fn carries_findings(body: &str, from_copilot: bool) -> bool {
             continue;
         }
         if let Some(heading) = text.strip_prefix('#') {
-            under_status =
-                from_copilot && is_status_heading(&bare(heading.trim_start_matches('#')));
+            // The status heads the overview, before the count; one after it heads something else.
+            under_status = from_copilot
+                && !says_none
+                && is_status_heading(&bare(heading.trim_start_matches('#')));
             continue;
         }
         let bare = bare(text);
@@ -342,6 +344,11 @@ mod tests {
         let second_line =
             NEEDS_A_CLOSER_LOOK.replace("validation.\n\n", "validation.\n\nRename the guard.\n\n");
         assert!(carries_findings(&second_line, true));
+        // A status heading after the count is another section, not the overview (PR #281).
+        let after = format!("{TEMPLATE}### 🔴 Security issue\nDo not expose the token.\n");
+        assert!(carries_findings(&after, true));
+        let after = format!("{NEEDS_A_CLOSER_LOOK}### 🔴 Security issue\nDo not expose it.\n");
+        assert!(carries_findings(&after, true));
     }
 
     /// PR #229's round 3 of 3 was spent on this summary (#234).
