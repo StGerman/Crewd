@@ -927,24 +927,26 @@ fn body_snippet(resp: &HttpResponse) -> String {
     text.chars().take(200).collect()
 }
 
-/// Extracts the job id from a `details_url` shaped like
-/// `https://github.com/o/r/actions/runs/<run_id>/job/<job_id>` — the only form the log/step
-/// lookup in [`GithubForge::actions_detail`] knows how to follow. Checking for both the `runs`
-/// and `job` segments, not just parsing the trailing number, is what keeps a non-Actions
-/// `details_url` (a third-party CI's own dashboard link) from being treated as one by accident.
 /// Keeps only the newest check run of each name, by `started_at` and then by id, in the order
 /// each name first appears. A workflow with `concurrency: cancel-in-progress` cancels the older
 /// run when the same head gets a second event, and that cancelled run is not this head's CI
-/// (#268); a newest run that is itself cancelled is still kept, and still fails.
+/// (#268); a newest run that is itself cancelled is still kept, and still fails. A run with no
+/// readable `started_at`, such as one still queued, is compared by id alone, which GitHub
+/// assigns in creation order, so it is never judged older than the run it replaced.
 fn newest_of_each_name(runs: Vec<GhCheckRun>) -> Vec<GhCheckRun> {
-    fn key(r: &GhCheckRun) -> (Option<OffsetDateTime>, u64) {
-        let started = r.started_at.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-        (started, r.id)
+    fn started(r: &GhCheckRun) -> Option<OffsetDateTime> {
+        r.started_at.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+    }
+    fn is_newer(a: &GhCheckRun, b: &GhCheckRun) -> bool {
+        match (started(a), started(b)) {
+            (Some(x), Some(y)) if x != y => x > y,
+            _ => a.id > b.id,
+        }
     }
     let mut newest: Vec<GhCheckRun> = Vec::new();
     for run in runs {
         match newest.iter_mut().find(|n| n.name == run.name) {
-            Some(n) if key(&run) > key(n) => *n = run,
+            Some(n) if is_newer(&run, n) => *n = run,
             Some(_) => {}
             None => newest.push(run),
         }
@@ -952,6 +954,11 @@ fn newest_of_each_name(runs: Vec<GhCheckRun>) -> Vec<GhCheckRun> {
     newest
 }
 
+/// Extracts the job id from a `details_url` shaped like
+/// `https://github.com/o/r/actions/runs/<run_id>/job/<job_id>` — the only form the log/step
+/// lookup in [`GithubForge::actions_detail`] knows how to follow. Checking for both the `runs`
+/// and `job` segments, not just parsing the trailing number, is what keeps a non-Actions
+/// `details_url` (a third-party CI's own dashboard link) from being treated as one by accident.
 fn actions_job_id(details_url: &str) -> Option<u64> {
     let parts: Vec<&str> = details_url.split('/').collect();
     let runs_pos = parts.iter().position(|p| *p == "runs")?;
@@ -1436,6 +1443,19 @@ mod tests {
         ] })));
         let f = forge(http);
         assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Success);
+    }
+
+    #[test]
+    fn a_queued_rerun_with_no_start_time_supersedes_the_older_run() {
+        let http = FakeHttp::new();
+        let mut queued = gh_check_run("test", "queued", None, None);
+        queued["id"] = json!(2);
+        http.push(ok(json!({ "check_runs": [
+            queued,
+            timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("success")),
+        ] })));
+        let f = forge(http);
+        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending { running: vec!["test".into()] });
     }
 
     #[test]
