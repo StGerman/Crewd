@@ -83,8 +83,12 @@ fail:
 - `agent.max_turns_per_issue` counts turns across every session of the issue and quarantines it
   when the budget is spent, so even a well-behaved `Continue` cannot run forever.
 - A run that ends `Done` or `Blocked` parks the issue at its current state (`parked_state`), so
-  the ticket still reading `In Progress` does not pick it straight back up. The park lifts only
-  when the ticket moves.
+  the ticket still reading `In Progress` does not pick it straight back up. On direct dispatch
+  the park lifts when the ticket moves or an operator unblocks the issue. With delivery on, a
+  pull request's CI failure, review or conflict hands the issue back to an agent through the
+  same unpark and retry a `Continue` takes, with the ticket still `In Progress`; each hand-back
+  is a round counted against delivery's own budget, and a ticket move does not lift the park of
+  a delivery still in flight.
 
 **Invariants:** "No 1s continuation respawn loop" and "A finished issue is not re-dispatched".
 **Guard tests:** `continuation_backs_off_instead_of_respawning_every_second` (the row's guard:
