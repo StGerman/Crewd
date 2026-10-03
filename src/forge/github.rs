@@ -160,6 +160,36 @@ struct GhCheckRun {
     details_url: Option<String>,
     #[serde(default)]
     output: Option<GhCheckOutput>,
+    /// Which App reported the run. Absent, the run's identity is unknown and it is never
+    /// collapsed into another of the same name.
+    #[serde(default)]
+    app: Option<GhCheckApp>,
+    #[serde(default)]
+    check_suite: Option<GhId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCheckApp {
+    id: u64,
+    #[serde(default)]
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhId {
+    id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhWorkflowRunsPage {
+    #[serde(default)]
+    workflow_runs: Vec<GhWorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhWorkflowRun {
+    workflow_id: u64,
+    check_suite_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +613,29 @@ impl<H: Http> GithubForge<H> {
         if parts.is_empty() { None } else { Some(parts.join("\n")) }
     }
 
+    /// Each Actions check suite's workflow on `sha`, or `None` when it cannot be read whole:
+    /// reading it needs `actions: read`, which an App may not hold, and a partial map would
+    /// pair a suite with no workflow as readily as a missing one.
+    fn workflows_of(&self, sha: &str) -> Option<HashMap<u64, u64>> {
+        let mut suites = HashMap::new();
+        let mut page = 1u32;
+        loop {
+            let url = format!(
+                "{API_BASE}/repos/{}/{}/actions/runs?head_sha={sha}&per_page={PER_PAGE}&page={page}",
+                self.owner, self.repo
+            );
+            let resp = self.get_best_effort(&url)?;
+            let batch: GhWorkflowRunsPage = serde_json::from_slice(&resp.body).ok()?;
+            let got = batch.workflow_runs.len();
+            suites
+                .extend(batch.workflow_runs.into_iter().map(|r| (r.check_suite_id, r.workflow_id)));
+            if got < PER_PAGE as usize {
+                return Some(suites);
+            }
+            page += 1;
+        }
+    }
+
     fn build_failure(&self, run: &GhCheckRun) -> CiFailure {
         let mut detail = String::new();
         if let Some(output) = &run.output {
@@ -776,7 +829,8 @@ impl<H: Http> Forge for GithubForge<H> {
         if runs.is_empty() {
             return Ok(CiStatus::Pending { running: vec![] });
         }
-        let runs = newest_of_each_name(runs);
+        let workflows = if needs_workflows(&runs) { self.workflows_of(&sha) } else { None };
+        let runs = newest_of_each_check(runs, workflows.as_ref());
 
         const FAILING: &[&str] =
             &["failure", "timed_out", "cancelled", "action_required", "startup_failure"];
@@ -927,27 +981,60 @@ fn body_snippet(resp: &HttpResponse) -> String {
     text.chars().take(200).collect()
 }
 
-/// Keeps only the newest check run of each name, by `started_at` and then by id, in the order
-/// each name first appears. A workflow with `concurrency: cancel-in-progress` cancels the older
-/// run when the same head gets a second event, and that cancelled run is not this head's CI
-/// (#268); a newest run that is itself cancelled is still kept, and still fails. When any run of
-/// a name has no readable `started_at`, such as one still queued, that whole name is ordered by
-/// id alone, which GitHub assigns in creation order: one ordering per name, so the run chosen
-/// never depends on the order the response lists them in.
-fn newest_of_each_name(runs: Vec<GhCheckRun>) -> Vec<GhCheckRun> {
+const ACTIONS_SLUG: &str = "github-actions";
+
+/// What makes two check runs the same logical check, so the newer supersedes the older (#268).
+/// The name alone does not: two Apps, or two workflows, can each report `test` on one head, and
+/// collapsing them would let one's success hide the other's failure. `None` is a run whose App
+/// is not reported; it is kept as it is. An Actions run is told apart by its workflow when that
+/// could be read, and by name within Actions when it could not (no `actions: read`), which is
+/// #268's rule and keeps a cancelled run superseded by its own rerun from failing the head.
+fn check_identity(
+    run: &GhCheckRun,
+    workflows: Option<&HashMap<u64, u64>>,
+) -> Option<(u64, Option<u64>, String)> {
+    let app = run.app.as_ref()?;
+    let workflow = match workflows {
+        Some(map) if app.slug == ACTIONS_SLUG => Some(*map.get(&run.check_suite.as_ref()?.id)?),
+        _ => None,
+    };
+    Some((app.id, workflow, run.name.clone()))
+}
+
+/// Only an Actions name reported more than once can need its workflow told apart, so the
+/// lookup's request is spent only then.
+fn needs_workflows(runs: &[GhCheckRun]) -> bool {
+    let actions = runs.iter().filter(|r| r.app.as_ref().is_some_and(|a| a.slug == ACTIONS_SLUG));
+    let mut seen = std::collections::HashSet::new();
+    actions.into_iter().any(|r| !seen.insert(r.name.as_str()))
+}
+
+/// Keeps only the newest run of each logical check ([`check_identity`]), by `started_at` and
+/// then by id, in the order each check first appears. A workflow with `concurrency:
+/// cancel-in-progress` cancels the older run when the same head gets a second event, and that
+/// cancelled run is not this head's CI (#268); a newest run that is itself cancelled is still
+/// kept, and still fails. When any run of a check has no readable `started_at`, such as one
+/// still queued, that whole check is ordered by id alone, which GitHub assigns in creation
+/// order: one ordering per check, so the run chosen never depends on the response's order.
+fn newest_of_each_check(
+    runs: Vec<GhCheckRun>,
+    workflows: Option<&HashMap<u64, u64>>,
+) -> Vec<GhCheckRun> {
     fn started(r: &GhCheckRun) -> Option<OffsetDateTime> {
         r.started_at.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
     }
-    let mut groups: Vec<Vec<GhCheckRun>> = Vec::new();
+    type Key = Option<(u64, Option<u64>, String)>;
+    let mut groups: Vec<(Key, Vec<GhCheckRun>)> = Vec::new();
     for run in runs {
-        match groups.iter_mut().find(|g| g[0].name == run.name) {
-            Some(g) => g.push(run),
-            None => groups.push(vec![run]),
+        let key = check_identity(&run, workflows);
+        match groups.iter_mut().find(|(k, _)| key.is_some() && *k == key) {
+            Some((_, g)) => g.push(run),
+            None => groups.push((key, vec![run])),
         }
     }
     groups
         .into_iter()
-        .filter_map(|group| {
+        .filter_map(|(_, group)| {
             let timed: Option<Vec<(OffsetDateTime, u64)>> =
                 group.iter().map(|r| started(r).map(|t| (t, r.id))).collect();
             match timed {
@@ -1344,7 +1431,84 @@ mod tests {
             "conclusion": conclusion,
             "html_url": "https://github.com/o/r/runs/1",
             "details_url": details_url,
+            "app": { "id": 9, "slug": "some-ci" },
         })
+    }
+
+    /// A timed run reported by GitHub Actions, in check suite `suite`.
+    fn actions_run(id: u64, suite: u64, started_at: &str, conclusion: &str) -> Value {
+        let mut run = timed_run(id, "test", started_at, "completed", Some(conclusion));
+        run["app"] = json!({ "id": 15368, "slug": "github-actions" });
+        run["check_suite"] = json!({ "id": suite });
+        run
+    }
+
+    /// `(check_suite_id, workflow_id)` pairs, as `GET /actions/runs?head_sha=` lists them.
+    fn workflow_runs(pairs: &[(u64, u64)]) -> Value {
+        let runs: Vec<Value> = pairs
+            .iter()
+            .map(|(suite, wf)| json!({ "id": suite * 10, "workflow_id": wf, "check_suite_id": suite }))
+            .collect();
+        json!({ "workflow_runs": runs })
+    }
+
+    #[test]
+    fn a_failed_check_is_not_hidden_by_a_later_success_of_the_same_name_from_another_app() {
+        let http = FakeHttp::new();
+        let mut other = timed_run(2, "test", "2026-10-03T08:31:00Z", "completed", Some("success"));
+        other["app"] = json!({ "id": 10, "slug": "other-ci" });
+        http.push(ok(json!({ "check_runs": [
+            timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("failure")),
+            other,
+        ] })));
+        let f = forge(http);
+        assert!(matches!(f.ci_status("sha").unwrap(), CiStatus::Failure { .. }));
+    }
+
+    #[test]
+    fn a_failed_job_is_not_hidden_by_a_later_success_of_the_same_name_in_another_workflow() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "check_runs": [
+            actions_run(1, 100, "2026-10-03T08:30:00Z", "failure"),
+            actions_run(2, 200, "2026-10-03T08:31:00Z", "success"),
+        ] })));
+        http.push(ok(workflow_runs(&[(100, 7), (200, 8)])));
+        let f = forge(http);
+        assert!(matches!(f.ci_status("sha").unwrap(), CiStatus::Failure { .. }));
+        assert!(f.http.gets()[1].contains("/actions/runs?head_sha=sha"), "{:?}", f.http.gets());
+    }
+
+    #[test]
+    fn a_cancelled_run_superseded_by_its_own_workflows_rerun_is_not_a_failure() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "check_runs": [
+            actions_run(1, 100, "2026-10-03T08:30:00Z", "cancelled"),
+            actions_run(2, 200, "2026-10-03T08:31:00Z", "success"),
+        ] })));
+        http.push(ok(workflow_runs(&[(100, 7), (200, 7)])));
+        assert_eq!(forge(http).ci_status("sha").unwrap(), CiStatus::Success);
+    }
+
+    #[test]
+    fn without_actions_read_an_actions_check_is_grouped_by_name_as_before() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "check_runs": [
+            actions_run(1, 100, "2026-10-03T08:30:00Z", "cancelled"),
+            actions_run(2, 200, "2026-10-03T08:31:00Z", "success"),
+        ] })));
+        http.push(status(403, &[], json!({ "message": "Resource not accessible by integration" })));
+        assert_eq!(forge(http).ci_status("sha").unwrap(), CiStatus::Success);
+    }
+
+    #[test]
+    fn a_run_whose_app_is_not_reported_is_never_collapsed_into_another() {
+        let http = FakeHttp::new();
+        let mut older = timed_run(1, "test", "2026-10-03T08:30:00Z", "completed", Some("failure"));
+        let mut newer = timed_run(2, "test", "2026-10-03T08:31:00Z", "completed", Some("success"));
+        older.as_object_mut().unwrap().remove("app");
+        newer.as_object_mut().unwrap().remove("app");
+        http.push(ok(json!({ "check_runs": [older, newer] })));
+        assert!(matches!(forge(http).ci_status("sha").unwrap(), CiStatus::Failure { .. }));
     }
 
     #[test]
