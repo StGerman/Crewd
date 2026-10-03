@@ -84,6 +84,26 @@ pub enum Command {
     Unblock { issue_id: String, reply: oneshot::Sender<anyhow::Result<Unblocked>> },
 }
 
+/// What the scheduler loop does for [`Command::Tick`]: tick, publish what the tick reached, and
+/// answer with the tick's failure if it had one, else the published snapshot. One function for
+/// `main` and the API tests, so the `500` that `POST /refresh` promises for a failed tick
+/// (docs/api-v1.md, #245) is tested where it is produced: a failure returned by `?` never
+/// reaches `last_error`, so answering with the snapshot alone would report it as a `200`.
+pub fn answer_tick(
+    sched: &mut crate::sched::Scheduler,
+    snap_tx: &watch::Sender<Snapshot>,
+) -> anyhow::Result<Snapshot> {
+    let ticked = sched.tick();
+    if let Err(e) = &ticked {
+        tracing::error!(error = %e, "api tick failed");
+    }
+    let snap = sched.snapshot();
+    if let Ok(s) = &snap {
+        let _ = snap_tx.send(s.clone());
+    }
+    ticked.and(snap)
+}
+
 /// Bind the API's listener, refusing an exposure nobody asked for.
 ///
 /// Separate from [`Api::serve`] so `main` can bind at startup, before the store or any worktree

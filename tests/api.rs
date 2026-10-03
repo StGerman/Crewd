@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crew::api::client::{Client, Endpoint, Source, StatusError};
 use crew::api::mcp::{self, OpsMcp};
-use crew::api::{Api, Command};
+use crew::api::{self, Api, Command};
 use crew::broker::fake::FakeWrites;
 use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use crew::clock::FakeClock;
@@ -42,11 +42,14 @@ struct Harness {
     snap_tx: watch::Sender<Snapshot>,
     commands: mpsc::UnboundedReceiver<Command>,
     root: PathBuf,
+    /// The store's file, so a test can reach it from a second connection.
+    db: PathBuf,
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_file(&self.db);
     }
 }
 
@@ -73,6 +76,8 @@ impl Harness {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!("crew-api-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let db = root.with_extension("db");
+        let _ = std::fs::remove_file(&db);
 
         let cfg = Config {
             tracker: TrackerConfig {
@@ -102,7 +107,7 @@ impl Harness {
         let sched = Scheduler::new(
             cfg,
             clock.clone(),
-            Store::open_in_memory().unwrap(),
+            Store::open(&db).unwrap(),
             Arc::new(FakeTracker::new(issues)),
             worker.clone(),
             Arc::new(DirWorkspace::new(&root).unwrap()),
@@ -123,7 +128,7 @@ impl Harness {
         broker::server::serve(Arc::new(OpsMcp::new(Api::new(snap_rx, cmd_tx))), mcp_listener)
             .unwrap();
 
-        Harness { addr, mcp_addr, sched, clock, worker, snap_tx, commands, root }
+        Harness { addr, mcp_addr, sched, clock, worker, snap_tx, commands, root, db }
     }
 
     /// One MCP `tools/call` against the ops server, pumping commands the way `main`'s loop
@@ -167,12 +172,7 @@ impl Harness {
     fn apply(&mut self, cmd: Command) {
         match cmd {
             Command::Tick(reply) => {
-                self.sched.tick().unwrap();
-                let snap = self.sched.snapshot();
-                if let Ok(s) = &snap {
-                    self.snap_tx.send(s.clone()).unwrap();
-                }
-                let _ = reply.send(snap);
+                let _ = reply.send(api::answer_tick(&mut self.sched, &self.snap_tx));
             }
             Command::Unquarantine { issue_id, reply } => {
                 let cleared = self.sched.unquarantine(&issue_id);
@@ -356,6 +356,29 @@ async fn a_forced_refresh_advances_the_tick_count_by_exactly_one() {
     // A read must not be a write: the tick count is unchanged by asking for it.
     let (_, again) = h.request("GET", "/api/v1/snapshot").await;
     assert_eq!(again["ticks"], after["ticks"]);
+}
+
+/// docs/api-v1.md promises `500` for a refresh whose tick failed (#245). A tick that stops on
+/// `?` leaves `last_error` unset, so an answer built from the snapshot alone reads as a `200`.
+/// The trigger fails the claim's write while every read the snapshot makes still works.
+#[tokio::test]
+async fn a_refresh_whose_tick_fails_answers_500_and_still_publishes() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    rusqlite::Connection::open(&h.db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_claims BEFORE INSERT ON issue_state
+             BEGIN SELECT RAISE(ABORT, 'claims refused by the test'); END;",
+        )
+        .unwrap();
+
+    let (status, body) = h.request("POST", "/api/v1/refresh").await;
+    assert_eq!(status, 500, "body was {body}");
+    assert!(body["error"].as_str().unwrap().contains("claims refused"), "body was {body}");
+
+    let (status, snap) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(status, 200);
+    assert_eq!(snap["ticks"], 1, "the failed tick still published what it reached");
 }
 
 #[tokio::test]
