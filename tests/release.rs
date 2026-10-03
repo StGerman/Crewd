@@ -132,3 +132,16 @@ fn a_release_ships_two_targets_a_shell_installer_and_a_homebrew_formula_per_bina
     assert_eq!(strings("publish-jobs"), ["homebrew", "./publish-crates"]);
     assert_eq!(dist["tap"].as_str(), Some("StGerman/homebrew-tap"));
 }
+
+#[test]
+fn the_crate_publish_job_can_check_out_the_repository() {
+    let release = read(RELEASE);
+    let job: Vec<&str> = block(&release, "jobs:")
+        .into_iter()
+        .skip_while(|l| *l != "  custom-publish-crates:")
+        .skip(1)
+        .take_while(|l| l.starts_with("   "))
+        .collect();
+    assert!(job.contains(&"    permissions:"), "the job's permissions: {job:?}");
+    assert!(job.contains(&"      \"contents\": \"read\""), "the job's permissions: {job:?}");
+}

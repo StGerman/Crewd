@@ -23,3 +23,6 @@ tag-namespace = "v"
 # dist writes the install instructions as the release body; this job adds GitHub's notes, built
 # from the merged pull requests' titles, so there is no CHANGELOG.md to keep.
 post-announce-jobs = ["./release-notes"]
+# A job-level `permissions` block drops every scope it does not name, and a called workflow
+# cannot raise them again, so without `contents = "read"` the publish job's checkout is refused.
+github-custom-job-permissions = { "publish-crates" = { contents = "read" } }
