@@ -1577,13 +1577,18 @@ impl Scheduler {
             match st.parked_state.as_deref() {
                 // Still sitting where we left it: nothing new to act on.
                 Some(parked) if parked == key => continue,
-                // A handed-off delivery's park is the operator's to lift: a run dispatched here
-                // would end in a `Done` that restarts delivery with no unblock (#262).
+                // A delivery in flight holds the park until delivery releases the issue: a fix
+                // round, a merge or a close. A run dispatched here would work without the
+                // review feedback and outside the round bounds, and a handed-off one's `Done`
+                // would restart delivery with no unblock (#262, #266). With delivery off nothing
+                // advances a pending, awaiting or ready row, so the ticket's move lifts its park.
                 Some(_)
-                    if self
-                        .store
-                        .delivery(&issue.id)?
-                        .is_some_and(|d| d.stage == crate::store::DeliveryStage::HandedOff) =>
+                    if self.store.delivery(&issue.id)?.is_some_and(|d| {
+                        use crate::store::DeliveryStage as S;
+                        d.stage == S::HandedOff
+                            || self.delivery_on()
+                                && matches!(d.stage, S::Pending | S::Awaiting | S::Ready)
+                    }) =>
                 {
                     continue;
                 }
