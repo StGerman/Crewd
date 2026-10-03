@@ -213,13 +213,14 @@ its crypto backends would add a second RSA implementation for one signature. #64
 three for the same reason, and whichever lands second keeps one JWT signer.
 
 `service-manager` and `plist` arrived with `crewd service install` (#246). The crate replaces
-writing a launchd plist and a systemd unit by hand and driving `launchctl` and `systemctl`
-directly, which is a second copy of each manager's load, enable and remove quirks; Homebrew's
-`service do` block was the alternative, and it covers neither a crates.io nor a tarball install.
-Its `encoding` default only decodes Windows command output and is off. It adds `plist`,
-`xml-rs`, `quick-xml`, `which` and `dirs` to the tree. `plist` is named directly because the
-crate's own plist has no `StandardOutPath`, so the agent's definition is written here and
-passed through the crate's `contents` override. The one `systemctl` call crewd still makes itself is
+driving `launchctl` and `systemctl` directly, which is a second copy of each manager's load,
+enable and remove quirks; Homebrew's `service do` block was the alternative, and it covers
+neither a crates.io nor a tarball install. Its `encoding` default only decodes Windows command
+output and is off. It adds `plist`, `xml-rs`, `quick-xml`, `which` and `dirs` to the tree. Both
+definitions are written here and passed through the crate's `contents` override: `plist` is
+named directly because the crate's own plist has no `StandardOutPath`, and the crate's systemd
+template leaves `ExecStart` and `WorkingDirectory` unquoted, so a path with a space would split
+(#276). The one `systemctl` call crewd still makes itself is
 `daemon-reload`, after writing or removing a unit, because the crate does not reload and a
 reinstall would otherwise start the cached definition (`Reloading` in `src/service.rs`).
 
