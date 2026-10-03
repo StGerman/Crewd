@@ -6232,6 +6232,11 @@ fn a_branch_the_gate_rebased_is_not_merged_with_its_own_earlier_push_at_the_next
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
     assert_eq!(h.sched.gating_count(), 1, "the run's Done is being gated");
+    assert_eq!(
+        git_out(&wt, &["rev-parse", &format!("refs/crew/lease/{branch}")]),
+        Some(pushed.clone()),
+        "the sync before the gate recorded the agent's own push as the lease"
+    );
     let rebased = rebase_onto_moved_base(&repo, &wt);
     assert_ne!(rebased, pushed, "the gate rewrote the pushed commit");
 

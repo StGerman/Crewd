@@ -3282,6 +3282,47 @@ mod tests {
         }
     }
 
+    /// As a mid-merge one: a merge onto a paused rebase's detached head would hide the rebase
+    /// from the gate that reports it `Stuck`.
+    #[test]
+    fn a_worktree_left_mid_rebase_is_not_synced_and_keeps_its_rebase() {
+        let root = tmp_root("wt-sync-mid-rebase");
+        let (repo, bare) = repo_with_remote("wt-sync-mid-rebase");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-mid-rebase-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+
+        git_out(&p.path, &["checkout", "-q", "-b", "side", "HEAD~1"]).unwrap();
+        commit_in(&p.path, "b.txt", "the side's change");
+        git_out(&p.path, &["checkout", "-q", &branch]).unwrap();
+        // Paused with a clean tree, so only the rebase markers can refuse the sync.
+        assert!(
+            git_out(&p.path, &["rebase", "-q", "--exec", "false", "side"]).is_err(),
+            "the agent's rebase pauses"
+        );
+        let head = head_of(&p.path);
+
+        assert!(matches!(ws.sync(&p.path, &branch, "origin"), Err(ForgeError::Permanent(_))));
+        let rebase_dir = git_out(
+            &p.path,
+            &["rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"],
+        )
+        .unwrap();
+        assert!(Path::new(&rebase_dir).exists(), "the rebase is still paused for the gate to find");
+        assert_eq!(head_of(&p.path), head, "nothing was merged onto its detached head");
+        assert!(!p.path.join("theirs.txt").exists());
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     /// Review on #271: git merges a commit touching other files over tracked edits, moving
     /// `HEAD` before the gate has reported those edits. Refused, the worktree stays as left.
     #[test]
