@@ -622,8 +622,9 @@ pub fn uninstall(
     }
     // systemd's `disable` leaves a running unit running after its file is gone, so a stop that
     // fails ends the uninstall rather than reporting a removal that is not one; stopping an
-    // inactive unit succeeds. On launchd the crate's `launchctl remove` stops the job itself.
-    if platform == Platform::Systemd {
+    // inactive unit succeeds, but one systemd never loaded (a file whose install failed to
+    // reload) fails, and only its file is left to remove. On launchd `Launchd` boots it out.
+    if platform == Platform::Systemd && status != ServiceStatus::NotInstalled {
         manager.stop(ServiceStopCtx { label: ctx.clone() }).map_err(fail("stopping"))?;
     }
     manager.uninstall(ServiceUninstallCtx { label: ctx }).map_err(fail("uninstalling"))?;
@@ -918,21 +919,6 @@ mod tests {
             ["status dev.crewd.acme-api", "status dev.crewd.acme-api"],
             "systemctl disable would fail on no unit"
         );
-        manager.calls.borrow_mut().clear();
-
-        let unit = root.join("home/.config/systemd/user/dev.crewd.acme-api.service");
-        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-        std::fs::write(&unit, "").unwrap();
-        let got = uninstall(&manager, config, &host, Platform::Systemd).unwrap();
-        assert!(matches!(got, Uninstalled::Removed { .. }));
-        assert_eq!(
-            *manager.calls.borrow(),
-            [
-                "status dev.crewd.acme-api",
-                "stop dev.crewd.acme-api",
-                "uninstall dev.crewd.acme-api"
-            ]
-        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1005,6 +991,28 @@ mod tests {
             ],
         };
         insta::assert_snapshot!(plan.unit().unwrap());
+    }
+
+    #[test]
+    fn uninstall_removes_a_unit_file_systemd_never_loaded_without_stopping_it() {
+        let (root, host) = sandbox("unloaded-unit");
+        let unit = host.systemd_user_dir.clone().unwrap().join("dev.crewd.acme-api.service");
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, "").unwrap();
+        // `systemctl stop` on a unit systemd does not know fails.
+        let manager = FakeManager {
+            fail_stop: true,
+            definition: Some(unit.clone()),
+            ..FakeManager::default()
+        };
+        let got = uninstall(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Systemd);
+        assert!(matches!(got, Ok(Uninstalled::Removed { .. })), "{got:?}");
+        assert_eq!(
+            *manager.calls.borrow(),
+            ["status dev.crewd.acme-api", "uninstall dev.crewd.acme-api"]
+        );
+        assert!(!unit.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
