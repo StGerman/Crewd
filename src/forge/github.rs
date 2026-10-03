@@ -51,6 +51,22 @@ struct GhUser {
     login: String,
 }
 
+/// `GET /app`: the App's slug, which GitHub writes its comments as `<slug>[bot]`.
+#[derive(Debug, Deserialize)]
+struct GhApp {
+    slug: String,
+}
+
+/// An issue comment, which is what a pull request's conversation is made of.
+#[derive(Debug, Deserialize)]
+struct GhIssueComment {
+    id: u64,
+    user: GhUser,
+    body: String,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GhHeadRef {
     sha: String,
@@ -656,7 +672,9 @@ impl<H: Http> Forge for GithubForge<H> {
     }
 
     /// A bot through GraphQL's `requestReviewsByLogin`, since REST drops one and answers
-    /// success (GETT-174120); anyone else through REST.
+    /// success (GETT-174120); anyone else through REST. Sent with an App's installation token,
+    /// a request for Copilot succeeds and attaches nobody, because an App has no Copilot seat:
+    /// only a person can request it (#252). Delivery reads that back and asks the operator.
     fn request_review(&self, number: u64, reviewer: &str) -> Result<(), ForgeError> {
         if let Some(bot) = reviewer.strip_suffix(BOT_SUFFIX) {
             let id = self.pull_request_node_id(number)?;
@@ -771,6 +789,42 @@ impl<H: Http> Forge for GithubForge<H> {
         }
 
         Ok(CiStatus::Success)
+    }
+
+    /// An App's writes carry `<slug>[bot]`, which only the App's own JWT can read; an
+    /// installation token is refused by `GET /user`, and a personal token answers it.
+    fn login(&self) -> Result<String, ForgeError> {
+        let Some(jwt) = self.creds.app_jwt() else {
+            let user: GhUser = self.get_json(&format!("{API_BASE}/user"))?;
+            return Ok(user.login);
+        };
+        let mut headers = http::github_rest_headers();
+        headers.insert(0, ("Authorization", format!("Bearer {}", jwt?)));
+        let resp = self
+            .http
+            .get(&format!("{API_BASE}/app"), &headers)
+            .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
+        let app: GhApp = parse(&classify(resp)?)?;
+        Ok(format!("{}{BOT_SUFFIX}", app.slug))
+    }
+
+    fn conversation_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+        let raw: Vec<GhIssueComment> = self.paginate(|page| {
+            format!("{API_BASE}/repos/{owner}/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}")
+        })?;
+        Ok(raw
+            .into_iter()
+            .map(|c| ReviewComment {
+                id: c.id.to_string(),
+                author: c.user.login,
+                path: None,
+                line: None,
+                body: c.body,
+                url: c.html_url,
+            })
+            .collect())
     }
 
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {
@@ -1408,6 +1462,52 @@ mod tests {
         assert_eq!(w[0].0, "POST");
         assert_eq!(w[0].1, "https://api.github.com/repos/o/r/issues/1/comments");
         assert_eq!(w[0].2, json!({ "body": "**Rejected**" }));
+    }
+
+    #[test]
+    fn a_token_credential_posts_as_its_users_login() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "login": "operator" })));
+        let f = forge(http);
+        assert_eq!(f.login().unwrap(), "operator");
+        assert_eq!(f.http.gets(), ["https://api.github.com/user"]);
+    }
+
+    /// An installation token cannot read `GET /user`; the App's own JWT reads `GET /app`, and
+    /// GitHub writes the App's comments as its slug with the bot suffix (#263).
+    #[test]
+    fn an_app_credential_posts_as_its_slug_with_the_bot_suffix() {
+        use crate::credentials::CredentialError;
+        struct App;
+        impl Credentials for App {
+            fn token(&self) -> Result<String, CredentialError> {
+                Ok("installation".into())
+            }
+            fn app_jwt(&self) -> Option<Result<String, CredentialError>> {
+                Some(Ok("jwt".into()))
+            }
+        }
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "slug": "crew-bot" })));
+        let f = forge(http).with_credentials(Arc::new(App));
+        assert_eq!(f.login().unwrap(), "crew-bot[bot]");
+        assert_eq!(f.http.gets(), ["https://api.github.com/app"]);
+    }
+
+    /// #265: no cutoff at the head, which would need a push time GitHub does not record.
+    #[test]
+    fn conversation_comments_are_every_comment_on_the_pull_requests_conversation() {
+        let http = FakeHttp::new();
+        let comment = |id: u64| json!({ "id": id, "user": { "login": "alice" }, "body": "b" });
+        http.push(ok(json!([comment(1), comment(2)])));
+        let f = forge(http);
+        let got = f.conversation_comments(4).unwrap();
+        let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+        assert_eq!(
+            f.http.gets(),
+            ["https://api.github.com/repos/o/r/issues/4/comments?per_page=100&page=1"]
+        );
     }
 
     #[test]

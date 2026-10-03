@@ -170,6 +170,9 @@ impl OpsMcp {
                                 been resolved, so the next tick dispatches it onto its \
                                 existing branch. Write what changed into the issue's \
                                 description first: that is the prompt the agent reads. \
+                                On an issue whose delivery was handed off, hands its pull \
+                                request back to crewd's delivery instead, with its round \
+                                counts kept; `detail` says which happened. \
                                 Reports `cleared: false` rather than failing when the issue \
                                 is not parked, is running, gating or waiting on a retry, its \
                                 delivery still owns the branch, or its ticket is no \
@@ -348,7 +351,7 @@ mod tests {
         let (svc, mut commands) = ops(vec![row("iss-a", "MT-1")]);
         let scheduler = std::thread::spawn(move || match commands.blocking_recv() {
             Some(super::super::Command::Unblock { issue_id, reply }) => {
-                let _ = reply.send(Ok(false));
+                let _ = reply.send(Ok(crate::model::Unblocked::Nothing));
                 issue_id
             }
             other => panic!("expected an unblock, got {other:?}"),

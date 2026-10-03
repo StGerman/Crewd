@@ -1,11 +1,16 @@
-//! Review summaries as findings (#126).
+//! Review summaries and conversation comments as findings (#126, #263).
 //!
 //! Delivery used to read only a pull request's inline comments, so a finding a reviewer put in
 //! a review's summary — Copilot's "Previously missed", or a human's `CHANGES_REQUESTED` with no
 //! line to hang it on — never reached an agent and never held `ready`. Here a summary becomes a
-//! [`ReviewComment`] keyed by its review ([`SUMMARY_PREFIX`]), and from there it has the same
-//! lifecycle as an inline comment: handed back in a round, settled once by a verdict in
-//! `review_verdict`, never re-argued.
+//! [`ReviewComment`] keyed by its review ([`SUMMARY_PREFIX`]), and a comment on the pull
+//! request's conversation one keyed by its id ([`CONVERSATION_PREFIX`]); from there each has the
+//! same lifecycle as an inline comment: handed back in a round, settled once by a verdict in
+//! `review_verdict`, never re-argued. Neither has a thread, so a verdict on one is a comment on
+//! the pull request quoting it.
+//!
+//! Whoever wrote it, except crewd: its own verdict comments land in the same conversation, and
+//! handing one back would have an agent settle its own answer, round after round (#263).
 //!
 //! The summary is handed over whole. Copilot's format is not a published contract, and a parser
 //! for its sections that drifted would drop findings silently; a noisy summary costs one
@@ -16,29 +21,47 @@
 //! counted as one spent a delivery round on every review.
 
 use crate::config::COPILOT_REVIEWER;
-use crate::forge::{Review, ReviewComment, SUMMARY_PREFIX, summary_review_id};
+use crate::forge::{CONVERSATION_PREFIX, CommentKind, Review, ReviewComment, SUMMARY_PREFIX};
 
-/// The summaries on `head` that carry a finding, oldest first: from a login in
-/// `summary_reviewers`, or in the `CHANGES_REQUESTED` state whoever wrote it. A review on an
-/// earlier head was about code a later push replaced, so it is not handed back.
+/// The summaries on `head` that carry a finding, oldest first, from anyone but `own_login`. An
+/// `APPROVED` review is not a request, and a review on an earlier head was about code a later
+/// push replaced, so neither is handed back.
 pub(super) fn summary_findings(
     reviews: &[Review],
     head: &str,
-    summary_reviewers: &[String],
+    own_login: &str,
 ) -> Vec<ReviewComment> {
     reviews
         .iter()
-        .filter(|r| r.commit_sha == head)
-        .filter(|r| r.state == "CHANGES_REQUESTED" || summary_reviewers.contains(&r.reviewer))
+        .filter(|r| r.commit_sha == head && r.reviewer != own_login)
+        .filter(|r| r.state == "COMMENTED" || r.state == "CHANGES_REQUESTED")
         .filter(|r| carries_findings(&r.body, r.reviewer == COPILOT_REVIEWER))
-        .map(|r| ReviewComment {
-            id: format!("{SUMMARY_PREFIX}{}", r.id),
-            author: r.reviewer.clone(),
-            path: None,
-            line: None,
-            body: r.body.clone(),
-            url: r.url.clone(),
-        })
+        .map(summary_comment)
+        .collect()
+}
+
+/// A review's summary as the finding it is handed back as.
+pub(super) fn summary_comment(r: &Review) -> ReviewComment {
+    ReviewComment {
+        id: format!("{SUMMARY_PREFIX}{}", r.id),
+        author: r.reviewer.clone(),
+        path: None,
+        line: None,
+        body: r.body.clone(),
+        url: r.url.clone(),
+    }
+}
+
+/// The conversation's comments as findings, keyed by [`CONVERSATION_PREFIX`], from anyone but
+/// `own_login`. An empty one says nothing to settle.
+pub(super) fn conversation_findings(
+    comments: Vec<ReviewComment>,
+    own_login: &str,
+) -> Vec<ReviewComment> {
+    comments
+        .into_iter()
+        .filter(|c| c.author != own_login && !c.body.trim().is_empty())
+        .map(|c| ReviewComment { id: format!("{CONVERSATION_PREFIX}{}", c.id), ..c })
         .collect()
 }
 
@@ -157,18 +180,25 @@ fn is_section_label(bare: &str) -> bool {
         && words.chars().all(|c| c.is_alphabetic() || c == ' ')
 }
 
-/// What is posted on the pull request when a summary's verdict lands: the verdict, and the
-/// finding it answers quoted, since a summary has no thread for the verdict to sit under.
-/// `review` is `None` when the review is no longer there to quote.
-pub(super) fn verdict_comment(comment_id: &str, review: Option<&Review>, verdict: &str) -> String {
-    let who = review.map_or("the reviewer", |r| r.reviewer.as_str());
-    let id = summary_review_id(comment_id).unwrap_or(comment_id);
-    let mut s = match review.and_then(|r| r.url.as_deref()) {
-        Some(url) => format!("On [the review summary]({url}) by {who}:\n\n"),
-        None => format!("On review {id} by {who}:\n\n"),
+/// What is posted on the pull request when a summary's or a conversation comment's verdict
+/// lands: the verdict, and the finding it answers quoted, since neither has a thread for the
+/// verdict to sit under. `finding` is `None` when it is no longer there to quote.
+pub(super) fn verdict_comment(
+    comment_id: &str,
+    finding: Option<&ReviewComment>,
+    verdict: &str,
+) -> String {
+    let who = finding.map_or("the reviewer", |c| c.author.as_str());
+    let what = match CommentKind::of(comment_id) {
+        CommentKind::Conversation => "the comment",
+        _ => "the review summary",
     };
-    if let Some(r) = review {
-        for line in excerpt(&r.body).lines() {
+    let mut s = match finding.and_then(|c| c.url.as_deref()) {
+        Some(url) => format!("On [{what}]({url}) by {who}:\n\n"),
+        None => format!("On {comment_id} by {who}:\n\n"),
+    };
+    if let Some(c) = finding {
+        for line in excerpt(&c.body).lines() {
             s.push_str(&format!("> {line}\n"));
         }
         s.push('\n');
@@ -177,8 +207,8 @@ pub(super) fn verdict_comment(comment_id: &str, review: Option<&Review>, verdict
     s
 }
 
-/// The start of a summary, bounded: a quote is there to say which finding is answered, and the
-/// review itself is one link away.
+/// The start of a finding, bounded: a quote is there to say which finding is answered, and the
+/// finding itself is one link away.
 fn excerpt(body: &str) -> String {
     const MAX: usize = 600;
     let body = body.trim();
@@ -205,6 +235,7 @@ mod tests {
     }
 
     const COPILOT: &str = COPILOT_REVIEWER;
+    const CREW: &str = "crew-bot[bot]";
 
     #[test]
     fn a_summary_that_is_only_findings_none_carries_no_finding() {
@@ -243,7 +274,7 @@ mod tests {
         assert!(!carries_findings(TEMPLATE, true));
         assert!(!carries_findings("*Review effort:* Lite\n<details open>\n</details>", true));
         let reviews = [review("1", COPILOT, "COMMENTED", "head", TEMPLATE)];
-        assert!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).is_empty());
+        assert!(summary_findings(&reviews, "head", CREW).is_empty());
     }
 
     #[test]
@@ -253,7 +284,7 @@ mod tests {
             "### 🔵 Needs a closer look\n\nThe guard can still judge an older stale head.\n\n",
         );
         let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
-        assert_eq!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).len(), 1);
+        assert_eq!(summary_findings(&reviews, "head", CREW).len(), 1);
         assert!(carries_findings("a < b is <b>still</b> said", true));
     }
 
@@ -268,7 +299,7 @@ mod tests {
             "### 🟢 Approved\n\nThe fail-fast paths are consistently propagated.\n\n",
         );
         let reviews = [review("1", COPILOT, "COMMENTED", "head", &with_template)];
-        assert!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).is_empty());
+        assert!(summary_findings(&reviews, "head", CREW).is_empty());
     }
 
     #[test]
@@ -290,7 +321,7 @@ mod tests {
         let approval = "### 🟢 Approved\nLooks good.\n**Findings:** None";
         assert!(carries_findings(approval, false));
         let reviews = [review("1", "alice", "COMMENTED", "head", approval)];
-        assert_eq!(summary_findings(&reviews, "head", &["alice".to_string()]).len(), 1);
+        assert_eq!(summary_findings(&reviews, "head", CREW).len(), 1);
         assert!(carries_findings(
             "### 🟢 Approved\nLooks good.\n**Findings:** None\n<details>\n\
              <summary>Open (1)</summary>\nRename the guard.\n</details>",
@@ -307,12 +338,11 @@ mod tests {
              </details>\n",
         );
         let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
-        assert_eq!(summary_findings(&reviews, "head", &[COPILOT.to_string()]).len(), 1);
+        assert_eq!(summary_findings(&reviews, "head", CREW).len(), 1);
     }
 
     #[test]
-    fn only_copilot_and_changes_requested_summaries_on_the_head_are_findings() {
-        let reviewers = vec![COPILOT.to_string()];
+    fn a_commented_or_changes_requested_summary_on_the_head_is_a_finding_from_anyone_but_crewd() {
         let reviews = vec![
             review("1", COPILOT, "COMMENTED", "old", "stale finding"),
             review("2", COPILOT, "COMMENTED", "head", "a finding"),
@@ -321,21 +351,42 @@ mod tests {
             review("5", "alice", "APPROVED", "head", "looks fine"),
             review("6", "bob", "CHANGES_REQUESTED", "head", "please split this"),
             review("7", "bob", "CHANGES_REQUESTED", "head", ""),
+            review("8", CREW, "COMMENTED", "head", "crewd's own summary"),
+            review("9", "carol", "DISMISSED", "head", "withdrawn"),
         ];
-        let got = summary_findings(&reviews, "head", &reviewers);
+        let got = summary_findings(&reviews, "head", CREW);
         let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["review-2", "review-6"]);
-        assert_eq!(got[1].author, "bob");
-        assert_eq!(got[1].path, None);
+        assert_eq!(ids, ["review-2", "review-4", "review-6"]);
+        assert_eq!(got[2].author, "bob");
+        assert_eq!(got[2].path, None);
+    }
+
+    #[test]
+    fn conversation_comments_are_findings_keyed_apart_except_crewds_own_and_empty_ones() {
+        let c = |id: &str, author: &str, body: &str| ReviewComment {
+            id: id.into(),
+            author: author.into(),
+            path: None,
+            line: None,
+            body: body.into(),
+            url: None,
+        };
+        let got = conversation_findings(
+            vec![c("1", "alice", "Rename it."), c("2", CREW, "**Accepted**"), c("3", "bob", " ")],
+            CREW,
+        );
+        let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["conversation-1"]);
+        assert_eq!(CommentKind::of(&got[0].id), CommentKind::Conversation);
     }
 
     #[test]
     fn a_verdict_comment_quotes_the_finding_it_answers() {
-        let r = review("9", COPILOT, "COMMENTED", "head", "line one\nline two");
+        let r = summary_comment(&review("9", COPILOT, "COMMENTED", "head", "line one\nline two"));
         let s = verdict_comment("review-9", Some(&r), "**Rejected** — noise.");
         assert!(s.contains("> line one\n> line two\n"), "{s}");
         assert!(s.ends_with("**Rejected** — noise."), "{s}");
         let gone = verdict_comment("review-9", None, "**Rejected** — noise.");
-        assert!(gone.starts_with("On review 9 by the reviewer"), "{gone}");
+        assert!(gone.starts_with("On review-9 by the reviewer"), "{gone}");
     }
 }

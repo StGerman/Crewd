@@ -89,6 +89,13 @@ pub trait Credentials: Send + Sync {
     fn invalidate(&self) -> bool {
         false
     }
+
+    /// A JWT signed as the GitHub App itself, for the one read only the App can make: `GET
+    /// /app`, whose slug names the login every write through this credential carries (#263).
+    /// `None` for a credential that is not an App.
+    fn app_jwt(&self) -> Option<Result<String, CredentialError>> {
+        None
+    }
 }
 
 /// A personal or fine-grained token from `GITHUB_TOKEN`, which does not expire on any scale this
@@ -322,7 +329,8 @@ fn jira_toml_error_message(text: &str, e: &toml::de::Error) -> String {
     }
 }
 
-fn expand_home(path: &Path) -> PathBuf {
+/// `~` and `~/...` against `HOME`; any other path, `~user` included, is returned unchanged.
+pub(crate) fn expand_home(path: &Path) -> PathBuf {
     match (path.strip_prefix("~"), std::env::var_os("HOME")) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => path.to_path_buf(),
@@ -421,6 +429,10 @@ impl<H: Http> Credentials for GithubApp<H> {
     fn invalidate(&self) -> bool {
         *self.cached.lock() = None;
         true
+    }
+
+    fn app_jwt(&self) -> Option<Result<String, CredentialError>> {
+        Some(self.jwt(self.clock.wall()))
     }
 }
 

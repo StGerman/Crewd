@@ -173,6 +173,9 @@ trait ForgeBackend {
     fn holds_open(&self, open: &PullRequest, spec: &PullRequestSpec);
     /// The provider attaches bot `login` (as reviews spell it) when asked to review `pr`.
     fn attaches_bot(&self, pr: &PullRequest, login: &str);
+    /// The credential posts as `login`, and the provider keeps `body` on `pr`'s conversation
+    /// once the forge comments it.
+    fn keeps_comment(&self, pr: &PullRequest, login: &str, body: &str);
 }
 
 struct FakeForgeBackend(FakeForge);
@@ -191,6 +194,8 @@ impl ForgeBackend for FakeForgeBackend {
     fn holds_open(&self, _open: &PullRequest, _spec: &PullRequestSpec) {}
 
     fn attaches_bot(&self, _pr: &PullRequest, _login: &str) {}
+
+    fn keeps_comment(&self, _pr: &PullRequest, _login: &str, _body: &str) {}
 }
 
 struct GithubBackend {
@@ -253,6 +258,16 @@ impl ForgeBackend for GithubBackend {
             }
         } } } })));
     }
+
+    fn keeps_comment(&self, _pr: &PullRequest, login: &str, body: &str) {
+        self.http.push(ok(json!({ "login": login })));
+        self.http.push(ok(json!({ "id": 9 })));
+        self.http.push(ok(json!([{
+            "id": 9,
+            "user": { "login": login },
+            "body": body,
+        }])));
+    }
 }
 
 /// The trait's idempotency contract: the scheduler opens after every run that reports done, and
@@ -298,9 +313,31 @@ fn a_requested_bot_is_listed_as_its_reviews_spell_it(b: &dyn ForgeBackend) {
     assert_eq!(f.review_requests(pr.number).unwrap(), vec![copilot.to_string()], "{}", b.name());
 }
 
+/// #263: delivery tells crewd's verdict comments from a reviewer's by the author `login`
+/// answers, so the conversation must spell the forge's own comment with exactly that login.
+fn the_forges_own_comment_is_written_by_its_login(b: &dyn ForgeBackend) {
+    let f = b.forge();
+    let spec = PullRequestSpec {
+        title: "Do the work".into(),
+        body: String::new(),
+        head: "crew/MT-1".into(),
+        base: "main".into(),
+    };
+    b.will_open(&spec);
+    let pr = f.open_pull_request(&spec).unwrap();
+    b.keeps_comment(&pr, FakeForge::LOGIN, "**Accepted** — resolved in abc1234.");
+    let login = f.login().unwrap();
+    f.comment(pr.number, "**Accepted** — resolved in abc1234.").unwrap();
+    let got = f.conversation_comments(pr.number).unwrap();
+    let authors: Vec<&str> = got.iter().map(|c| c.author.as_str()).collect();
+    assert_eq!(authors, [login.as_str()], "{}", b.name());
+    assert_eq!(login, FakeForge::LOGIN, "{}", b.name());
+}
+
 const FORGE_CASES: &[fn(&dyn ForgeBackend)] = &[
     a_second_open_for_a_head_finds_the_first_and_points_it_at_the_base_asked_for,
     a_requested_bot_is_listed_as_its_reviews_spell_it,
+    the_forges_own_comment_is_written_by_its_login,
 ];
 
 /// Fresh backends per case, so no case can pass on state another left behind.

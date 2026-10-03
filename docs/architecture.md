@@ -468,8 +468,19 @@ it, since with `active_states = ["open"]` the tracker has no state to move it th
 ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
 running, gating (a held claim is phase `running`), retry-queued, quarantined, or parked under a
 delivery still `pending`, `awaiting` or `ready` — which would push or hand back the branch in the
-tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. `Scheduler::unblock`
-also reads the ticket fresh and keeps a park whose ticket is no longer active, since
+tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. A
+`handed_off` delivery is what the same unblock hands back instead (#262): `Store::resume_delivery`
+moves it back to `awaiting` when it was handed off waiting on its pull request, and otherwise
+to `pending`, so a fix run whose push was refused is pushed rather than judged on the old head.
+It forgets the review request and the CI wait so neither is timed from before the handoff, and
+keeps both round counts, so a pull request at `max_rounds_per_pr` is handed off again on its next
+round; the turn budget is checked before any round opens, so one past `max_turns_per_issue` is
+handed off rather than dispatched. The
+answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. Only the unblock
+resumes it: `dispatch_new` keeps a handed-off delivery's park even when its ticket moves between
+active states, since a run dispatched there would restart delivery with its `Done`. `Scheduler::unblock`
+also reads the ticket fresh and keeps a park, or a handoff, whose ticket is no longer active or
+routable, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
 changed into the issue's description first: that is the prompt the next run reads.
 
@@ -564,14 +575,19 @@ before the dispatch gate, at `delivery.poll_interval_ms` — through: push the b
 (`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
 request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
 reviewers on the current head *and read back whether they attached*, read CI, read the review threads — and the
-reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
-current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
-`CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" and Copilot's template
-(headings, tags, the "Review effort" line, section labels; #201), or than the overview sentence
-under Copilot's `🟢 Approved` status that also says "Findings: None" (#234), is handed back whole
-as one more comment keyed `review-<id>`: no parser for its sections, whose format is nobody's
-contract, and noise costs one `rejected` verdict, posted as a pull request comment since a
-summary has no thread. A red CI or
+reviews' summaries and the conversation, since a reviewer can leave a finding on no line (#126,
+#263). Every comment is worked whoever wrote it, except crewd itself: its verdict comments land
+in the same conversation, so the login the forge posts as is learned when delivery is attached
+(`GET /app`'s slug as `<slug>[bot]` for an App, `GET /user` for a token), and startup fails if it
+cannot be. A summary on the current head in the `COMMENTED` or `CHANGES_REQUESTED` state that
+says more than "Findings: None" and Copilot's template (headings, tags, the "Review effort" line,
+section labels; #201), or than the overview sentence under Copilot's `🟢 Approved` status that
+also says "Findings: None" (#234), is handed back whole as one more comment keyed `review-<id>`:
+no parser for its sections, whose format is nobody's contract, and noise costs one `rejected`
+verdict. A conversation comment is handed back keyed `conversation-<id>`, whenever it was written:
+GitHub records no time a head was pushed, a commit's date is not one, and a cutoff would drop a
+comment nobody answered (#265). Neither has a thread, so a verdict on either is a pull request comment
+quoting it. The round prompt names each comment's kind and author. A red CI or
 an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
 due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 `Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".
@@ -611,8 +627,10 @@ that reset with the pull request would bound nothing (the same gap `max_calls_pe
 closes for the broker). At either bound the pull request is handed to the operator with the
 outstanding items named. A review request is followed by a read of the outstanding review
 requests (`Forge::review_requests`, GraphQL `reviewRequests` on GitHub) and the reviews, because
-GitHub answers a REST request for a bot reviewer with `200` and attaches nobody (GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
-issue's row, not a success. `Forge` has no `merge` method, and must not grow one — merging is
+GitHub answers a REST request for a bot reviewer with `200` and attaches nobody (GETT-174120); a person or team request that verifiably attached nobody is a handoff with that
+reason on the issue's row, not a success. A bot's request is waited for like an attached one, with the
+issue's row telling the operator to request it: an App has no Copilot seat, so crew-bot's
+request for Copilot is accepted and attaches nobody, and only a person can make it (#252). `Forge` has no `merge` method, and must not grow one — merging is
 the operator's, and the trait's shape is what enforces it. And a delivery step only runs for an
 issue nothing else owns (phase `released`, no live run), so a push cannot land under a running
 agent and a hand-back cannot race a dispatch. A branch whose work sits on another issue's branch
@@ -710,6 +728,24 @@ to reach for the ambient one, and every write it makes through the front door is
 Do not restate this as "the worker cannot reach a credential"; it is the weaker of the two
 options issue #4 offered, and it was chosen because the stronger one is not true on this
 platform.
+
+## Deployments
+
+A **deployment** is one directory holding a config, its `crew.db`, its log and its `workspaces/`,
+pointing at the repository's clone by absolute path. Everything a running crewd owns is in that
+directory, so two deployments on one host share nothing but the clone (and must still pick their
+own `api.bind`/`api.mcp_bind`). Writing one per deployment under `~/.crewd/` is #247; `crewd
+init` today writes only the GitHub App files.
+
+What makes the directory the unit rather than the shell that started crewd is `Config::parse`
+(#251): every path key (`workspace.repo`, `workspace.root`, `transcripts.root`,
+`tracker.github_app`, `forge.github_app`, `tracker.jira.credentials`) has `~` expanded and is then
+resolved against the config file's directory, and the store defaults to `crew.db` beside the
+config (`config::store_path`). Resolved against the current directory instead, `crewd --config
+~/.crewd/acme-api/crewd.toml` started from `$HOME` opened a fresh, empty store there and took
+`$HOME` for the clone. `CREW_DB` still overrides the store and, like any path given in the
+environment or on the command line, means what it says relative to the shell that set it. This
+repository's own run is unchanged: `crew.github.toml` sits at the root it is started from.
 
 ## Running the daemon inside a worktree
 

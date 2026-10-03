@@ -184,8 +184,7 @@ async fn main() -> anyhow::Result<()> {
     // one root-certificate set rather than each reading the environment for their own.
     let http = UreqHttp::from_env().context("building the HTTPS client")?;
 
-    let db_path =
-        std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
+    let db_path = crew::config::store_path(&args.config, std::env::var_os("CREW_DB"));
     // Before the store is opened and before the first tick's `recover`. A second process on
     // this file must exit here rather than release claims a live daemon still holds (#217).
     let _store_lock = StoreLock::acquire(&db_path)?;
@@ -382,7 +381,9 @@ async fn main() -> anyhow::Result<()> {
     sched.set_transcripts(transcripts);
     sched.set_gate(gate);
     if let Some((forge, publisher)) = delivery {
-        sched.set_delivery(Some(forge), Some(publisher));
+        sched
+            .set_delivery(Some(forge), Some(publisher))
+            .context("delivery on: could not learn the login the forge posts as")?;
     }
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
@@ -464,8 +465,8 @@ async fn main() -> anyhow::Result<()> {
                     // outage; a keypress must not take the daemon down with it.
                     UiAction::Unblock(id) => {
                         match sched.unblock(&id) {
-                            Ok(cleared) => tracing::info!(issue_id = %id, cleared, "operator lifted a park"),
-                            Err(e) => tracing::error!(issue_id = %id, error = %e, "unblock failed; the park is kept"),
+                            Ok(done) => tracing::info!(issue_id = %id, unblocked = ?done, "operator unblocked"),
+                            Err(e) => tracing::error!(issue_id = %id, error = %e, "unblock failed; the park or handoff is kept"),
                         }
                         let _ = snap_tx.send(sched.snapshot()?);
                     }
@@ -493,8 +494,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Command::Unblock { issue_id, reply } => {
                         let cleared = sched.unblock(&issue_id);
-                        if let Ok(c) = &cleared {
-                            tracing::info!(issue_id = %issue_id, cleared = c, "api lifted a park");
+                        if let Ok(done) = &cleared {
+                            tracing::info!(issue_id = %issue_id, unblocked = ?done, "api unblocked");
                         }
                         if let Ok(s) = sched.snapshot() { let _ = snap_tx.send(s); }
                         let _ = reply.send(cleared);

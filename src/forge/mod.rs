@@ -126,6 +126,38 @@ pub fn summary_review_id(comment_id: &str) -> Option<&str> {
     comment_id.strip_prefix(SUMMARY_PREFIX)
 }
 
+/// The prefix that marks a [`ReviewComment`] id as a comment on the pull request's conversation
+/// (#263). Like a summary it has no thread, so its verdict is posted as a comment quoting it;
+/// and conversation comments are a third id space on the provider, so the prefix keeps them
+/// from colliding with inline comments and reviews in `review_verdict`.
+pub const CONVERSATION_PREFIX: &str = "conversation-";
+
+/// The conversation comment id a finding's key names, or `None` for any other kind.
+pub fn conversation_comment_id(comment_id: &str) -> Option<&str> {
+    comment_id.strip_prefix(CONVERSATION_PREFIX)
+}
+
+/// Which of the pull request's comment kinds a finding's key names: what the agent's prompt
+/// calls it, and whether settling it resolves a thread or posts a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentKind {
+    Inline,
+    Summary,
+    Conversation,
+}
+
+impl CommentKind {
+    pub fn of(comment_id: &str) -> Self {
+        if summary_review_id(comment_id).is_some() {
+            CommentKind::Summary
+        } else if conversation_comment_id(comment_id).is_some() {
+            CommentKind::Conversation
+        } else {
+            CommentKind::Inline
+        }
+    }
+}
+
 /// The CI verdict for one head commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CiStatus {
@@ -191,6 +223,17 @@ pub trait Forge: Send + Sync {
     fn reviews(&self, number: u64) -> Result<Vec<Review>, ForgeError>;
 
     fn ci_status(&self, head_sha: &str) -> Result<CiStatus, ForgeError>;
+
+    /// The login what this forge posts is attributed to, spelled as [`Forge::reviews`] and the
+    /// comment reads spell an author: `<slug>[bot]` for a GitHub App. Read once, when delivery is
+    /// attached, so its own replies, summaries and verdict comments are never handed back to an
+    /// agent as a reviewer's (#263).
+    fn login(&self) -> Result<String, ForgeError>;
+
+    /// Every comment on the pull request's own conversation, oldest first, with the provider's
+    /// ids unprefixed. Not cut at the head: GitHub records no time a head was pushed, and a
+    /// commit's own date is not one (#265), so a cutoff would drop a comment nobody answered.
+    fn conversation_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError>;
 
     /// Top-level review comments, oldest first.
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError>;

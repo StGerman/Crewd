@@ -34,9 +34,12 @@
 //!
 //! A review request is followed by a read. GitHub answers a request for a bot reviewer with
 //! `200` and attaches nobody (GETT-174120), so the provider's own answer is not evidence; the
-//! pull request's outstanding requests and its posted reviews are. A request that verifiably
-//! attached nobody is a handoff with that reason, reported on the issue's row — never a quiet
-//! success that leaves a pull request nobody will look at.
+//! pull request's outstanding requests and its posted reviews are. A person or team request
+//! that verifiably attached nobody is a handoff with that reason, reported on the issue's row —
+//! never a quiet success that leaves a pull request nobody will look at. A bot's request is the one
+//! waiting can fix: an App has no Copilot seat, so only a person can request Copilot, and the
+//! pull request waits for that review with the issue's row telling the operator to request it
+//! (#252). It is never ready in between.
 //!
 //! And it is per head. A fix round pushes a new head to the same pull request, and a reviewer
 //! verified against the old one has not seen it; so a head the request was not made on is
@@ -50,14 +53,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::review_summary::{summary_findings, verdict_comment};
+use super::review_summary::{
+    conversation_findings, summary_comment, summary_findings, verdict_comment,
+};
 use super::{Gating, Running, Scheduler, log_tracker_failure};
 use crate::clock::{Clock, Mono, Wall};
 use crate::forge::{
-    CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, Synced,
-    summary_review_id,
+    CiStatus, CommentKind, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review,
+    ReviewComment, Synced, conversation_comment_id, summary_review_id,
 };
-use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Verdict};
+use crate::model::{Feedback, Issue, Outcome, ReviewVerdict, Unblocked, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState, PushedHead};
 use crate::worker::{KillResult, Progress, RunHandle};
 
@@ -125,13 +130,22 @@ impl Scheduler {
     /// Attach the forge and the publisher. A setter, like the broker's: optional by nature,
     /// and every caller without it — the scheduler's whole existing test suite — is correct
     /// without it. `delivery.enabled` in the config is what turns the attached pair on.
+    ///
+    /// Asks the forge which login it posts as, and fails if it cannot say: without it delivery
+    /// cannot tell its own verdict comments from a reviewer's and would hand them back (#263),
+    /// so `main` exits at startup naming the failure rather than delivering without it.
     pub fn set_delivery(
         &mut self,
         forge: Option<std::sync::Arc<dyn Forge>>,
         publisher: Option<std::sync::Arc<dyn crate::forge::Publisher>>,
-    ) {
+    ) -> Result<(), ForgeError> {
+        self.own_login = match &forge {
+            Some(f) => f.login()?,
+            None => String::new(),
+        };
         self.forge = forge;
         self.publisher = publisher;
+        Ok(())
     }
 
     pub(super) fn delivery_on(&self) -> bool {
@@ -263,6 +277,33 @@ impl Scheduler {
                 Ok(())
             }
         }
+    }
+
+    /// The operator's unblock of a handed-off delivery (#262): `None` when the issue has none,
+    /// so the unblock goes on to its park. Never resumed by anything else — not a restart, not a
+    /// cause that looks fixed — since only the operator knows the handoff's cause is gone.
+    ///
+    /// The in-memory waits go with the persisted ones [`Store::resume_delivery`] clears, or the
+    /// first poll would time the CI or review wait from before the handoff and hand it off
+    /// again; the poll timer goes too, so that poll is the next tick's.
+    ///
+    /// [`Store::resume_delivery`]: crate::store::Store::resume_delivery
+    pub(super) fn resume_delivery(&mut self, issue_id: &str) -> anyhow::Result<Option<Unblocked>> {
+        let handed_off =
+            self.store.delivery(issue_id)?.is_some_and(|d| d.stage == DeliveryStage::HandedOff);
+        if !handed_off || !self.delivery_on() {
+            return Ok(None);
+        }
+        if !self.store.resume_delivery(self.clock.as_ref(), issue_id)? {
+            return Ok(Some(Unblocked::Nothing));
+        }
+        self.delivery_polled.remove(issue_id);
+        self.ci_waits.remove(issue_id);
+        self.review_waits.remove(issue_id);
+        let d = self.store.delivery(issue_id)?;
+        let pr_url = d.as_ref().and_then(|d| d.pr_url.clone());
+        tracing::info!(issue_id, stage = ?d.map(|d| d.stage), pr = ?pr_url, "operator resumed a handed-off delivery");
+        Ok(Some(Unblocked::Delivery { pr_url }))
     }
 
     /// The operator merged or closed the pull request, which ends the delivery however it got
@@ -514,13 +555,37 @@ impl Scheduler {
             CiStatus::Success => {}
         }
 
-        // Inline comments, then the findings reviewers left only in a review's summary (#126):
-        // both are settled by the same verdict table, so a summary is handed back once and a
-        // review arriving after `ready` takes the pull request out of it.
+        // Inline comments, then the findings left only in a review's summary (#126) or on the
+        // conversation (#263), whoever wrote them but crewd: all are settled by the same verdict
+        // table, so each is handed back once and one arriving after `ready` takes the pull
+        // request out of it.
         let settled = self.store.verdicts_for(issue_id)?;
         let reviews = forge.reviews(number)?;
+        // The review the operator was told to request has arrived, whoever requested it: the
+        // note is done, and left on the row it would tell them to request it still (#252). The
+        // row's note is cleared first: `review_error` is what finds this again, so a kill between
+        // the two writes is finished on the next poll.
+        if let Some(note) = &d.review_error
+            && self.cfg.delivery.reviewers.iter().all(|r| reviewed_head(&reviews, r, &pr.head_sha))
+        {
+            tracing::info!(issue_id, pr = number, head = %pr.head_sha, "the review the operator was asked to request has arrived");
+            if st.last_error.as_ref() == Some(note) {
+                self.store.clear_note(clock.as_ref(), issue_id)?;
+            }
+            self.store.set_review_requested(
+                clock.as_ref(),
+                issue_id,
+                &pr.head_sha,
+                &d.review_reviewers,
+                None,
+            )?;
+        }
+        let own = self.own_login.clone();
         let mut open = forge.review_comments(number)?;
-        open.extend(summary_findings(&reviews, &pr.head_sha, &self.cfg.delivery.summary_reviewers));
+        open.retain(|c| c.author != own);
+        open.extend(summary_findings(&reviews, &pr.head_sha, &own));
+        let conversation = forge.conversation_comments(number)?;
+        open.extend(conversation_findings(conversation, &own));
         open.retain(|c| !settled.contains_key(&c.id));
         if !open.is_empty() {
             let handed_before: Vec<String> = d
@@ -536,10 +601,11 @@ impl Scheduler {
             let ids: Vec<String> = open.iter().map(|c| c.id.clone()).collect();
             let named: Vec<String> = open
                 .iter()
-                .map(|c| match &c.path {
-                    Some(p) => format!("{} ({p})", c.id),
-                    None if summary_review_id(&c.id).is_some() => format!("{} (summary)", c.id),
-                    None => c.id.clone(),
+                .map(|c| match (&c.path, CommentKind::of(&c.id)) {
+                    (Some(p), _) => format!("{} ({p})", c.id),
+                    (None, CommentKind::Summary) => format!("{} (summary)", c.id),
+                    (None, CommentKind::Conversation) => format!("{} (conversation)", c.id),
+                    (None, CommentKind::Inline) => c.id.clone(),
                 })
                 .collect();
             let fb = Feedback::Review { pr_url: pr.url.clone(), comments: open, unanswered_before };
@@ -623,9 +689,10 @@ impl Scheduler {
     }
 
     /// Request a review of `pr`'s head from every expected reviewer who has not already given
-    /// one, then read back whether each attached; `true` when one did not and the pull request
-    /// was handed off for it. A refused request names its reviewer in the error, so the handoff
-    /// it becomes says who could not be asked (#222).
+    /// one, then read back whether each attached; `true` when a person or team did not and the
+    /// pull request was handed off for it. A bot that did not attach is waited for as if it had,
+    /// with the operator told to request it (#252). A refused request names its reviewer in the
+    /// error, so the handoff it becomes says who could not be asked (#222).
     fn request_reviews(&mut self, issue_id: &str, pr: &PullRequest) -> Result<bool, StepError> {
         let forge = self.forge.clone().expect("checked by delivery_on");
         let clock = self.clock.clone();
@@ -648,14 +715,30 @@ impl Scheduler {
             .filter(|r| !requested.contains(r) && !reviewed_head(&reviews, r, &pr.head_sha))
             .map(String::as_str)
             .collect();
-        if missing.is_empty() {
-            tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, reviewers = ?reviewers, "review requested and verified attached");
+        // A bot that attached nobody is one crew-bot may not ask: an App has no Copilot seat, so
+        // only a person can request Copilot (#252). Its review is still what delivery waits for,
+        // so the operator is told to request it. A person or team that attached nobody is a
+        // wrong login, which no wait fixes.
+        let (bots, people): (Vec<&str>, Vec<&str>) =
+            missing.iter().partition(|r| r.ends_with("[bot]"));
+        if people.is_empty() {
+            let note =
+                (!bots.is_empty()).then(|| format!("request {} on {}", bots.join(", "), pr.url));
+            match &note {
+                Some(note) => {
+                    tracing::warn!(issue_id, pr = pr.number, head = %pr.head_sha, url = %pr.url, missing = ?bots, "review request did not attach; waiting for the operator to {note}");
+                    self.store.note_error(clock.as_ref(), issue_id, note)?;
+                }
+                None => {
+                    tracing::info!(issue_id, pr = pr.number, head = %pr.head_sha, reviewers = ?reviewers, "review requested and verified attached");
+                }
+            }
             self.store.set_review_requested(
                 clock.as_ref(),
                 issue_id,
                 &pr.head_sha,
                 &reviewers,
-                None,
+                note.as_deref(),
             )?;
             if self.review_waits.get(issue_id).is_none_or(|(head, _)| *head != pr.head_sha) {
                 self.review_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), clock.mono()));
@@ -768,7 +851,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Whether either round bound is reached, handing the pull request to the operator if so.
+    /// Whether either round bound or the issue's turn budget is reached, handing the pull
+    /// request to the operator if so. The budget is checked here because a round is dispatched
+    /// through a retry row, and neither `dispatch_due_retries` nor `launch` reads
+    /// `cumulative_turns`: without it a round, or an unblock's resumed delivery, would start an
+    /// agent past `max_turns_per_issue` (#262).
     fn rounds_spent(
         &mut self,
         issue_id: &str,
@@ -776,13 +863,19 @@ impl Scheduler {
         what: &str,
     ) -> Result<bool, StepError> {
         let cfg = &self.cfg.delivery;
-        if d.rounds_pr < cfg.max_rounds_per_pr && d.rounds_issue < cfg.max_rounds_per_issue {
+        let budget = self.cfg.agent.max_turns_per_issue;
+        let turns = self.store.get(issue_id)?.map_or(0, |st| st.cumulative_turns);
+        let reason = if turns >= budget {
+            format!("turn budget exhausted ({turns} of {budget} turns on this issue); {what}")
+        } else if d.rounds_pr >= cfg.max_rounds_per_pr || d.rounds_issue >= cfg.max_rounds_per_issue
+        {
+            format!(
+                "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
+                d.rounds_pr, d.rounds_issue
+            )
+        } else {
             return Ok(false);
-        }
-        let reason = format!(
-            "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
-            d.rounds_pr, d.rounds_issue
-        );
+        };
         tracing::warn!(issue_id, pr = ?d.pr_number, "{reason}; handing off");
         self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
         Ok(true)
@@ -930,8 +1023,9 @@ impl Scheduler {
         let settled = self.store.verdicts_for(issue_id)?;
         let mut unapplied: Vec<ReviewVerdict> = Vec::new();
         let mut failure: Option<ForgeError> = None;
-        // Read once, and only if a summary is answered: its verdict quotes the finding.
+        // Each read once, and only if a finding of its kind is answered: the verdict quotes it.
         let mut reviews: Option<Result<Vec<Review>, ForgeError>> = None;
+        let mut conversation: Option<Result<Vec<ReviewComment>, ForgeError>> = None;
         for v in verdicts {
             if settled.contains_key(&v.comment_id) {
                 // Settled by an earlier round; the first verdict stands and is not re-argued.
@@ -941,15 +1035,28 @@ impl Scheduler {
                 Verdict::Accepted => format!("**Accepted** — resolved in {}.", v.detail),
                 Verdict::Rejected => format!("**Rejected** — {}", v.detail),
             };
-            let posted = match summary_review_id(&v.comment_id) {
-                // A summary has no thread to reply on, so the verdict goes on the pull request.
-                Some(review_id) => match reviews.get_or_insert_with(|| forge.reviews(pr.number)) {
-                    Ok(all) => {
-                        let r = all.iter().find(|r| r.id == review_id);
-                        forge.comment(pr.number, &verdict_comment(&v.comment_id, r, &body))
-                    }
+            // A summary or a conversation comment has no thread to reply on, so the verdict goes
+            // on the pull request.
+            let finding = if let Some(review_id) = summary_review_id(&v.comment_id) {
+                Some(match reviews.get_or_insert_with(|| forge.reviews(pr.number)) {
+                    Ok(all) => Ok(all.iter().find(|r| r.id == review_id).map(summary_comment)),
                     Err(e) => Err(e.clone()),
-                },
+                })
+            } else if let Some(id) = conversation_comment_id(&v.comment_id) {
+                let read =
+                    conversation.get_or_insert_with(|| forge.conversation_comments(pr.number));
+                Some(match read {
+                    Ok(all) => Ok(all.iter().find(|c| c.id == id).cloned()),
+                    Err(e) => Err(e.clone()),
+                })
+            } else {
+                None
+            };
+            let posted = match finding {
+                Some(Ok(c)) => {
+                    forge.comment(pr.number, &verdict_comment(&v.comment_id, c.as_ref(), &body))
+                }
+                Some(Err(e)) => Err(e),
                 None => forge.reply(pr.number, &v.comment_id, &body),
             };
             match posted {
@@ -998,8 +1105,9 @@ impl Scheduler {
             .store
             .unresolved_verdicts(issue_id, number)?
             .into_iter()
-            .partition(|c| summary_review_id(c).is_some());
-        // A review's summary has no thread; its verdict's comment is all there is to see.
+            .partition(|c| CommentKind::of(c) != CommentKind::Inline);
+        // A summary or a conversation comment has no thread; its verdict's comment is all there
+        // is to see.
         for s in summaries {
             self.store.mark_thread_resolved(self.clock.as_ref(), issue_id, &s)?;
         }
