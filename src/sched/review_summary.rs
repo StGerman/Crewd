@@ -17,8 +17,9 @@
 //! `rejected` verdict instead. The only text recognised is the one that says there is nothing:
 //! a body that is "Findings: None" once Copilot's template is set aside — headings, HTML
 //! comments and tags, the "Review effort" line, and its section labels (#201). Any prose left
-//! over is a finding, except the overview sentence of Copilot's approval (#234); a template line
-//! counted as one spent a delivery round on every review.
+//! over is a finding, except the overview sentence under Copilot's status heading, whatever its
+//! emoji, when the count says there is none (#234, #280); a template line counted as one spent a
+//! delivery round on every review.
 
 use crate::config::COPILOT_REVIEWER;
 use crate::forge::{CONVERSATION_PREFIX, CommentKind, Review, ReviewComment, SUMMARY_PREFIX};
@@ -65,14 +66,15 @@ pub(super) fn conversation_findings(
         .collect()
 }
 
-/// Whether `body` says anything beyond "Findings: None". The one prose allowed is the overview
-/// sentence under Copilot's approval (`🟢 Approved`), before a "Findings: None" line, and only
-/// when `from_copilot`: that sentence is on every approval, and handing it back spent a delivery
-/// round on each (#234). A second line of prose, prose under any other status or after the
-/// count, anything in another section, and the same heading from any other reviewer still count.
+/// Whether `body` says anything beyond "Findings: None" (or "0"). The one prose allowed is the
+/// overview sentence under Copilot's status heading (`🟢 Approved`, `🔵 Needs a closer look`,
+/// `🟡 Changes recommended`, any status emoji), before that count, and only when `from_copilot`:
+/// that sentence is on every summary, and handing it back spent a delivery round on each (#234,
+/// #280). A second line of prose, prose under any other heading or after the count, anything in
+/// another section, and the same heading from any other reviewer still count.
 fn carries_findings(body: &str, from_copilot: bool) -> bool {
     let mut in_html_comment = false;
-    let mut under_approval = false;
+    let mut under_status = false;
     let mut says_none = false;
     let mut overview = false;
     for line in body.lines() {
@@ -107,18 +109,19 @@ fn carries_findings(body: &str, from_copilot: bool) -> bool {
             continue;
         }
         if let Some(heading) = text.strip_prefix('#') {
-            under_approval = from_copilot && bare(heading.trim_start_matches('#')) == "🟢 approved";
+            under_status =
+                from_copilot && is_status_heading(&bare(heading.trim_start_matches('#')));
             continue;
         }
         let bare = bare(text);
         if text.starts_with('<') {
             // A `<details>` block is a section of its own, never the overview.
-            under_approval = false;
+            under_status = false;
         }
-        if bare == "findings: none" {
+        if bare == "findings: none" || bare == "findings: 0" {
             says_none = true;
             // The overview precedes the count; prose after it is something else.
-            under_approval = false;
+            under_status = false;
             continue;
         }
         let template = bare.is_empty()
@@ -129,12 +132,22 @@ fn carries_findings(body: &str, from_copilot: bool) -> bool {
             continue;
         }
         // The overview is one sentence; a second line is something else.
-        if !under_approval || overview {
+        if !under_status || overview {
             return true;
         }
         overview = true;
     }
     overview && !says_none
+}
+
+/// Whether `bare` is the heading Copilot puts its verdict under: a status emoji, then words, as
+/// in "🟢 approved" or "🔵 needs a closer look".
+fn is_status_heading(bare: &str) -> bool {
+    const STATUS: [char; 9] = ['🟢', '🔵', '🟡', '🟠', '🔴', '🟣', '🟤', '⚪', '⚫'];
+    let mut chars = bare.chars();
+    chars.next().is_some_and(|c| STATUS.contains(&c))
+        && chars.as_str().starts_with(' ')
+        && chars.as_str().trim().chars().all(|c| c.is_alphabetic() || c == ' ')
 }
 
 /// `text` as compared against the template: tags and emphasis gone, the curly apostrophe
@@ -278,14 +291,56 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_with_an_overview_sentence_is_still_a_finding() {
-        let body = TEMPLATE.replace(
-            "### 🟢 Approved\n\n",
-            "### 🔵 Needs a closer look\n\nThe guard can still judge an older stale head.\n\n",
-        );
+    fn a_summary_with_an_overview_sentence_and_a_count_is_still_a_finding() {
+        let body = TEMPLATE
+            .replace(
+                "### 🟢 Approved\n\n",
+                "### 🔵 Needs a closer look\n\nThe guard can still judge an older stale head.\n\n",
+            )
+            .replace("**Findings:** None", "**Findings:** 1");
         let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
         assert_eq!(summary_findings(&reviews, "head", CREW).len(), 1);
         assert!(carries_findings("a < b is <b>still</b> said", true));
+    }
+
+    /// #258's last delivery round was spent on this summary, review 5400835744, as posted (#280).
+    const NEEDS_A_CLOSER_LOOK: &str = "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n\
+        ### 🔵 Needs a closer look\n\nCredential-backed provisioning and changes to delivery’s CI \
+        decisions warrant final human validation.\n\n**Review effort:** Balanced  \n\
+        **Findings:** None\n";
+
+    #[test]
+    fn a_needs_a_closer_look_summary_with_no_findings_opens_no_round() {
+        let reviews = [review("5400835744", COPILOT, "COMMENTED", "head", NEEDS_A_CLOSER_LOOK)];
+        assert!(summary_findings(&reviews, "head", CREW).is_empty());
+        for status in ["🟡 Changes recommended", "🟢 Approved", "🔴 Something new"] {
+            let body = NEEDS_A_CLOSER_LOOK.replace("🔵 Needs a closer look", status);
+            assert!(!carries_findings(&body, true), "{status}");
+        }
+        let zero = NEEDS_A_CLOSER_LOOK.replace("**Findings:** None", "**Findings:** 0");
+        assert!(!carries_findings(&zero, true));
+        let with_template = TEMPLATE.replace(
+            "### 🟢 Approved\n\n",
+            "### 🔵 Needs a closer look\n\nThe guard can still judge an older stale head.\n\n",
+        );
+        assert!(!carries_findings(&with_template, true));
+        // From anyone but Copilot, the same body is read whole.
+        assert!(carries_findings(NEEDS_A_CLOSER_LOOK, false));
+    }
+
+    #[test]
+    fn a_summary_with_a_previously_missed_item_still_opens_a_round() {
+        let body = NEEDS_A_CLOSER_LOOK.to_string()
+            + "\n<details>\n<summary><strong>Previously missed (1)</strong></summary>\n\n\
+               In code that hasn’t changed since last review\n\n<details>\n<summary>\
+               <picture><img src=\"low.png\" alt=\"Low severity\"></picture> ci_status \
+               collapses checks from two workflows</summary>\n\n`src/forge/github.rs:612`\n\
+               </details>\n</details>\n";
+        let reviews = [review("1", COPILOT, "COMMENTED", "head", &body)];
+        assert_eq!(summary_findings(&reviews, "head", CREW).len(), 1);
+        let second_line =
+            NEEDS_A_CLOSER_LOOK.replace("validation.\n\n", "validation.\n\nRename the guard.\n\n");
+        assert!(carries_findings(&second_line, true));
     }
 
     /// PR #229's round 3 of 3 was spent on this summary (#234).
