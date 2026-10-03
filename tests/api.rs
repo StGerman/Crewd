@@ -360,25 +360,99 @@ async fn a_forced_refresh_advances_the_tick_count_by_exactly_one() {
 
 /// docs/api-v1.md promises `500` for a refresh whose tick failed (#245). A tick that stops on
 /// `?` leaves `last_error` unset, so an answer built from the snapshot alone reads as a `200`.
-/// The trigger fails the claim's write while every read the snapshot makes still works.
+/// The trigger fails `Store::ensure`'s `INSERT`, the first write a dispatch makes, while every
+/// read the snapshot makes still works.
 #[tokio::test]
 async fn a_refresh_whose_tick_fails_answers_500_and_still_publishes() {
     let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
     rusqlite::Connection::open(&h.db)
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER refuse_claims BEFORE INSERT ON issue_state
-             BEGIN SELECT RAISE(ABORT, 'claims refused by the test'); END;",
+            "CREATE TRIGGER refuse_ensure BEFORE INSERT ON issue_state
+             BEGIN SELECT RAISE(ABORT, 'ensure refused by the test'); END;",
         )
         .unwrap();
 
     let (status, body) = h.request("POST", "/api/v1/refresh").await;
     assert_eq!(status, 500, "body was {body}");
-    assert!(body["error"].as_str().unwrap().contains("claims refused"), "body was {body}");
+    assert!(body["error"].as_str().unwrap().contains("ensure refused"), "body was {body}");
 
     let (status, snap) = h.request("GET", "/api/v1/snapshot").await;
     assert_eq!(status, 200);
     assert_eq!(snap["ticks"], 1, "the failed tick still published what it reached");
+}
+
+/// One line per key path of a JSON answer, `path: type`, sorted, with a list's element at the
+/// path plus `[]`: the walk `libcrew`'s snapshot shape guard pins `Snapshot` with.
+fn shape(path: &str, v: &Value, out: &mut Vec<String>) {
+    let ty = match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "integer",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    if !path.is_empty() {
+        out.push(format!("{path}: {ty}"));
+    }
+    match v {
+        Value::Object(map) => map.iter().for_each(|(k, child)| {
+            shape(&if path.is_empty() { k.clone() } else { format!("{path}.{k}") }, child, out)
+        }),
+        Value::Array(items) => items.iter().for_each(|i| shape(&format!("{path}[]"), i, out)),
+        _ => {}
+    }
+}
+
+/// The v1 promise (docs/api-v1.md) covers the action answer and the error body as well as
+/// `Snapshot` (#275): renaming `identifier` or `issue_ids`, or dropping a key, rewrites a line
+/// of this snapshot, and that diff is the review question "does this need `/api/v2`?".
+#[tokio::test]
+async fn the_v1_action_and_error_answers_only_grow() {
+    let mut twin = issue(2, "In Progress");
+    twin.identifier = "MT-1".into();
+    let mut h = Harness::new(vec![issue(1, "In Progress"), twin]).await;
+    h.tick();
+
+    let mut answers = Vec::new();
+    for (method, path, want) in [
+        ("POST", "/api/v1/unquarantine/iss-1", 200),
+        ("POST", "/api/v1/unblock/iss-2", 200),
+        ("POST", "/api/v1/unblock/MT-1", 409),
+        ("GET", "/api/v1/issues/MT-404", 404),
+        ("GET", "/api/v1/refresh", 405),
+        ("GET", "/metrics", 404),
+    ] {
+        let (status, body) = h.request(method, path).await;
+        assert_eq!(status, want, "{method} {path}: {body}");
+        answers.push((format!("{method} {path}"), status, body));
+    }
+    assert_eq!(answers[0].2["identifier"], "MT-1", "the action answer names the identifier");
+    assert_eq!(answers[1].2["identifier"], "MT-1");
+
+    let mut failing = Harness::new(vec![issue(1, "In Progress")]).await;
+    rusqlite::Connection::open(&failing.db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_ensure BEFORE INSERT ON issue_state
+             BEGIN SELECT RAISE(ABORT, 'ensure refused by the test'); END;",
+        )
+        .unwrap();
+    let (status, body) = failing.request("POST", "/api/v1/refresh").await;
+    assert_eq!(status, 500, "{body}");
+    answers.push(("POST /api/v1/refresh".into(), status, body));
+
+    let mut out = Vec::new();
+    for (request, status, body) in answers {
+        let mut lines = Vec::new();
+        shape("", &body, &mut lines);
+        lines.sort();
+        lines.dedup();
+        out.push(format!("{request} -> {status}\n  {}", lines.join("\n  ")));
+    }
+    insta::assert_snapshot!(out.join("\n"));
 }
 
 #[tokio::test]

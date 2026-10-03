@@ -25,8 +25,12 @@ JSON type, whether it may be `null`, and every enum spelling, as an `insta` snap
 removing a field fails it; adding one changes the snapshot visibly, and that diff is where a
 reviewer asks whether the change is an addition. `a_v1_payload_from_before_any_addition_still_reads`
 reads a v1 payload frozen when this promise was made, with every optional field `null`, so a field
-that does not read when absent, or an optional one made required, fails it. The meanings below
-are kept by review, not by those tests.
+that does not read when absent, or an optional one made required, fails it.
+`a_v1_snapshot_key_that_stops_serializing_fails_the_shape_guard` holds a `null` key to the same
+promise: read back and written again, that payload must still carry every key it had, so a
+`skip_serializing_if` on an existing field fails it. `the_v1_action_and_error_answers_only_grow`
+in [tests/api.rs](../tests/api.rs) pins the action answer and the error body below the same way,
+over a real socket. The meanings below are kept by review, not by those tests.
 
 Out of this promise: the store schema, the MCP tools' argument shapes beyond what these routes
 already promise, the text of an `error` or `detail` message, and the order of `rows`.
@@ -93,7 +97,7 @@ milliseconds where named `_ms`. "Optional" means the key is always present and m
 | `issue_id` | string | The dispatch id, unique |
 | `identifier` | string | The tracker's identifier, not guaranteed unique |
 | `title` | string | The issue's title; empty until the daemon has read the issue since it started, as in the snapshot published before the first tick |
-| `url` | optional string | The issue in the tracker; `null` on the same terms as an empty `title` |
+| `url` | optional string | The issue in the tracker; `null` while `title` is empty, and after it too when the tracker gave the issue no URL |
 | `tracker_state` | string | The tracker's state for it; empty on the same terms as `title` |
 | `phase` | string | The claim state: `queued`, `running`, `retry`, `quarantine` or `released` |
 | `attempt` | integer | Attempts charged to it |

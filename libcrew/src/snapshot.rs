@@ -450,6 +450,58 @@ mod tests {
         lines.iter().filter_map(|l| l.strip_suffix(": null")).map(String::from).collect()
     }
 
+    /// Each key [`FROZEN_V1`] carries that `written` lacks, at its own position (`rows[1].url`), so
+    /// a key dropped from one row is not hidden by another row still carrying it. A
+    /// `skip_serializing_if` on an existing key removes it from the wire only when it is `null`
+    /// or empty, which the populated shape never is, and [`nullable_paths`] still reads it as
+    /// nullable from the frozen payload, so without this the pinned shape stays green.
+    fn stopped_serializing(written: &serde_json::Value) -> Vec<String> {
+        use serde_json::Value;
+        fn walk(path: &str, raw: &Value, written: Option<&Value>, out: &mut Vec<String>) {
+            let Some(written) = written else {
+                out.push(path.to_string());
+                return;
+            };
+            match raw {
+                Value::Object(map) => {
+                    for (k, child) in map {
+                        let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                        walk(&p, child, written.get(k), out);
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        walk(&format!("{path}[{i}]"), item, written.get(i), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let raw: Value = serde_json::from_str(FROZEN_V1).unwrap();
+        let mut out = Vec::new();
+        walk("", &raw, Some(written), &mut out);
+        out
+    }
+
+    /// [`FROZEN_V1`] read by the current types and written back, as a daemon would send it.
+    fn frozen_written_back() -> serde_json::Value {
+        let read: Snapshot = serde_json::from_str(FROZEN_V1).unwrap();
+        serde_json::to_value(read).unwrap()
+    }
+
+    /// The v1 promise covers a key that is `null`, not only one that is set (#275): a client
+    /// that indexes `last_tick_at` breaks when the key is skipped instead of sent as `null`.
+    #[test]
+    fn a_v1_snapshot_key_that_stops_serializing_fails_the_shape_guard() {
+        let mut written = frozen_written_back();
+        assert_eq!(stopped_serializing(&written), Vec::<String>::new());
+
+        // What `#[serde(skip_serializing_if = "Option::is_none")]` would do to these two keys.
+        written.as_object_mut().unwrap().remove("last_tick_at");
+        written["rows"][1].as_object_mut().unwrap().remove("url");
+        assert_eq!(stopped_serializing(&written), ["last_tick_at", "rows[1].url"]);
+    }
+
     /// [`populated_shape`] with `| null` on each path that may be `null`, so making a field
     /// required, or a new one optional, rewrites a line of the pinned snapshot.
     fn snapshot_shape() -> Vec<String> {
@@ -507,6 +559,8 @@ mod tests {
     /// enum spellings are pinned too, because a client matches on them.
     #[test]
     fn the_v1_snapshot_shape_only_grows() {
+        let dropped = stopped_serializing(&frozen_written_back());
+        assert!(dropped.is_empty(), "a v1 key is sent as null, never skipped: {dropped:?}");
         let mut lines = snapshot_shape();
         for p in every_phase() {
             lines.push(format!("enum phase: {}", serde_json::to_value(p).unwrap()));
