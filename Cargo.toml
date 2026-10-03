@@ -36,8 +36,9 @@ homepage.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# Agent tooling and CI, which a crate built from crates.io never runs.
-exclude = [".claude", ".github"]
+# Agent tooling and CI, which a crate built from crates.io never runs, and the test that reads
+# them, which would fail in the unpacked crate (#272).
+exclude = [".claude", ".github", "tests/release.rs"]
 description = "Tracker-driven orchestrator for Claude Code agents: a worktree, a session and a pull request per issue. The `crew` library inside is internal, with no API promise."
 # `cargo run` means the daemon, as the quickstart in CLAUDE.md and the README assumes, even
 # though `default-members` also builds `crewctl`.

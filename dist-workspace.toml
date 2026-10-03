@@ -1,11 +1,14 @@
-# The release (#248): `dist generate` writes `.github/workflows/v-release.yml` from this file, so
-# change this and regenerate rather than editing that workflow by hand.
+# The release (#248): `dist generate` wrote `.github/workflows/v-release.yml` from this file. Two
+# fixes dist has no setting for are hand edits in that workflow, marked `Hand-edited (#272)`, so
+# `allow-dirty` stops dist refusing it; a regeneration drops them and `release.rs` in `tests/`
+# fails until they are put back.
 
 [workspace]
 members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.33.0"
+allow-dirty = ["ci"]
 ci = "github"
 targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 installers = ["shell", "homebrew"]
