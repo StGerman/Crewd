@@ -242,8 +242,10 @@ in that worktree is started on it without a check of its own.
 `hostile_identifiers_stay_inside_the_root` ([src/workspace.rs](../src/workspace.rs)), with
 `hostile_identifiers_stay_inside_the_root_for_git_worktrees_too` for git worktrees, which feed
 `../../etc`, `/etc/passwd`, `..` and `a/../../b` as identifiers and assert each workspace lands
-exactly one level under the root. Both drive `prepare`; `remove` is held by sharing the same
-`guard_within`, not by a test of its own.
+exactly one level under the root and that `remove` deletes it there. Each then replaces the root
+with a symlink to a directory outside it, the root that moved between launch and cleanup, and
+asserts `remove` refuses every identifier with `OutsideRoot` and leaves what is out there in
+place, so taking the check out of either `remove` turns its test red.
 
 **What this does not cover.** `guard_within` canonicalises the parent, not the leaf, because the
 leaf may not exist yet. A symlink planted *at* the workspace path, `<root>/<key>` pointing
