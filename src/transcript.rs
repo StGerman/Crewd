@@ -7,7 +7,7 @@
 //! the reader: every line it sees goes to a file keyed by run id, whether or not the parser had
 //! a use for it.
 //!
-//! Three properties, each closing something that went wrong in practice:
+//! Four properties, each closing something that went wrong in practice:
 //!
 //! * **Unbuffered, one write per line.** The diagnosis this exists to prevent was made by
 //!   tailing the daemon's redirected stdout, which was block-buffered and hours behind; reading
@@ -23,6 +23,9 @@
 //! * **Bounded on both axes.** A per-run byte cap and a count of runs kept, because a daemon
 //!   that runs for months otherwise fills the disk with the thing that was supposed to make it
 //!   debuggable.
+//!
+//! * **Redacted on the way in.** A tool result can carry a token the agent read, and the line
+//!   is copied through whole; [`crate::redact`] replaces the secret and keeps the line (#138).
 //!
 //! Best-effort per run: a transcript that cannot be opened or written is logged and swallowed,
 //! and costs a post-mortem, never a dispatch. A root that [`Transcripts::new`] cannot create is
@@ -167,11 +170,14 @@ impl TranscriptWriter {
         &self.path
     }
 
-    /// Append one line. Silent on every failure — a run must not die because its log did.
+    /// Append one line, its secrets redacted. Silent on every failure — a run must not die
+    /// because its log did.
     pub fn write_line(&mut self, line: &str) {
         if self.file.is_none() {
             return;
         }
+        // Redacted before the cost is charged, so the cap bounds the bytes actually written.
+        let line = crate::redact::redact(line);
 
         let cost = line.len() as u64 + 1;
         if cost > self.remaining {
@@ -262,6 +268,26 @@ mod tests {
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "the transcript root must not be readable by other users");
         assert_eq!(file_mode, 0o600, "a transcript must not be readable by other users");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_token_in_a_stream_line_is_redacted_before_it_reaches_the_transcript() {
+        let root = tmp("redact");
+        let t = Transcripts::new(&root, 1 << 20, 10).unwrap();
+        let token = format!("ghp_{}", "Z9".repeat(18));
+
+        let mut w = t.open("leaky").unwrap();
+        w.write_line(&format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","content":"GH={token}\n"}}]}}}}"#
+        ));
+        let path = w.path().to_path_buf();
+        drop(w);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(&token), "the token reached the transcript: {text}");
+        assert!(text.contains(r#""type":"tool_result","content":"GH=[REDACTED]\n""#), "{text}");
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -20,6 +20,7 @@ pub mod http;
 pub mod init;
 pub mod model;
 pub mod project;
+pub mod redact;
 pub mod sched;
 pub mod service;
 pub mod store;

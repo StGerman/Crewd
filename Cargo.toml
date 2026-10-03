@@ -59,6 +59,7 @@ crossterm = "0.29.0"
 parking_lot = "0.12.5"
 ratatui = "0.30.2"
 ring = "0.17.14"
+regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls-pki-types = "1.15.1"
 serde = { version = "1.0.229", features = ["derive"] }

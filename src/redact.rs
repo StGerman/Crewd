@@ -1,0 +1,230 @@
+//! Secret redaction for the lines crewd stores: transcript lines and its own log lines (#138).
+//!
+//! A transcript copies every worker stream line through before the parser decides whether it
+//! has a use for it, so a token the agent read and printed would otherwise sit on disk for as
+//! long as retention keeps the run. Nothing on the host confines that: a worker that cannot reach
+//! `github.com` can still print what it read. The line is kept, because it is the post-mortem;
+//! only the secret in it is replaced, by [`MARKER`].
+//!
+//! Matching is by shape, never by the values crewd knows: the agent's environment and tool
+//! results hold credentials crewd never saw. A shape that is not listed here is not redacted,
+//! so this narrows what a transcript keeps rather than guaranteeing it keeps nothing.
+//!
+//! A line with no match is returned borrowed, byte for byte, so a clean transcript is unchanged
+//! and costs no allocation.
+
+use std::borrow::Cow;
+use std::io::Write;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+/// What a secret is replaced with. Bracketed, so a reader of the transcript sees that a value
+/// was there rather than a line that looks malformed.
+pub const MARKER: &str = "[REDACTED]";
+
+/// An ANSI style sequence. Under a terminal, `tracing`'s formatter wraps a field's name and its
+/// `=` in these, and a `key=value` pattern that did not skip them would miss every coloured log
+/// line.
+const ANSI: &str = r"(?:\x1b\[[0-9;]*m)*";
+
+/// Each pattern with its replacement. A replacement that keeps a capture group keeps the name
+/// of the thing redacted, which is what the reader needs to know which credential leaked.
+static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
+    let kv_name = r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?))";
+    let sep = format!(r#"({ANSI}\\?["']?{ANSI}\s*[:=]{ANSI}\s*\\?["']?)"#);
+    let url_params = r"(?i)([?&](?:access_token|refresh_token|id_token|token|api_key|apikey|key|password|passwd|pwd|secret|client_secret|state|code|sig|signature|auth|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\s#\x22'\\]+";
+    let table: Vec<(String, String)> = vec![
+        // Multi-line in a log, `\n`-escaped inside a JSON stream line; an unterminated block
+        // runs to the end of the line rather than leaving its tail in place.
+        (
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?s:.*?)(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)"
+                .into(),
+            MARKER.into(),
+        ),
+        (r"(://[^/\s:@\x22'\\]+:)[^@\s/\x22'\\]+@".into(), format!("${{1}}{MARKER}@")),
+        (url_params.into(), format!("${{1}}{MARKER}")),
+        (r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})".into(), MARKER.into()),
+        (r"\bglpat-[A-Za-z0-9_-]{20,}".into(), MARKER.into()),
+        (r"\bxox[abposr]-[A-Za-z0-9-]{10,}".into(), MARKER.into()),
+        (r"\bxapp-[0-9]-[A-Za-z0-9-]{10,}".into(), MARKER.into()),
+        (r"\bsk-[A-Za-z0-9_-]{20,}".into(), MARKER.into()),
+        (r"\bAIza[0-9A-Za-z_-]{35}".into(), MARKER.into()),
+        (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b".into(), MARKER.into()),
+        (r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+".into(), MARKER.into()),
+        (r"(?i)\b(bearer|authorization:\s*basic)(\s+)[A-Za-z0-9._~+/-]{8,}=*".into(), format!("${{1}}${{2}}{MARKER}")),
+        // The name must end in the keyword, so `input_tokens` and `token_count` are left alone:
+        // every usage event in a stream carries the first. A value opening with `[` is skipped,
+        // so a URL parameter already redacted above is not read again with its fragment.
+        (format!(r#"{kv_name}{sep}[^\s"'\\&,;\x1b\[][^\s"'\\&,;\x1b]*"#), format!("${{1}}${{2}}{MARKER}")),
+    ];
+    table
+        .into_iter()
+        .map(|(re, with)| {
+            (Regex::new(&re).expect("every pattern is a literal the tests compile"), with)
+        })
+        .collect()
+});
+
+/// `line` with every known secret shape replaced by [`MARKER`]; borrowed when nothing matched.
+pub fn redact(line: &str) -> Cow<'_, str> {
+    let mut out = Cow::Borrowed(line);
+    for (re, with) in PATTERNS.iter() {
+        if let Cow::Owned(replaced) = re.replace_all(&out, with.as_str()) {
+            out = Cow::Owned(replaced);
+        }
+    }
+    out
+}
+
+/// A `tracing_subscriber` writer that redacts each formatted event before it reaches `W`.
+///
+/// The formatter hands its writer one whole event per `write_all`, so a secret is never split
+/// across two calls to [`Write::write`] here. A short write from the formatter would break
+/// that, which is why `write` reports the caller's length only after the whole redacted buffer
+/// went through.
+pub struct Redacting<W>(pub W);
+
+impl<W: Write> Write for Redacting<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match std::str::from_utf8(buf) {
+            Ok(text) => self.0.write_all(redact(text).as_bytes())?,
+            Err(_) => self.0.write_all(redact(&String::from_utf8_lossy(buf)).as_bytes())?,
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// [`Redacting`] over every writer `M` makes: what `main` installs as the log's writer.
+#[derive(Clone)]
+pub struct RedactingMakeWriter<M>(pub M);
+
+impl<'a, M: tracing_subscriber::fmt::MakeWriter<'a>> tracing_subscriber::fmt::MakeWriter<'a>
+    for RedactingMakeWriter<M>
+{
+    type Writer = Redacting<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        Redacting(self.0.make_writer())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_with_no_secret_is_stored_unchanged() {
+        for line in [
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":23169,"cache_read_input_tokens":0,"output_tokens":263}}}"#,
+            r#"{"type":"result","subtype":"success","num_turns":4,"session_id":"0b6c-11"}"#,
+            "2026-10-03T10:00:00Z  INFO crew::sched: dispatched issue=MT-649 state=Todo run=r-1",
+            "see https://github.com/StGerman/Crewd/issues/138?page=2 and token_count=12",
+            "the token budget is spent; max_tokens: 4096",
+            "",
+        ] {
+            assert!(matches!(redact(line), Cow::Borrowed(_)), "{line} was rewritten");
+        }
+    }
+
+    #[test]
+    fn every_listed_shape_is_replaced_and_the_rest_of_the_line_kept() {
+        let gh = format!("ghp_{}", "a1".repeat(18));
+        let cases = [
+            format!("before {gh} after"),
+            format!("before github_pat_{} after", "A1_".repeat(10)),
+            format!("before glpat-{} after", "x".repeat(20)),
+            format!("before xoxb-{} after", "1234-".repeat(4)),
+            format!("before sk-ant-api03-{} after", "Q".repeat(40)),
+            "before AKIAIOSFODNN7EXAMPLE after".to_string(),
+            format!("before eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.{} after", "s".repeat(20)),
+            format!("before Authorization: Bearer {} after", "t".repeat(30)),
+            "before aws_secret_access_key=wJalrXUtnFEMI/K7MDENG after".to_string(),
+            r#"before {\"password\": \"hunter2hunter2\"} after"#.to_string(),
+            "before GITHUB_TOKEN=abc123def after".to_string(),
+            "before https://deploy:s3cr3t@example.com/repo.git after".to_string(),
+        ];
+        for line in cases {
+            let out = redact(&line);
+            assert!(out.contains(MARKER), "nothing redacted in {line}: {out}");
+            assert!(out.starts_with("before") && out.ends_with("after"), "{line} became {out}");
+        }
+        let line = format!("{{\"text\":\"use {gh}\"}}");
+        let out = redact(&line);
+        assert!(!out.contains(&gh), "{out}");
+    }
+
+    #[test]
+    fn a_recorded_grok_stream_passes_through_unchanged() {
+        for name in ["stream.jsonl", "resume.jsonl", "sigterm.jsonl"] {
+            let path = format!("{}/tests/fixtures/grok/{name}", env!("CARGO_MANIFEST_DIR"));
+            for line in std::fs::read_to_string(path).unwrap().lines() {
+                assert_eq!(redact(line), line, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pem_block_is_replaced_whole_whether_escaped_or_multi_line() {
+        let escaped = r#"{"content":"-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nAAAA\n-----END RSA PRIVATE KEY-----\n","x":1}"#;
+        assert_eq!(redact(escaped), format!(r#"{{"content":"{MARKER}\n","x":1}}"#));
+        let raw = "key:\n-----BEGIN PRIVATE KEY-----\nMIIEow\n-----END PRIVATE KEY-----\ndone";
+        assert_eq!(redact(raw), format!("key:\n{MARKER}\ndone"));
+        let cut = "-----BEGIN PRIVATE KEY-----\nMIIEow";
+        assert_eq!(redact(cut), MARKER);
+    }
+
+    #[test]
+    fn every_listed_url_parameter_loses_its_value_and_keeps_the_rest_of_the_url() {
+        let url = "https://h/cb?code=abc&state=xyz&page=2&access_token=t0k&api_key=k#frag";
+        assert_eq!(
+            redact(url),
+            format!(
+                "https://h/cb?code={MARKER}&state={MARKER}&page=2&access_token={MARKER}&api_key={MARKER}#frag"
+            )
+        );
+    }
+
+    #[test]
+    fn a_coloured_log_field_is_redacted_through_its_escape_codes() {
+        let line = "\x1b[3mauth_token\x1b[0m\x1b[2m=\x1b[0mabc123 next";
+        assert_eq!(redact(line), format!("\x1b[3mauth_token\x1b[0m\x1b[2m=\x1b[0m{MARKER} next"));
+    }
+
+    #[test]
+    fn a_url_with_an_access_token_is_logged_without_the_token() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(RedactingMakeWriter(move || writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                url = "https://api.example.com/v1/items?access_token=gho_s3cr3tvalue&page=2",
+                "tracker call failed"
+            );
+        });
+
+        let log = String::from_utf8(capture.0.lock().clone()).unwrap();
+        assert!(log.contains("tracker call failed"), "the line is kept: {log}");
+        assert!(log.contains(&format!("access_token={MARKER}&page=2")), "{log}");
+        assert!(!log.contains("gho_s3cr3tvalue"), "the token reached the log: {log}");
+    }
+}
