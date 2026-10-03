@@ -218,7 +218,9 @@ directly, which is a second copy of each manager's load, enable and remove quirk
 Its `encoding` default only decodes Windows command output and is off. It adds `plist`,
 `xml-rs`, `quick-xml`, `which` and `dirs` to the tree. `plist` is named directly because the
 crate's own plist has no `StandardOutPath`, so the agent's definition is written here and
-passed through the crate's `contents` override.
+passed through the crate's `contents` override. The one `systemctl` call crewd still makes itself is
+`daemon-reload`, after writing or removing a unit, because the crate does not reload and a
+reinstall would otherwise start the cached definition (`Reloading` in `src/service.rs`).
 
 ### Approved to add
 
