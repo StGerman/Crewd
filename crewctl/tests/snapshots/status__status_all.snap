@@ -2,7 +2,7 @@
 source: crewctl/tests/status.rs
 expression: "stdout(&all, &addr, &root)"
 ---
-crewd @ [ADDR]  —  1 running / 10 limit
+crewd [BUILD] @ [ADDR]  —  1 running / 10 limit
 tick 1, last at 2026-02-02 02:40:00Z (0s ago)
 tokens 0 in / 0 out
 

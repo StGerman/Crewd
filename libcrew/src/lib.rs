@@ -8,11 +8,13 @@
 //! applied is a `pub` item here that `crewctl` never names.
 
 pub mod api;
+pub mod build;
 pub mod client;
 pub mod fmt;
 pub mod render;
 pub mod snapshot;
 
+pub use build::build;
 pub use snapshot::{
     DeliveryView, HaltReason, HaltedWorker, Phase, RateLimitPause, Row, RunRecord, Snapshot,
     TokenUsage,
