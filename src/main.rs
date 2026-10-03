@@ -14,6 +14,7 @@
 //! package that links no store, worktree or tracker code (#45), because an operator asking what
 //! is running must not be able to disturb it.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -83,8 +84,9 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Register this operator's own GitHub App and write ~/.crewd/github-app.toml naming it.
-    /// Two clicks in a browser — create, install — and nothing typed.
+    /// Run in a git clone: register this operator's own GitHub App (two clicks, once per
+    /// machine), then write ~/.crewd/<owner>-<repo>/crewd.toml and create the labels it
+    /// dispatches on. Never overwrites a file or a label.
     Init {
         /// The App's name. Defaults to `crew-<your GitHub login>`; GitHub requires it to be
         /// unique across all of GitHub.
@@ -93,9 +95,27 @@ enum Cmd {
         /// Register the App under this organization rather than your own account.
         #[arg(long)]
         org: Option<String>,
-        /// Where to write the settings file and key. Defaults to `~/.crewd`.
+        /// Where to write the settings file, the key and the deployment. Defaults to `~/.crewd`.
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
+        /// The deployment's directory under DIR. Defaults to `<owner>-<repo>`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Let agents work issues (`[worker] kind = "claude"`) without asking.
+        #[arg(long, overrides_with = "no_work")]
+        work: bool,
+        /// Keep the fake worker, which spawns nothing, without asking.
+        #[arg(long)]
+        no_work: bool,
+        /// Open pull requests (`[delivery] enabled = true`) without asking.
+        #[arg(long, overrides_with = "no_deliver")]
+        deliver: bool,
+        /// Leave delivery off without asking.
+        #[arg(long)]
+        no_deliver: bool,
+        /// The gate's check commands, `&&` between two; "" for none.
+        #[arg(long, value_name = "COMMANDS")]
+        checks: Option<String>,
     },
     /// Run one deployment as a per-user service (launchd on macOS, systemd `--user` on Linux)
     /// that starts at login and restarts after a crash.
@@ -137,8 +157,26 @@ async fn main() -> anyhow::Result<()> {
 
     // Before the config is loaded: `init` is what produces the file a config names, so it must
     // not need one to exist.
-    if let Some(Cmd::Init { app_name, org, dir }) = args.command {
-        return tokio::task::spawn_blocking(move || run_init(app_name, org, dir)).await?;
+    if let Some(Cmd::Init {
+        app_name,
+        org,
+        dir,
+        name,
+        work,
+        no_work,
+        deliver,
+        no_deliver,
+        checks,
+    }) = args.command
+    {
+        let flag = |on: bool, off: bool| (on || off).then_some(on);
+        let answers = init::deploy::Answers {
+            work: flag(work, no_work),
+            deliver: flag(deliver, no_deliver),
+            checks,
+        };
+        return tokio::task::spawn_blocking(move || run_init(app_name, org, dir, name, answers))
+            .await?;
     }
     if let Some(Cmd::Service { action }) = args.command {
         return tokio::task::spawn_blocking(move || run_service(action)).await?;
@@ -707,12 +745,81 @@ fn run_init(
     app_name: Option<String>,
     org: Option<String>,
     dir: Option<PathBuf>,
+    name: Option<String>,
+    answers: init::deploy::Answers,
 ) -> anyhow::Result<()> {
     let dir = match dir {
         Some(d) => d,
         None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set; pass --dir")?)
             .join(".crewd"),
     };
+    // Absolute before any path under it is written into a file: a relative key path is read
+    // against the settings file's own directory, and `tracker.github_app` against wherever the
+    // daemon starts, which the printed command makes the deployment directory.
+    let dir = std::path::absolute(&dir).with_context(|| format!("resolving {}", dir.display()))?;
+    // Before registering anything: an App created from outside a clone has nowhere to go.
+    let clone = init::deploy::Clone::at(&std::env::current_dir()?)?;
+    let settings = dir.join(init::SETTINGS_FILE);
+    let port_free = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+    let opts = init::deploy::Options {
+        dir: dir.clone(),
+        name,
+        app_file: settings.clone(),
+        answers,
+        port_free: &port_free,
+    };
+    let has_terminal = std::io::stdin().is_terminal();
+    init::deploy::check_answers(&clone, &opts, has_terminal)?;
+    // `init` runs before a config is loaded and on its own thread (#150), so it builds its own
+    // client from the environment rather than sharing the daemon's.
+    let http = UreqHttp::from_env().context("building the HTTPS client")?;
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    // A kept config names the App its labels are written as; only a new one uses the default.
+    let kept_app = init::deploy::kept(&clone, &opts)?.and_then(|cfg| cfg.tracker.github_app);
+    let app_file = match kept_app {
+        Some(app) => app,
+        None if settings.symlink_metadata().is_ok() => {
+            println!("Kept {}: the App is already registered.\n", settings.display());
+            settings.clone()
+        }
+        None => {
+            let repo = (clone.owner.clone(), clone.repo.clone());
+            register(&http, clock.as_ref(), RegisterArgs { app_name, org, dir: &dir, repo })?;
+            settings.clone()
+        }
+    };
+    init::installed_on(&http, clock.as_ref(), &app_file, &clone.owner, &clone.repo)?;
+
+    let mut terminal = TerminalPrompt;
+    let prompt: Option<&mut dyn init::deploy::Prompt> = has_terminal.then_some(&mut terminal);
+    let written = init::deploy::write(&clone, &opts, prompt)?;
+    let cfg = Config::load(&written.config)
+        .with_context(|| format!("loading {}", written.config.display()))?;
+    init::deploy::check_kept(&written.config, &cfg, &clone)?;
+    // The configured credential, the one the daemon will write as, never a separate token.
+    let app_file =
+        cfg.tracker.github_app.clone().context("the config names no tracker.github_app")?;
+    let creds: Arc<dyn Credentials> =
+        Arc::new(GithubApp::new(http.clone(), &GithubAppFile::load(&app_file)?, clock)?);
+    let tracker = GithubTracker::new(http, &cfg.tracker.owner, &cfg.tracker.repo, "", &[])
+        .with_credentials(creds);
+    let labels = init::deploy::create_labels(&tracker, &cfg)?;
+    println!("{}", init::deploy::summary(&written, &cfg, &labels));
+    Ok(())
+}
+
+struct RegisterArgs<'a> {
+    app_name: Option<String>,
+    org: Option<String>,
+    dir: &'a std::path::Path,
+    repo: (String, String),
+}
+
+fn register(
+    http: &UreqHttp,
+    clock: &dyn Clock,
+    RegisterArgs { app_name, org, dir, repo }: RegisterArgs,
+) -> anyhow::Result<()> {
     let app_name = match app_name {
         Some(n) => n,
         None => {
@@ -720,26 +827,22 @@ fn run_init(
         }
     };
     let opts = init::Options {
-        dir,
+        dir: dir.to_path_buf(),
         app_name,
         org,
         limits: broker::server::Limits::default(),
         // Ten minutes at three seconds a read: long enough to choose repositories, short enough
         // that an abandoned run ends.
         install_polls: 200,
+        repo: Some(repo),
     };
-    // `init` runs before a config is loaded and on its own thread (#150), so it builds its own
-    // client from the environment rather than sharing the daemon's.
-    let http = UreqHttp::from_env().context("building the HTTPS client")?;
-    let registered = init::run(&http, &SystemClock::new(), &mut TerminalOperator, &opts)?;
+    let registered = init::run(http, clock, &mut TerminalOperator, &opts)?;
     println!(
-        "\nApp {} (id {}) is installed (installation {}).\n  key:      {}\n  settings: {}\n\n\
-         Name the settings from the daemon's config:\n\n  [tracker]\n  github_app = \"{}\"",
+        "\nApp {} (id {}) is installed (installation {}).\n  key:      {}\n  settings: {}\n",
         registered.slug,
         registered.app_id,
         registered.installation_id,
         registered.key.display(),
-        registered.settings.display(),
         registered.settings.display(),
     );
     Ok(())
@@ -794,6 +897,34 @@ fn run_service(action: ServiceCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct TerminalPrompt;
+
+impl init::deploy::Prompt for TerminalPrompt {
+    fn yes_no(&mut self, question: &str) -> std::io::Result<bool> {
+        loop {
+            match self.line(&format!("{question} [Y/n]"))?.to_ascii_lowercase().as_str() {
+                "" | "y" | "yes" => return Ok(true),
+                "n" | "no" => return Ok(false),
+                _ => println!("Answer y or n."),
+            }
+        }
+    }
+
+    fn line(&mut self, question: &str) -> std::io::Result<String> {
+        use std::io::Write as _;
+        print!("{question} ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stdin closed before an answer",
+            ));
+        }
+        Ok(answer.trim().to_string())
+    }
+}
+
 /// The operator's login for the default App name, from `gh` if it is there. Nothing else is
 /// asked for: the point of `init` is that a machine with no prior setup still types nothing.
 fn github_login() -> Option<String> {
@@ -818,5 +949,35 @@ impl init::Operator for TerminalOperator {
 
     fn wait(&mut self) {
         std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `crewd …` in `text`, split into argv, with `&&` separating two commands on a line.
+    fn crewd_commands(text: &str) -> Vec<Vec<String>> {
+        text.lines()
+            .flat_map(|line| line.split("&&"))
+            .map(|cmd| cmd.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .filter(|argv| argv.first().is_some_and(|p| p == "crewd"))
+            .collect()
+    }
+
+    #[test]
+    fn every_command_the_readme_quickstart_names_exists() {
+        let readme = include_str!("../README.md");
+        let section = readme.split("### Quickstart").nth(1).expect("the README has a Quickstart");
+        let block = section.split("```bash").nth(1).and_then(|b| b.split("```").next());
+        let mut commands = crewd_commands(block.expect("the Quickstart has a bash block"));
+        assert!(commands.iter().any(|c| c.get(1).is_some_and(|s| s == "init")), "{commands:?}");
+        // What `init` prints as the next command must exist too.
+        commands.extend(crewd_commands(&init::deploy::next_command(std::path::Path::new("/d"))));
+        for argv in commands {
+            if let Err(e) = Args::try_parse_from(&argv) {
+                panic!("`{}` is not a crewd command: {e}", argv.join(" "));
+            }
+        }
     }
 }

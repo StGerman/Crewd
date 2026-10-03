@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write as _};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -64,6 +64,8 @@ struct FakeGithub {
     permissions: Value,
     /// One answer per read of `/app/installations`; empty once exhausted.
     installations: Mutex<VecDeque<Value>>,
+    /// What `/repos/acme/api/installation` answers: the id, or a 404.
+    repo_installation: Option<u64>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -80,6 +82,7 @@ impl Default for FakeGithub {
                     { "id": 99, "account": { "login": "Octo" } },
                 ]),
             ])),
+            repo_installation: Some(99),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -135,7 +138,14 @@ impl Http for Arc<FakeGithub> {
             return respond(401, json!({ "message": "A JSON web token could not be decoded" }));
         }
         match path {
-            "/app" => respond(200, json!({ "permissions": self.permissions, "events": [] })),
+            "/app" => respond(
+                200,
+                json!({ "slug": "crew-octo", "permissions": self.permissions, "events": [] }),
+            ),
+            "/repos/acme/api/installation" => match self.repo_installation {
+                Some(id) => respond(200, json!({ "id": id })),
+                None => respond(404, json!({ "message": "Not Found" })),
+            },
             "/app/installations" => {
                 let next = self.installations.lock().unwrap().pop_front();
                 respond(200, next.unwrap_or(json!([])))
@@ -269,6 +279,7 @@ fn opts(dir: PathBuf) -> Options {
             max_connections: 8,
         },
         install_polls: 3,
+        repo: None,
     }
 }
 
@@ -502,4 +513,419 @@ fn an_app_never_installed_leaves_its_key_and_says_how_to_finish_by_hand() {
     assert!(dir.join(KEY_FILE).exists());
     assert!(!dir.join(SETTINGS_FILE).exists());
     assert_eq!(seen.lock().unwrap().waits, 2, "three reads, a wait between each");
+}
+
+// ---- the deployment (#247) -------------------------------------------------
+
+use crate::config::{Config, WorkerKind};
+use crate::tracker::fake::FakeTracker;
+use crate::tracker::{LabelOutcome, RepoLabels};
+use deploy::{Answers, Prompt};
+
+/// A clone of `acme/api` with a `Cargo.toml`, and an App settings file naming the throwaway key.
+fn deployment_fixture(tag: &str) -> (deploy::Clone, PathBuf, PathBuf) {
+    let root = tmp(tag).parent().unwrap().to_path_buf();
+    let repo = root.join("api");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "trunk"]);
+    git(&["remote", "add", "origin", "git@github.com:acme/api.git"]);
+    std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"api\"\n").unwrap();
+
+    let dir = root.join("crewd");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(KEY_FILE), throwaway_pem()).unwrap();
+    let app_file = dir.join(SETTINGS_FILE);
+    std::fs::write(&app_file, settings_toml(42, 99, &dir.join(KEY_FILE))).unwrap();
+    (deploy::Clone::at(&repo).unwrap(), dir, app_file)
+}
+
+/// Answers in order, and fails the test on a question it was not given an answer for.
+struct Scripted(VecDeque<String>, Vec<String>);
+
+impl Prompt for Scripted {
+    fn yes_no(&mut self, question: &str) -> std::io::Result<bool> {
+        Ok(matches!(self.line(question)?.as_str(), "" | "y"))
+    }
+
+    fn line(&mut self, question: &str) -> std::io::Result<String> {
+        self.1.push(question.to_string());
+        Ok(self.0.pop_front().unwrap_or_else(|| panic!("unscripted question: {question}")))
+    }
+}
+
+fn scripted(answers: &[&str]) -> Scripted {
+    Scripted(answers.iter().map(|a| a.to_string()).collect(), vec![])
+}
+
+fn deploy_opts<'a>(
+    dir: &Path,
+    app_file: &Path,
+    port_free: &'a dyn Fn(u16) -> bool,
+) -> deploy::Options<'a> {
+    deploy::Options {
+        dir: dir.to_path_buf(),
+        name: None,
+        app_file: app_file.to_path_buf(),
+        answers: Answers::default(),
+        port_free,
+    }
+}
+
+#[test]
+fn init_writes_a_deployment_whose_config_loads_with_the_answers_given() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-answers");
+    // 8787 is taken on this host and a stopped sibling deployment names 8789, so the pair after.
+    let sibling = dir.join("acme-web");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join(deploy::CONFIG_FILE), "[api]\nbind = \"127.0.0.1:8789\"\n")
+        .unwrap();
+    let port_free = |p: u16| p != 8787;
+    let opts = deploy_opts(&dir, &app_file, &port_free);
+    // Agents yes, pull requests no, and the suggested `cargo test` typed in.
+    let mut prompt = scripted(&["", "n", "cargo test"]);
+
+    let written = deploy::write(&clone, &opts, Some(&mut prompt)).unwrap();
+    assert!(!written.kept);
+    assert_eq!(written.dir, dir.join("acme-api"));
+    assert_eq!(mode(&written.dir), 0o700);
+    assert_eq!(
+        prompt.1,
+        [
+            "Let agents work issues?",
+            "Open pull requests?",
+            "The gate's check commands, `&&` between two, empty for none. This clone suggests \
+             `cargo test`."
+        ]
+    );
+
+    let cfg = Config::load(&written.config).unwrap();
+    assert_eq!((cfg.tracker.owner.as_str(), cfg.tracker.repo.as_str()), ("acme", "api"));
+    assert_eq!(cfg.tracker.github_app.as_deref(), Some(app_file.as_path()));
+    let repo = cfg.workspace.repo.clone().unwrap();
+    assert!(repo.is_absolute());
+    assert_eq!(repo.canonicalize().unwrap(), clone.path.canonicalize().unwrap());
+    // Written as `workspaces`, and resolved beside the config wherever crewd starts (#251).
+    assert!(std::fs::read_to_string(&written.config).unwrap().contains("root = \"workspaces\""));
+    assert_eq!(cfg.workspace.root, Some(written.dir.join("workspaces")));
+    assert_eq!(cfg.workers()[0].kind().unwrap(), WorkerKind::Claude);
+    assert!(!cfg.delivery.enabled);
+    assert_eq!(cfg.delivery.base, "trunk");
+    assert_eq!(cfg.gate.commands, [["cargo", "test"]]);
+    assert_eq!(
+        (cfg.api.bind.as_str(), cfg.api.mcp_bind.as_str()),
+        ("127.0.0.1:8791", "127.0.0.1:8792")
+    );
+
+    let tracker = FakeTracker::new(vec![]);
+    let labels = deploy::create_labels(&tracker, &cfg).unwrap();
+    assert_eq!(tracker.repo_labels(), ["agent", "state:in-progress"]);
+    assert!(labels.iter().all(|(_, o)| *o == LabelOutcome::Created));
+}
+
+#[test]
+fn init_run_twice_overwrites_no_config_and_no_label() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-twice");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.answers = Answers { work: Some(false), deliver: Some(true), checks: Some(String::new()) };
+    let tracker = FakeTracker::new(vec![]);
+    // A label the operator made by hand, in another case, before init ever ran.
+    tracker.ensure_label("Agent").unwrap();
+
+    let first = deploy::write(&clone, &opts, None).unwrap();
+    let cfg = Config::load(&first.config).unwrap();
+    let labels = deploy::create_labels(&tracker, &cfg).unwrap();
+    assert_eq!(
+        labels,
+        [
+            ("agent".to_string(), LabelOutcome::Kept),
+            ("state:in-progress".into(), LabelOutcome::Created)
+        ]
+    );
+    assert!(cfg.gate.commands.is_empty());
+
+    let edited = std::fs::read_to_string(&first.config).unwrap() + "# the operator's edit\n";
+    std::fs::write(&first.config, &edited).unwrap();
+    // No terminal and no flags: a second run that asked anything would fail here.
+    opts.answers = Answers::default();
+    let second = deploy::write(&clone, &opts, None).unwrap();
+    assert!(second.kept);
+    assert_eq!(std::fs::read_to_string(&second.config).unwrap(), edited);
+    let labels = deploy::create_labels(&tracker, &Config::load(&second.config).unwrap()).unwrap();
+    assert!(labels.iter().all(|(_, o)| *o == LabelOutcome::Kept));
+    assert_eq!(tracker.repo_labels(), ["Agent", "state:in-progress"]);
+}
+
+#[test]
+fn with_no_terminal_init_writes_nothing_and_names_every_flag_left_unanswered() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-script");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.answers.deliver = Some(false);
+    let err = deploy::write(&clone, &opts, None).unwrap_err().to_string();
+    assert!(err.contains("--work or --no-work") && err.contains("--checks"), "{err}");
+    assert!(!err.contains("--deliver"), "{err}");
+    assert!(!dir.join("acme-api").join(deploy::CONFIG_FILE).exists());
+}
+
+#[test]
+fn the_summary_names_each_switch_still_off_and_the_line_that_turns_it_on() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-summary");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.answers = Answers { work: Some(false), deliver: Some(false), checks: Some(String::new()) };
+    let written = deploy::write(&clone, &opts, None).unwrap();
+    let cfg = Config::load(&written.config).unwrap();
+    let shown = deploy::Written {
+        dir: "/home/op/.crewd/acme-api".into(),
+        config: "/home/op/.crewd/acme-api/crewd.toml".into(),
+        kept: false,
+    };
+    let labels = [
+        ("agent".to_string(), LabelOutcome::Kept),
+        ("state:in-progress".to_string(), LabelOutcome::Created),
+    ];
+    insta::assert_snapshot!(deploy::summary(&shown, &cfg, &labels));
+}
+
+#[test]
+fn an_app_not_installed_on_the_clones_repository_stops_init_with_its_install_url() {
+    let (_, _, app_file) = deployment_fixture("deploy-installed");
+    let clock = FakeClock::new();
+    let installed = Arc::new(FakeGithub::default());
+    installed_on(&installed, &clock, &app_file, "acme", "api").unwrap();
+
+    let missing = Arc::new(FakeGithub { repo_installation: None, ..FakeGithub::default() });
+    let err = installed_on(&missing, &clock, &app_file, "acme", "api").unwrap_err();
+    assert!(
+        matches!(&err, InitError::NotInstalledOnRepo { install_url, .. }
+            if install_url == "https://github.com/apps/crew-octo/installations/new"),
+        "{err}"
+    );
+
+    let elsewhere = Arc::new(FakeGithub { repo_installation: Some(7), ..FakeGithub::default() });
+    let err = installed_on(&elsewhere, &clock, &app_file, "acme", "api").unwrap_err();
+    assert!(matches!(err, InitError::OtherInstallation { found: 7, named: 99, .. }), "{err}");
+}
+
+#[test]
+fn every_github_remote_spelling_names_its_owner_and_repo() {
+    for url in [
+        "https://github.com/acme/api.git",
+        "https://github.com/acme/api",
+        "git@github.com:acme/api.git",
+        "ssh://git@github.com/acme/api.git",
+    ] {
+        assert_eq!(deploy::parse_github_remote(url), Some(("acme".into(), "api".into())), "{url}");
+    }
+    assert_eq!(deploy::parse_github_remote("https://gitlab.com/acme/api.git"), None);
+    assert_eq!(
+        deploy::parse_github_remote("ssh://git@other.example/github.com/acme/api.git"),
+        None
+    );
+    assert_eq!(deploy::parse_github_remote("https://github.com.evil/acme/api.git"), None);
+    assert_eq!(
+        deploy::parse_checks("cargo fmt --check && cargo test"),
+        [vec!["cargo", "fmt", "--check"], vec!["cargo", "test"]]
+    );
+    assert!(deploy::parse_checks("  ").is_empty());
+}
+
+#[test]
+fn an_empty_gate_answer_writes_no_commands_even_where_the_clone_suggests_one() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-empty-gate");
+    let port_free = |_: u16| true;
+    let opts = deploy_opts(&dir, &app_file, &port_free);
+    let mut prompt = scripted(&["n", "n", ""]);
+    let written = deploy::write(&clone, &opts, Some(&mut prompt)).unwrap();
+    assert!(prompt.1[2].contains("`cargo test`"), "{:?}", prompt.1);
+    assert!(Config::load(&written.config).unwrap().gate.commands.is_empty());
+}
+
+#[test]
+fn a_script_missing_a_flag_is_refused_before_registration_unless_the_config_exists() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-preflight");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    let err = deploy::check_answers(&clone, &opts, false).unwrap_err();
+    assert!(matches!(err, InitError::NoTerminal { .. }), "{err}");
+    deploy::check_answers(&clone, &opts, true).unwrap();
+
+    opts.answers = Answers { work: Some(false), deliver: Some(false), checks: Some(String::new()) };
+    deploy::write(&clone, &opts, None).unwrap();
+    opts.answers = Answers::default();
+    deploy::check_answers(&clone, &opts, false).unwrap();
+}
+
+#[test]
+fn the_next_command_keeps_a_path_with_spaces_and_quotes_one_argument() {
+    assert_eq!(
+        deploy::next_command(Path::new("/home/op/.crewd/my project's")),
+        r"crewd service install --config '/home/op/.crewd/my project'\''s/crewd.toml'"
+    );
+}
+
+#[test]
+fn a_sibling_that_names_no_bind_keeps_the_default_pair_from_a_new_deployment() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-default-ports");
+    let sibling = dir.join("acme-web");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(
+        sibling.join(deploy::CONFIG_FILE),
+        "[api]\nenabled = true\nmcp_enabled = true\n",
+    )
+    .unwrap();
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.answers = Answers { work: Some(false), deliver: Some(false), checks: Some(String::new()) };
+    let written = deploy::write(&clone, &opts, None).unwrap();
+    let cfg = Config::load(&written.config).unwrap();
+    assert_eq!(
+        (cfg.api.bind.as_str(), cfg.api.mcp_bind.as_str()),
+        ("127.0.0.1:8789", "127.0.0.1:8790")
+    );
+}
+
+#[test]
+fn an_origin_that_is_not_github_is_refused_without_printing_its_token() {
+    let (clone, ..) = deployment_fixture("deploy-token-origin");
+    let url = "https://x-access-token:ghs_SECRET123@git.example.com/acme/api.git";
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&clone.path)
+        .args(["remote", "set-url", "origin", url])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = deploy::Clone::at(&clone.path).unwrap_err().to_string();
+    assert!(!err.contains("ghs_SECRET123") && !err.contains("x-access-token"), "{err}");
+    assert!(err.contains("https://git.example.com/acme/api.git"), "{err}");
+}
+
+#[test]
+fn a_clone_whose_directory_name_ends_in_a_space_is_found_where_it_is() {
+    let (clone, ..) = deployment_fixture("deploy-trailing-space");
+    let spaced = clone.path.parent().unwrap().join("api ");
+    let _ = std::fs::remove_dir_all(&spaced);
+    std::fs::rename(&clone.path, &spaced).unwrap();
+    let found = deploy::Clone::at(&spaced).unwrap();
+    assert_eq!(found.path.canonicalize().unwrap(), spaced.canonicalize().unwrap());
+    assert_eq!((found.owner.as_str(), found.repo.as_str()), ("acme", "api"));
+}
+
+#[test]
+fn a_personal_app_installed_only_on_the_clones_organization_repository_is_found() {
+    let dir = tmp("org-repo");
+    // The creator's own account never gets an installation; the organization's repository does.
+    let github = Arc::new(FakeGithub {
+        installations: Mutex::new(VecDeque::new()),
+        ..FakeGithub::default()
+    });
+    let (mut browser, _seen) = Browser::new(Script::default());
+    let mut o = opts(dir);
+    o.repo = Some(("acme".into(), "api".into()));
+    let registered = run(&github, &FakeClock::new(), &mut browser, &o).unwrap();
+    assert_eq!(registered.installation_id, 99);
+    assert!(
+        !github.calls().iter().any(|c| c.ends_with("/app/installations")),
+        "{:?}",
+        github.calls()
+    );
+}
+
+#[test]
+fn a_placeholder_spelled_inside_a_clone_path_is_written_as_the_path() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-placeholder-path");
+    let odd = clone.path.parent().unwrap().join("{{delivery_enabled}}-{{worker_kind}}");
+    let _ = std::fs::remove_dir_all(&odd);
+    std::fs::rename(&clone.path, &odd).unwrap();
+    let clone = deploy::Clone::at(&odd).unwrap();
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.answers = Answers { work: Some(true), deliver: Some(true), checks: Some(String::new()) };
+    let written = deploy::write(&clone, &opts, None).unwrap();
+    let cfg = Config::load(&written.config).unwrap();
+    assert_eq!(cfg.workspace.repo.unwrap(), clone.path);
+}
+
+#[test]
+fn a_kept_config_for_another_repository_is_refused_before_any_label() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-other-repo");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.name = Some("shared".into());
+    opts.answers = Answers { work: Some(false), deliver: Some(false), checks: Some(String::new()) };
+    let written = deploy::write(&clone, &opts, None).unwrap();
+    let cfg = Config::load(&written.config).unwrap();
+    deploy::check_kept(&written.config, &cfg, &clone).unwrap();
+
+    let other = deploy::Clone { owner: "acme".into(), repo: "web".into(), ..clone };
+    let again = deploy::write(&other, &opts, None).unwrap();
+    assert!(again.kept);
+    let err = deploy::check_kept(&again.config, &cfg, &other).unwrap_err();
+    let err2 = deploy::kept(&other, &opts).unwrap_err();
+    assert!(matches!(err2, InitError::OtherRepo { .. }), "{err2}");
+    assert!(matches!(&err, InitError::OtherRepo { named, .. } if named == "acme/api"), "{err}");
+}
+
+#[test]
+fn a_kept_config_with_a_workers_list_is_pointed_at_its_entries_not_at_a_worker_table() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-workers-list");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    opts.answers =
+        Answers { work: Some(false), deliver: Some(true), checks: Some("make test".into()) };
+    let written = deploy::write(&clone, &opts, None).unwrap();
+    let text = std::fs::read_to_string(&written.config)
+        .unwrap()
+        .replace("[worker]\nkind = \"fake\"", "[[workers]]\nkind = \"fake\"\nmax_concurrent = 1");
+    std::fs::write(&written.config, text).unwrap();
+    let cfg = Config::load(&written.config).unwrap();
+    assert!(!cfg.workers.is_empty());
+    let summary = deploy::summary(&written, &cfg, &[]);
+    assert!(summary.contains("under a [[workers]] entry, set\n    kind = \"claude\""), "{summary}");
+    assert!(!summary.contains("[worker],"), "{summary}");
+}
+
+#[test]
+fn a_linked_worktree_is_refused_before_anything_is_registered_or_written() {
+    let (clone, ..) = deployment_fixture("deploy-linked-worktree");
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(&clone.path).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+    let linked = clone.path.parent().unwrap().join("api-linked");
+    let _ = std::fs::remove_dir_all(&linked);
+    git(&["worktree", "add", "-q", linked.to_str().unwrap()]);
+    let err = deploy::Clone::at(&linked).unwrap_err();
+    assert!(matches!(err, InitError::LinkedWorktree { .. }), "{err}");
+    deploy::Clone::at(&clone.path).unwrap();
+}
+
+#[test]
+fn a_kept_config_is_checked_against_the_app_it_names_not_the_default_settings_file() {
+    let (clone, dir, app_file) = deployment_fixture("deploy-kept-app");
+    let port_free = |_: u16| true;
+    let mut opts = deploy_opts(&dir, &app_file, &port_free);
+    assert!(deploy::kept(&clone, &opts).unwrap().is_none());
+    opts.answers = Answers { work: Some(false), deliver: Some(false), checks: Some(String::new()) };
+    let written = deploy::write(&clone, &opts, None).unwrap();
+    // The operator points the deployment at a second App file and removes the default one.
+    let other = dir.join("other-app.toml");
+    std::fs::rename(&app_file, &other).unwrap();
+    let text = std::fs::read_to_string(&written.config).unwrap().replace(
+        &toml::Value::String(app_file.display().to_string()).to_string(),
+        &toml::Value::String(other.display().to_string()).to_string(),
+    );
+    std::fs::write(&written.config, text).unwrap();
+
+    let cfg = deploy::kept(&clone, &opts).unwrap().unwrap();
+    assert_eq!(cfg.tracker.github_app.as_deref(), Some(other.as_path()));
+    installed_on(&Arc::new(FakeGithub::default()), &FakeClock::new(), &other, "acme", "api")
+        .unwrap();
 }

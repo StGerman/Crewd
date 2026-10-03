@@ -4,10 +4,10 @@
 //! something to render. It can also be told to fail or to hide issues, so the scheduler's
 //! error and grace paths are exercisable without a network.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 
-use super::{Tracker, TrackerError};
+use super::{LabelOutcome, RepoLabels, Tracker, TrackerError};
 use crate::model::Issue;
 
 pub struct FakeTracker {
@@ -20,6 +20,8 @@ struct Inner {
     hidden: HashSet<String>,
     fail_states: Option<TrackerError>,
     fail_ids: Option<TrackerError>,
+    /// The repository's labels, which [`RepoLabels`] creates; never read by the poll.
+    repo_labels: Vec<String>,
     pub calls_by_states: u32,
     pub calls_by_ids: u32,
 }
@@ -32,6 +34,7 @@ impl FakeTracker {
                 hidden: HashSet::new(),
                 fail_states: None,
                 fail_ids: None,
+                repo_labels: Vec::new(),
                 calls_by_states: 0,
                 calls_by_ids: 0,
             }),
@@ -69,42 +72,47 @@ impl FakeTracker {
     }
 
     pub fn set_state(&self, id: &str, state: &str) {
-        if let Some(i) = self.inner.lock().unwrap().issues.get_mut(id) {
+        if let Some(i) = self.inner.lock().issues.get_mut(id) {
             i.state = state.to_string();
         }
     }
 
     pub fn set_body(&self, id: &str, body: Option<&str>) {
-        if let Some(i) = self.inner.lock().unwrap().issues.get_mut(id) {
+        if let Some(i) = self.inner.lock().issues.get_mut(id) {
             i.body = body.map(str::to_string);
         }
     }
 
     pub fn set_dispatchable(&self, id: &str, v: bool) {
-        if let Some(i) = self.inner.lock().unwrap().issues.get_mut(id) {
+        if let Some(i) = self.inner.lock().issues.get_mut(id) {
             i.dispatchable = v;
         }
     }
 
     /// Hide from `by_ids` without deleting — the eventual-consistency blip the grace count exists for.
     pub fn hide(&self, id: &str) {
-        self.inner.lock().unwrap().hidden.insert(id.to_string());
+        self.inner.lock().hidden.insert(id.to_string());
     }
 
     pub fn unhide(&self, id: &str) {
-        self.inner.lock().unwrap().hidden.remove(id);
+        self.inner.lock().hidden.remove(id);
     }
 
     pub fn fail_by_states(&self, e: Option<TrackerError>) {
-        self.inner.lock().unwrap().fail_states = e;
+        self.inner.lock().fail_states = e;
     }
 
     pub fn fail_by_ids(&self, e: Option<TrackerError>) {
-        self.inner.lock().unwrap().fail_ids = e;
+        self.inner.lock().fail_ids = e;
+    }
+
+    /// The repository's labels, in the order they were created.
+    pub fn repo_labels(&self) -> Vec<String> {
+        self.inner.lock().repo_labels.clone()
     }
 
     pub fn call_counts(&self) -> (u32, u32) {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock();
         (g.calls_by_states, g.calls_by_ids)
     }
 }
@@ -114,7 +122,7 @@ impl Tracker for FakeTracker {
         if states.is_empty() {
             return Ok(vec![]); // no provider request for an empty query
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         g.calls_by_states += 1;
         if let Some(e) = &g.fail_states {
             return Err(e.clone());
@@ -134,7 +142,7 @@ impl Tracker for FakeTracker {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         g.calls_by_ids += 1;
         if let Some(e) = &g.fail_ids {
             return Err(e.clone());
@@ -144,6 +152,18 @@ impl Tracker for FakeTracker {
             .filter(|id| !g.hidden.contains(*id))
             .filter_map(|id| g.issues.get(id).cloned())
             .collect())
+    }
+}
+
+/// GitHub's label names compare without case, so `Agent` is the existing `agent`.
+impl RepoLabels for FakeTracker {
+    fn ensure_label(&self, name: &str) -> Result<LabelOutcome, TrackerError> {
+        let mut g = self.inner.lock();
+        if g.repo_labels.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+            return Ok(LabelOutcome::Kept);
+        }
+        g.repo_labels.push(name.to_string());
+        Ok(LabelOutcome::Created)
     }
 }
 

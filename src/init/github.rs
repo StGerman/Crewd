@@ -12,7 +12,7 @@
 //! `credentials::GithubApp` because this branch was written before that one landed; whichever
 //! merges second should keep one.
 
-use crate::credentials::{AppSigner, parse_app_key};
+use crate::credentials::{AppSigner, GithubAppFile, parse_app_key};
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
@@ -115,6 +115,12 @@ impl AppAuth {
         Ok(Self { signer: AppSigner::new(app_id, key) })
     }
 
+    /// The App a settings file from an earlier `crewd init`, or a hand-registered one, names.
+    pub fn from_file(file: &GithubAppFile) -> Result<Self, InitError> {
+        let key = file.load_key().map_err(|e| InitError::Key(e.to_string()))?;
+        Ok(Self { signer: AppSigner::new(file.app_id, key) })
+    }
+
     fn jwt(&self, now: Wall) -> Result<String, InitError> {
         self.signer.jwt(now).map_err(InitError::Key)
     }
@@ -176,6 +182,48 @@ impl AppAuth {
             InitError::Api { what: "/app/installations".into(), detail: e.to_string() }
         })?;
         Ok(all.into_iter().find(|i| i.account.login.eq_ignore_ascii_case(owner)).map(|i| i.id))
+    }
+}
+
+impl AppAuth {
+    pub fn slug(&self, http: &dyn Http, now: Wall) -> Result<String, InitError> {
+        #[derive(Deserialize)]
+        struct App {
+            slug: String,
+        }
+        let resp = self.get(http, "/app", now)?;
+        let app: App = serde_json::from_slice(&resp.body)
+            .map_err(|e| InitError::Api { what: "/app".into(), detail: e.to_string() })?;
+        Ok(app.slug)
+    }
+
+    /// The installation that covers `owner/repo`, or `None` when the App is not installed on it:
+    /// an installation on the account with this repository left out of its selection is `None`
+    /// too, which is the case a check on the account alone would pass.
+    pub fn repo_installation(
+        &self,
+        http: &dyn Http,
+        owner: &str,
+        repo: &str,
+        now: Wall,
+    ) -> Result<Option<u64>, InitError> {
+        #[derive(Deserialize)]
+        struct Installation {
+            id: u64,
+        }
+        let path = format!("/repos/{owner}/{repo}/installation");
+        let url = format!("{API_BASE}{path}");
+        let resp = http
+            .get(&url, &headers(Some(self.jwt(now)?)))
+            .map_err(|e| InitError::Transport(e.0))?;
+        tracing::debug!(status = resp.status, path, "read the repository's installation");
+        match resp.status {
+            404 => Ok(None),
+            200 => serde_json::from_slice::<Installation>(&resp.body)
+                .map(|i| Some(i.id))
+                .map_err(|e| InitError::Api { what: path, detail: e.to_string() }),
+            _ => Err(InitError::Api { what: path, detail: snippet(&resp) }),
+        }
     }
 }
 

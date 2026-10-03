@@ -52,6 +52,21 @@ impl From<AuthError> for TrackerError {
     }
 }
 
+/// Whether [`RepoLabels::ensure_label`] made the label or found it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelOutcome {
+    Created,
+    Kept,
+}
+
+/// Creating a repository's labels, for `crewd init` only (#247): a label that does not exist
+/// cannot be put on an issue, so a dispatch label nobody created is a backlog nothing reaches.
+/// Never part of [`Tracker`], which the scheduler polls and which stays read-only.
+pub trait RepoLabels {
+    /// Creates `name` unless the repository already has it, and never edits one that exists.
+    fn ensure_label(&self, name: &str) -> Result<LabelOutcome, TrackerError>;
+}
+
 /// Without this an issue labelled `Agent` never matches a configured `agent` and is never
 /// dispatched (#70): `routable` compares with plain equality against `required_labels`, which
 /// `Config::normalize` has already given this same shape.

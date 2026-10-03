@@ -113,7 +113,28 @@ cargo run -p crewctl -- status
 `crewctl` reads the same `/api/v1` a program of your own can drive; what v1 keeps stable is
 [docs/api-v1.md](docs/api-v1.md).
 
-### Pointing it at your own repository
+### Quickstart
+
+Install the binary once (`cargo install --locked --path .` in the clone above), then, inside a
+clone of your own repository whose `origin` is on GitHub:
+
+```bash
+crewd init
+crewd service install --config ~/.crewd/<owner>-<repo>/crewd.toml
+```
+
+and label an issue `agent`. The second command runs the deployment as a login service
+(below); `crewd --config ~/.crewd/<owner>-<repo>/crewd.toml` runs it in the foreground instead.
+
+`crewd init` registers a GitHub App for crewd (below; once per machine, two clicks), checks it
+is installed on the repository, and writes `~/.crewd/<owner>-<repo>/crewd.toml`. It asks two
+questions, both defaulting to yes: whether agents work issues (`--work`/`--no-work`) and whether
+it opens pull requests (`--deliver`/`--no-deliver`). It suggests the gate's check command from
+the clone (`--checks` answers that). Then it creates the `agent` label and every `state:` label
+the config names, as the App. It never overwrites a config or a label, so running it again is
+how you see what it kept and which switches are still off, with the one line that turns each on.
+
+### Pointing it at your own repository by hand
 
 1. **Copy `crew.github.toml`** and set `tracker.owner` / `tracker.repo` to yours. Both
    shipped configs are heavily commented; the comments explain why each number is what it is,
@@ -132,7 +153,7 @@ cargo run -p crewctl -- status
    your credentials. Off by default.
 
 Steps 4 and 5 are separate switches on purpose. Turning this from "watch my backlog" into
-"work my backlog" should be a decision you make twice.
+"work my backlog" should be a decision you make twice; `crewd init` asks each one separately.
 
 ### Running it as a service
 
@@ -185,7 +206,7 @@ By default every comment, label and branch is authored by *you*, because the tok
 GitHub App gives the daemon its own identity, so its writes are distinguishable from yours and
 it can hold `contents: write` while being denied merge entirely.
 
-`cargo run -- init` registers that App for you in two clicks and writes the file below. To do
+`crewd init` registers that App for you in two clicks and writes the file below. To do
 it by hand instead, register an App with `contents`, `issues` and `pull_requests` set to
 **write** and `checks` set to **read** (delivery reads CI through the check-runs API, and
 without it every delivery is handed off on a 403 right after its pull request opens). Add
