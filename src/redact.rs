@@ -55,7 +55,15 @@ static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
         (r"\bAIza[0-9A-Za-z_-]{35}".into(), MARKER.into()),
         (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b".into(), MARKER.into()),
         (r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+".into(), MARKER.into()),
-        (r"(?i)\b(bearer|authorization:\s*basic)(\s+)[A-Za-z0-9._~+/-]{8,}=*".into(), format!("${{1}}${{2}}{MARKER}")),
+        // Any spelling of the header: raw, `=`, JSON-quoted or coloured by `tracing`. The scheme
+        // is kept and only the credential after it replaced.
+        (
+            format!(
+                r#"(?i)(\b[A-Za-z0-9_-]*authorization{sep}(?:basic|bearer|token|digest)?{ANSI}\s*)[A-Za-z0-9._~+/-]{{6,}}=*"#
+            ),
+            format!("${{1}}{MARKER}"),
+        ),
+        (r"(?i)\b(bearer)(\s+)[A-Za-z0-9._~+/-]{8,}=*".into(), format!("${{1}}${{2}}{MARKER}")),
         // A quoted value runs to its closing quote, JSON-escaped or not: stopping at whitespace
         // would leave `horse battery staple` of a quoted passphrase in place.
         (format!(r#"{kv_name}({quoted_sep})(\\")(?:[^"\\]|\\[^"])+(\\")"#), quoted.clone()),
@@ -109,8 +117,11 @@ impl LineRedactor {
             self.in_pem = false;
             return Cow::Owned(format!("{MARKER}{}", redact(&line[end.end()..])));
         }
+        // Only a header that ends its physical line opens a block across lines: one inside a
+        // JSON line with its newlines escaped has already been redacted to that line's end, and
+        // carrying it on would blank every event after it.
         if let Some(begin) = PEM_BEGIN.find_iter(line).last() {
-            self.in_pem = !PEM_END.is_match(&line[begin.end()..]);
+            self.in_pem = line[begin.end()..].trim().is_empty();
         }
         redact(line)
     }
@@ -249,6 +260,42 @@ mod tests {
             out,
             ["key follows", MARKER, MARKER, MARKER, &format!("{MARKER} tail"), "after"]
         );
+    }
+
+    #[test]
+    fn an_unterminated_pem_inside_one_json_line_does_not_blank_the_lines_after_it() {
+        let mut r = LineRedactor::default();
+        let cut = r#"{"content":"-----BEGIN PRIVATE KEY-----\nMIIEow\nAAAA","x":1}"#;
+        assert_eq!(r.redact(cut), format!(r#"{{"content":"{MARKER}"#));
+        let next = r#"{"type":"assistant","message":{"content":"done"}}"#;
+        assert_eq!(r.redact(next), next);
+    }
+
+    #[test]
+    fn an_authorization_credential_is_replaced_in_every_spelling_and_the_scheme_kept() {
+        let cred = "dXNlcjp0b2tlbg==";
+        for (line, want) in [
+            (format!("Authorization: Basic {cred}"), format!("Authorization: Basic {MARKER}")),
+            (
+                format!("Authorization=Basic {cred} next"),
+                format!("Authorization=Basic {MARKER} next"),
+            ),
+            (
+                format!(r#"{{"Authorization": "Basic {cred}"}}"#),
+                format!(r#"{{"Authorization": "Basic {MARKER}"}}"#),
+            ),
+            (
+                format!(r#"{{\"authorization\":\"token {cred}\"}}"#),
+                format!(r#"{{\"authorization\":\"token {MARKER}\"}}"#),
+            ),
+            (format!("proxy-authorization: {cred}"), format!("proxy-authorization: {MARKER}")),
+            (
+                format!("\x1b[3mauthorization\x1b[0m\x1b[2m=\x1b[0mBasic {cred} x"),
+                format!("\x1b[3mauthorization\x1b[0m\x1b[2m=\x1b[0mBasic {MARKER} x"),
+            ),
+        ] {
+            assert_eq!(redact(&line), want);
+        }
     }
 
     #[test]
