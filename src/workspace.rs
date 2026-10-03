@@ -1544,12 +1544,39 @@ mod tests {
         let root = tmp_root("escape");
         let ws = DirWorkspace::new(&root).unwrap();
 
-        for bad in ["../../etc", "/etc/passwd", "..", "a/../../b"] {
+        let hostile = ["../../etc", "/etc/passwd", "..", "a/../../b"];
+        for bad in hostile {
             let p = ws.prepare("id-x", bad).unwrap();
             assert!(p.path.starts_with(ws.root()), "{bad} escaped the root: {}", p.path.display());
             assert_eq!(p.path.parent().unwrap(), ws.root(), "must be exactly one level deep");
+            ws.remove("id-x", bad).unwrap();
+            assert!(!p.path.exists(), "{bad}: remove left its workspace behind");
         }
-        std::fs::remove_dir_all(&root).ok();
+
+        // Sanitisation keeps every identifier one component deep, so `remove`'s own check is
+        // what refuses a root that resolves elsewhere by cleanup time (section 6 of
+        // docs/symphony.md). Swap the root for a link to a directory holding a same-named one.
+        let outside = tmp_root("escape-outside");
+        for bad in hostile {
+            let victim = outside.join(worktree_key("id-x", bad));
+            std::fs::create_dir_all(&victim).unwrap();
+            std::fs::write(victim.join("keep"), b"outside the root").unwrap();
+        }
+        let parked = root.with_file_name(format!("{}-parked", root.file_name().unwrap().display()));
+        std::fs::rename(ws.root(), &parked).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.root()).unwrap();
+        for bad in hostile {
+            let refused = ws.remove("id-x", bad);
+            assert!(
+                matches!(refused, Err(WorkspaceError::OutsideRoot { .. })),
+                "{bad}: remove followed the root outside it: {refused:?}"
+            );
+            let victim = outside.join(worktree_key("id-x", bad));
+            assert!(victim.join("keep").exists(), "{bad}: remove deleted {}", victim.display());
+        }
+        std::fs::remove_file(ws.root()).ok();
+        std::fs::remove_dir_all(&parked).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     // ---- GitWorktreeWorkspace -------------------------------------------------
@@ -1735,12 +1762,37 @@ mod tests {
         let repo = tmp_repo("wt-escape");
         let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
 
-        for (i, bad) in ["../../etc", "/etc/passwd", "..", "a/../../b"].iter().enumerate() {
+        let hostile = ["../../etc", "/etc/passwd", "..", "a/../../b"];
+        for (i, bad) in hostile.iter().enumerate() {
             let p = ws.prepare(&format!("id-{i}"), bad).unwrap();
             assert!(p.path.starts_with(ws.root()), "{bad} escaped the root: {}", p.path.display());
             assert_eq!(p.path.parent().unwrap(), ws.root(), "must be exactly one level deep");
+            ws.remove(&format!("id-{i}"), bad).unwrap();
+            assert!(!p.path.exists(), "{bad}: remove left its worktree behind");
         }
-        std::fs::remove_dir_all(&root).ok();
+
+        // As in the plain-directory test: the root resolves elsewhere by cleanup time. Here the
+        // worktrees themselves move out with it, so git would still recognise and delete them.
+        for (i, bad) in hostile.iter().enumerate() {
+            let p = ws.prepare(&format!("id-{i}"), bad).unwrap();
+            std::fs::write(p.path.join("keep"), b"outside the root").unwrap();
+        }
+        let outside =
+            root.with_file_name(format!("{}-outside", root.file_name().unwrap().display()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::rename(ws.root(), &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.root()).unwrap();
+        for (i, bad) in hostile.iter().enumerate() {
+            let refused = ws.remove(&format!("id-{i}"), bad);
+            assert!(
+                matches!(refused, Err(WorkspaceError::OutsideRoot { .. })),
+                "{bad}: remove followed the root outside it: {refused:?}"
+            );
+            let victim = outside.join(worktree_key(&format!("id-{i}"), bad));
+            assert!(victim.join("keep").exists(), "{bad}: remove deleted {}", victim.display());
+        }
+        std::fs::remove_file(ws.root()).ok();
+        std::fs::remove_dir_all(&outside).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
