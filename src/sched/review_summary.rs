@@ -15,7 +15,7 @@
 //! The summary is handed over whole. Copilot's format is not a published contract, and a parser
 //! for its sections that drifted would drop findings silently; a noisy summary costs one
 //! `rejected` verdict instead. The only text recognised is the one that says there is nothing:
-//! a body that is "Findings: None" once Copilot's template is set aside — headings, HTML
+//! a body that is "Findings: None" (or "0") once Copilot's template is set aside — headings, HTML
 //! comments and tags, the "Review effort" line, and its section labels (#201). Any prose left
 //! over is a finding, except the overview sentence under Copilot's status heading, whatever its
 //! emoji, when the count says there is none (#234, #280); a template line counted as one spent a
@@ -255,6 +255,7 @@ mod tests {
         assert!(!carries_findings("", true));
         assert!(!carries_findings("  \n\n", true));
         assert!(!carries_findings("**Findings:** None", true));
+        assert!(!carries_findings("**Findings:** 0", true));
         assert!(!carries_findings(
             "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n**Findings:** None\n",
             true

@@ -616,9 +616,10 @@ reviews' summaries and the conversation, since a reviewer can leave a finding on
 in the same conversation, so the login the forge posts as is learned when delivery is attached
 (`GET /app`'s slug as `<slug>[bot]` for an App, `GET /user` for a token), and startup fails if it
 cannot be. A summary on the current head in the `COMMENTED` or `CHANGES_REQUESTED` state that
-says more than "Findings: None" and Copilot's template (headings, tags, the "Review effort" line,
-section labels; #201), or than the overview sentence under Copilot's status heading, whatever
-its emoji, that also says "Findings: None" or "0" (#234, #280), is handed back whole as one more comment keyed `review-<id>`:
+says more than "Findings: None" (or "0") and Copilot's template (headings, tags, the "Review
+effort" line, section labels; #201), or than the overview sentence under Copilot's status
+heading, whatever its emoji, before that count (#234, #280), is handed back whole as one more
+comment keyed `review-<id>`:
 no parser for its sections, whose format is nobody's contract, and noise costs one `rejected`
 verdict. A conversation comment is handed back keyed `conversation-<id>`, whenever it was written:
 GitHub records no time a head was pushed, a commit's date is not one, and a cutoff would drop a
