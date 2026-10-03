@@ -567,13 +567,17 @@ listing and a log dig to find.
 **A release** is a `v<version>` tag cut by hand when a milestone closes (#248). Versions stay
 `0.x` until the v1 promise (#245) and the store schema are declared stable. dist builds it from
 `dist-workspace.toml` into `.github/workflows/v-release.yml`, which is generated: change the
-config and run `dist generate`, because `dist plan` fails on a hand-edited copy. On a pull
+config and run `dist generate`. The two edits dist cannot express, marked `Hand-edited (#272)`,
+are why the config sets `allow-dirty = ["ci"]`: a pull request's plan job runs with a read-only
+token (#259), and a rerun of the Homebrew publish skips an empty commit. On a pull
 request that workflow only plans; on a tag it builds `aarch64-apple-darwin` and
 `x86_64-unknown-linux-gnu`, attaches the archives and a shell installer per binary to a GitHub
 release, pushes one Homebrew formula per binary to `StGerman/homebrew-tap`, runs `cargo publish
 --workspace` (`publish-crates.yml`, since dist has no crates.io publisher), and puts GitHub's
 generated notes above the install instructions (`release-notes.yml`), so there is no
-CHANGELOG.md. `tests/release.rs` fails if a pull request could reach any job past the plan, and
+CHANGELOG.md. `tests/release.rs` fails if a pull request could reach any job past the plan, if either hand
+edit is lost, or if `dist plan` stops listing both binaries' archives, shell installers and
+formulae (CI's `release-plan` job, which installs dist), and
 the CI `package` job runs `cargo package --workspace`, so missing crates.io metadata fails a pull
 request rather than a tag. The `crew` library is published only because `crewd` is, and makes
 no API promise until `crew-core` (#84).
