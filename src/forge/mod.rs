@@ -308,7 +308,9 @@ pub trait Publisher: Send + Sync {
     /// local rewrite of commits it already held — the gate rebasing onto a base that moved
     /// (#227) — and is left for that push to replace. Called before every agent run, every
     /// re-gate and every delivery push, so the branch those build on is the one the pull request
-    /// shows.
+    /// shows, and before the gate of a run that reported `Done`, so a head the agent pushed
+    /// itself is the lease before the gate's rebase rewrites it (#269). A worktree mid-rebase or
+    /// mid-merge is refused, not synced.
     fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError>;
 
     /// Push `branch` from `worktree` to `remote`, and list its commits over `base`.

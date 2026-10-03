@@ -670,7 +670,9 @@ The lease is a ref crewd owns, `refs/crew/lease/<branch>`, written by `Publisher
 `publish` and by nothing else (#163). The bare `--force-with-lease` took it from
 `refs/remotes/<remote>/<branch>`, which any fetch in `workspace.repo` moves onto commits the
 worktree never had, so the push replaced an operator's merge instead of refusing. `sync` runs
-before every agent run (`launch`), every re-gate and every delivery push: it fetches the branch.
+before every agent run (`launch`), every re-gate and every delivery push, and before the gate of
+a run that reported `Done`, because an agent can push its own branch and the lease would not
+name that head once the gate rebased it (#269). It fetches the branch.
 When the fetched head is the one the lease already names, the remote has not moved since the
 last sync or publish. A divergence is a local rewrite of commits the worktree already held —
 the gate rebasing onto a base that moved — so the worktree

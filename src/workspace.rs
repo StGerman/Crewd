@@ -1249,6 +1249,20 @@ impl Workspace for GitWorktreeWorkspace {
 impl Publisher for GitWorktreeWorkspace {
     fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError> {
         self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        // A merge into a worktree the agent left mid-rebase or mid-merge would land on the
+        // rebase's detached head, or abort the agent's own merge on the way out, and the gate
+        // after the sync before it (#269) would then never see the state to report it `Stuck`.
+        // Unreadable counts as in progress, as the gate's own check does.
+        let in_progress = ["rebase-merge", "rebase-apply", "MERGE_HEAD"].iter().any(|p| {
+            Self::git(worktree, &["rev-parse", "--path-format=absolute", "--git-path", p])
+                .map_or(true, |p| Path::new(&p).exists())
+        });
+        if in_progress {
+            return Err(ForgeError::Permanent(format!(
+                "{} is mid-rebase or mid-merge; not syncing it with {remote}/{branch}",
+                worktree.display()
+            )));
+        }
         // Asked of the remote, not read off `refs/remotes/`: that ref is what `workspace.repo`
         // last fetched, which is neither current nor anything this worktree took in.
         let full = format!("refs/heads/{branch}");
@@ -3179,6 +3193,39 @@ mod tests {
         assert_eq!(parents.split_whitespace().count(), 2, "the replaced head is not a merge");
 
         for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #269 syncs a worktree as the agent left it, before the gate has checked it. One left
+    /// mid-merge keeps its merge, so the gate still finds it and reports it `Stuck`.
+    #[test]
+    fn a_worktree_left_mid_merge_is_not_synced_and_keeps_its_merge() {
+        let root = tmp_root("wt-sync-mid-merge");
+        let (repo, bare) = repo_with_remote("wt-sync-mid-merge");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-mid-merge-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+
+        git_out(&p.path, &["checkout", "-q", "-b", "side", "HEAD~1"]).unwrap();
+        commit_in(&p.path, "a.txt", "the side's version");
+        git_out(&p.path, &["checkout", "-q", &branch]).unwrap();
+        assert!(git_out(&p.path, &["merge", "-q", "side"]).is_err(), "the agent's merge stops");
+
+        assert!(matches!(ws.sync(&p.path, &branch, "origin"), Err(ForgeError::Permanent(_))));
+        assert!(
+            git_out(&p.path, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_ok(),
+            "the agent's merge is still in progress for the gate to find"
+        );
+        assert!(!p.path.join("theirs.txt").exists(), "nothing was merged over it");
+
+        for d in [&root, &repo, &bare, &other] {
             std::fs::remove_dir_all(d).ok();
         }
     }
