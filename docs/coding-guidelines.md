@@ -219,8 +219,7 @@ neither a crates.io nor a tarball install. Its `encoding` default only decodes W
 output and is off. It adds `plist`, `xml-rs`, `quick-xml`, `which` and `dirs` to the tree. Both
 definitions are written here and passed through the crate's `contents` override: `plist` is
 named directly because the crate's own plist has no `StandardOutPath`, and the crate's systemd
-template leaves `ExecStart` and `WorkingDirectory` unquoted, so a path with a space would split
-(#276). crewd still runs three manager calls itself. One is `systemctl --user daemon-reload`,
+template leaves `ExecStart` unquoted, so a `--config` path with a space would split (#276). crewd still runs three manager calls itself. One is `systemctl --user daemon-reload`,
 after writing or removing a unit, because the crate does not reload and a reinstall would
 otherwise start the cached definition (`Reloading` in `src/service.rs`). The others are
 `launchctl print` and `launchctl bootout` against `gui/<uid>/<label>`, because the crate's

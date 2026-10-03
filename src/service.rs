@@ -21,8 +21,8 @@
 //!   so a new binary comes up.
 //! - On macOS the plist is written here rather than by the crate, which has no key for
 //!   `StandardOutPath`/`StandardErrorPath` and would add `Disabled` to a `KeepAlive` job.
-//! - On Linux the unit is written here too: the crate's template leaves `ExecStart` and
-//!   `WorkingDirectory` unquoted, so a deployment path with a space would split (#276).
+//! - On Linux the unit is written here too: the crate's template leaves `ExecStart` unquoted,
+//!   so the `--config` argument of a deployment path with a space would split (#276).
 //! - Install and uninstall ask the manager whether the service is loaded rather than trusting
 //!   the definition file, which outlives or predeceases what the manager holds (#276).
 
@@ -142,7 +142,8 @@ impl<M: ServiceManager> ServiceManager for Reloading<M> {
         // A retry after a failed reload finds the unit already disabled and its file gone, which
         // the crate's `disable` refuses; the reload is all that is left, and without it systemd
         // keeps the cached unit (#276).
-        if self.unit_dir.join(format!("{}.service", ctx.label.to_script_name())).exists() {
+        // `try_exists`: an unreadable directory must fail the uninstall, not read as removed.
+        if self.unit_dir.join(format!("{}.service", ctx.label.to_script_name())).try_exists()? {
             self.inner.uninstall(ctx)?;
         }
         (self.reload)()
@@ -613,7 +614,10 @@ pub fn uninstall(
     let status = manager
         .status(ServiceStatusCtx { label: ctx.clone() })
         .map_err(fail("reading the state of"))?;
-    if status == ServiceStatus::NotInstalled && !definition.exists() {
+    let on_disk = definition
+        .try_exists()
+        .map_err(|source| ServiceError::Path { path: definition.clone(), source })?;
+    if status == ServiceStatus::NotInstalled && !on_disk {
         return Ok(Uninstalled::NeverInstalled { label, definition });
     }
     // systemd's `disable` leaves a running unit running after its file is gone, so a stop that
@@ -1001,6 +1005,22 @@ mod tests {
             ],
         };
         insta::assert_snapshot!(plan.unit().unwrap());
+    }
+
+    #[test]
+    fn uninstall_fails_when_the_unit_directory_cannot_be_read() {
+        let (root, host) = sandbox("unreadable");
+        let unit_dir = host.systemd_user_dir.clone().unwrap();
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::set_permissions(&unit_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let manager = FakeManager::default();
+        let got = uninstall(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Systemd);
+        std::fs::set_permissions(&unit_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root reads through any mode, so there is nothing unreadable to assert on.
+        if !nix::unistd::getuid().is_root() {
+            assert!(matches!(got, Err(ServiceError::Path { .. })), "never NeverInstalled: {got:?}");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

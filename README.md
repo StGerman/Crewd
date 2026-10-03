@@ -174,9 +174,11 @@ Nothing else is: the install refuses a config whose credential would come from `
 `JIRA_*`, so name a credentials file instead, and it needs `crewd` on that `PATH`, which `cargo
 install` provides. The install prints where the logs go: `crewd.log` beside the config on macOS,
 the user journal on Linux, where it also tells you if `loginctl enable-linger` is needed to keep
-the service up after you log out. On Linux every path and value is quoted and escaped in the
-unit, so a deployment directory with a space works; only one ending in a space or a backslash,
-or holding a line break, is refused by name, because systemd's `WorkingDirectory=` cannot hold it.
+the service up after you log out. On Linux the command line and the captured environment are
+quoted and escaped in the unit, and the working directory is written as is with `%` doubled, so
+a deployment directory with a space works. One holding a control character such as a line
+break, or ending in whitespace or a backslash, is refused by name, because systemd's
+`WorkingDirectory=` cannot hold it.
 Install and uninstall report success only when the service manager agrees: a running service
 that will not stop fails the install, and an uninstall interrupted after removing the unit
 finishes when run again. `crewd service uninstall --config <same path>` removes it.
