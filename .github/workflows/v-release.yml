@@ -53,6 +53,11 @@ jobs:
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
+    # Hand-edited (#272): a pull request's run would otherwise hand this job a write-capable token
+    # as GH_TOKEN (#259). `dist host --steps=create` writes nothing to GitHub; the `host` job
+    # creates the release, so the tag run needs no more than this either.
+    permissions:
+      "contents": "read"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -320,7 +325,9 @@ jobs:
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
 
             git add "Formula/${filename}"
-            git commit -m "${name} ${version}"
+            # Hand-edited (#272): a rerun after the formulae were pushed has nothing to commit, and
+            # a failed commit here would block `announce` and the release notes.
+            git diff --cached --quiet || git commit -m "${name} ${version}"
           done
           git push
 

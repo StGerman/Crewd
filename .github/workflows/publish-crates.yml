@@ -32,7 +32,17 @@ jobs:
           cargo --version
           rustup show active-toolchain
       - name: cargo publish --workspace
+        # A failed `cargo metadata` or `jq` inside `< <(...)` would leave an empty list and a green
+        # job that published nothing (#272): the list is a file, written under `pipefail`, and an
+        # empty one fails the job.
+        shell: bash
         run: |
+          set -euo pipefail
+          cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | "\(.name) \(.version)"' > "$RUNNER_TEMP/packages"
+          if [[ ! -s "$RUNNER_TEMP/packages" ]]; then
+            echo "cargo metadata listed no publishable package"; exit 1
+          fi
           exclude=()
           total=0
           while read -r name version; do
@@ -51,8 +61,7 @@ jobs:
               echo "$name $version is already on crates.io"
               exclude+=(--exclude "$name")
             fi
-          done < <(cargo metadata --locked --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.publish != []) | "\(.name) \(.version)"')
+          done < "$RUNNER_TEMP/packages"
           if (( ${#exclude[@]} / 2 == total )); then
             echo "every package is already on crates.io"
             exit 0

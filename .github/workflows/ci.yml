@@ -125,3 +125,25 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo package --workspace
         run: cargo package --workspace --locked
+
+  # dist's own plan, not its config, is what a release ships (#272): this runs the one test that
+  # needs dist on PATH, at the version `dist-workspace.toml` pins, which the test checks.
+  release-plan:
+    name: release-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve pinned toolchain
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^cargo-dist-version = "\(.*\)"$/\1/p' dist-workspace.toml)
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v$version/cargo-dist-installer.sh" | sh
+      - name: dist plan
+        run: cargo test --locked --test release -- --ignored
