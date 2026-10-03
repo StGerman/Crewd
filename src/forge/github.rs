@@ -930,28 +930,32 @@ fn body_snippet(resp: &HttpResponse) -> String {
 /// Keeps only the newest check run of each name, by `started_at` and then by id, in the order
 /// each name first appears. A workflow with `concurrency: cancel-in-progress` cancels the older
 /// run when the same head gets a second event, and that cancelled run is not this head's CI
-/// (#268); a newest run that is itself cancelled is still kept, and still fails. A run with no
-/// readable `started_at`, such as one still queued, is compared by id alone, which GitHub
-/// assigns in creation order, so it is never judged older than the run it replaced.
+/// (#268); a newest run that is itself cancelled is still kept, and still fails. When any run of
+/// a name has no readable `started_at`, such as one still queued, that whole name is ordered by
+/// id alone, which GitHub assigns in creation order: one ordering per name, so the run chosen
+/// never depends on the order the response lists them in.
 fn newest_of_each_name(runs: Vec<GhCheckRun>) -> Vec<GhCheckRun> {
     fn started(r: &GhCheckRun) -> Option<OffsetDateTime> {
         r.started_at.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
     }
-    fn is_newer(a: &GhCheckRun, b: &GhCheckRun) -> bool {
-        match (started(a), started(b)) {
-            (Some(x), Some(y)) if x != y => x > y,
-            _ => a.id > b.id,
-        }
-    }
-    let mut newest: Vec<GhCheckRun> = Vec::new();
+    let mut groups: Vec<Vec<GhCheckRun>> = Vec::new();
     for run in runs {
-        match newest.iter_mut().find(|n| n.name == run.name) {
-            Some(n) if is_newer(&run, n) => *n = run,
-            Some(_) => {}
-            None => newest.push(run),
+        match groups.iter_mut().find(|g| g[0].name == run.name) {
+            Some(g) => g.push(run),
+            None => groups.push(vec![run]),
         }
     }
-    newest
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let timed: Option<Vec<(OffsetDateTime, u64)>> =
+                group.iter().map(|r| started(r).map(|t| (t, r.id))).collect();
+            match timed {
+                Some(keys) => group.into_iter().zip(keys).max_by_key(|(_, k)| *k).map(|(r, _)| r),
+                None => group.into_iter().max_by_key(|r| r.id),
+            }
+        })
+        .collect()
 }
 
 /// Extracts the job id from a `details_url` shaped like
@@ -1456,6 +1460,27 @@ mod tests {
         ] })));
         let f = forge(http);
         assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending { running: vec!["test".into()] });
+    }
+
+    #[test]
+    fn the_run_chosen_does_not_depend_on_the_order_the_response_lists_them() {
+        let mut queued = gh_check_run("test", "queued", None, None);
+        queued["id"] = json!(2);
+        let runs = [
+            timed_run(1, "test", "2026-10-03T08:32:00Z", "completed", Some("success")),
+            queued,
+            timed_run(3, "test", "2026-10-03T08:31:00Z", "completed", Some("cancelled")),
+        ];
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let http = FakeHttp::new();
+            let listed: Vec<Value> = order.iter().map(|&i| runs[i].clone()).collect();
+            http.push(ok(json!({ "check_runs": listed })));
+            let f = forge(http);
+            let CiStatus::Failure { failures } = f.ci_status("sha").unwrap() else {
+                panic!("order {order:?}: the highest id, the cancelled run, must decide")
+            };
+            assert_eq!(failures.len(), 1, "order {order:?}");
+        }
     }
 
     #[test]
