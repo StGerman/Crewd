@@ -850,8 +850,8 @@ fn register(
 
 fn run_service(action: ServiceCmd) -> anyhow::Result<()> {
     let platform = service::Platform::native()?;
-    let manager = platform.manager();
     let host = service::Host::from_env().context("reading the installing environment")?;
+    let manager = platform.manager(&host)?;
     match action {
         ServiceCmd::Install { config } => {
             let done = service::install(manager.as_ref(), &config, &host, platform)?;
@@ -887,7 +887,8 @@ fn run_service(action: ServiceCmd) -> anyhow::Result<()> {
                 }
                 service::Uninstalled::NeverInstalled { label, definition } => {
                     println!(
-                        "{label} is not installed ({} does not exist); nothing to do.",
+                        "{label} is not installed (the service manager does not know it and {} \
+                         does not exist); nothing to do.",
                         definition.display()
                     );
                 }

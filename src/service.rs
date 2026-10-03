@@ -21,15 +21,19 @@
 //!   so a new binary comes up.
 //! - On macOS the plist is written here rather than by the crate, which has no key for
 //!   `StandardOutPath`/`StandardErrorPath` and would add `Disabled` to a `KeepAlive` job.
+//! - On Linux the unit is written here too: the crate's template leaves `ExecStart` unquoted,
+//!   so the `--config` argument of a deployment path with a space would split (#276).
+//! - Install and uninstall ask the manager whether the service is loaded rather than trusting
+//!   the definition file, which outlives or predeceases what the manager holds (#276).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use service_manager::{
-    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx,
-    ServiceStopCtx, ServiceUninstallCtx,
+    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStatus,
+    ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 
 use crate::config::{Config, ConfigError};
@@ -40,6 +44,10 @@ pub const LABEL_PREFIX: &str = "dev.crewd.";
 
 /// The log file a launchd service writes, in the deployment directory.
 pub const LOG_FILE: &str = "crewd.log";
+
+/// launchd throttles a respawn to ten seconds; the same here keeps systemd under its default
+/// start limit, which would otherwise give up after five quick failures.
+const RESTART_DELAY_SECS: u32 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -65,7 +73,10 @@ pub enum ServiceError {
     NoHome,
     #[error("per-user services are supported on macOS (launchd) and Linux (systemd) only")]
     Unsupported,
-    #[error("{what} {value:?} contains {ch:?}, which a systemd unit would not pass through as is")]
+    #[error(
+        "the deployment directory {value:?} {what} {ch:?}, which systemd's WorkingDirectory= \
+         cannot hold"
+    )]
     Unquotable { what: &'static str, value: String, ch: char },
     #[error("writing the launchd plist: {0}")]
     Plist(#[from] plist::Error),
@@ -92,14 +103,20 @@ impl Platform {
     }
 
     /// The crate's manager for this platform, at user level.
-    pub fn manager(self) -> Box<dyn ServiceManager> {
-        match self {
-            Self::Launchd => Box::new(service_manager::LaunchdServiceManager::user()),
+    pub fn manager(self, host: &Host) -> Result<Box<dyn ServiceManager>, ServiceError> {
+        Ok(match self {
+            Self::Launchd => Box::new(Launchd {
+                inner: service_manager::LaunchdServiceManager::user(),
+                launchctl: Box::new(|args| Command::new("launchctl").args(args).output()),
+                domain: format!("gui/{}", nix::unistd::getuid()),
+                agents_dir: host.home.as_ref().ok_or(ServiceError::NoHome)?.join(AGENTS_DIR),
+            }),
             Self::Systemd => Box::new(Reloading {
                 inner: service_manager::SystemdServiceManager::user(),
                 reload: Box::new(daemon_reload),
+                unit_dir: host.systemd_user_dir.clone().ok_or(ServiceError::NoHome)?,
             }),
-        }
+        })
     }
 }
 
@@ -109,6 +126,8 @@ impl Platform {
 pub struct Reloading<M> {
     pub inner: M,
     pub reload: Box<dyn Fn() -> io::Result<()>>,
+    /// Where `inner` writes its units, the same directory [`Host::systemd_user_dir`] names.
+    pub unit_dir: PathBuf,
 }
 
 impl<M: ServiceManager> ServiceManager for Reloading<M> {
@@ -120,7 +139,13 @@ impl<M: ServiceManager> ServiceManager for Reloading<M> {
         (self.reload)()
     }
     fn uninstall(&self, ctx: ServiceUninstallCtx) -> io::Result<()> {
-        self.inner.uninstall(ctx)?;
+        // A retry after a failed reload finds the unit already disabled and its file gone, which
+        // the crate's `disable` refuses; the reload is all that is left, and without it systemd
+        // keeps the cached unit (#276).
+        // `try_exists`: an unreadable directory must fail the uninstall, not read as removed.
+        if self.unit_dir.join(format!("{}.service", ctx.label.to_script_name())).try_exists()? {
+            self.inner.uninstall(ctx)?;
+        }
         (self.reload)()
     }
     fn start(&self, ctx: ServiceStartCtx) -> io::Result<()> {
@@ -140,6 +165,109 @@ impl<M: ServiceManager> ServiceManager for Reloading<M> {
         ctx: service_manager::ServiceStatusCtx,
     ) -> io::Result<service_manager::ServiceStatus> {
         self.inner.status(ctx)
+    }
+}
+
+/// Where a per-user launchd agent's plist lives, under `HOME`.
+const AGENTS_DIR: &str = "Library/LaunchAgents";
+
+/// Runs `launchctl` with these arguments; a test answers in its place.
+pub type Launchctl = dyn Fn(&[&str]) -> io::Result<Output>;
+
+/// `launchctl print` exits with this for a target its domain does not hold.
+const LAUNCHCTL_NOT_FOUND: i32 = 113;
+/// `launchctl bootout` exits with this (ESRCH) for a job that is not loaded.
+const LAUNCHCTL_NO_SUCH_PROCESS: i32 = 3;
+
+/// A launchd manager whose `status` and `uninstall` are exact (#276). The crate's `status`
+/// matches `launchctl print` suggestions by substring, so `dev.crewd.acme` can read as
+/// `dev.crewd.acme-api`'s state; its `uninstall` discards a failed `launchctl remove` and reports
+/// success with the job still loaded; and its `install` unloads only a job whose plist is on
+/// disk, so a loaded job whose plist was deleted would keep running the old definition.
+pub struct Launchd<M> {
+    pub inner: M,
+    pub launchctl: Box<Launchctl>,
+    /// `gui/<uid>`, the domain a per-user agent is loaded in.
+    pub domain: String,
+    pub agents_dir: PathBuf,
+}
+
+impl<M> Launchd<M> {
+    fn target(&self, label: &ServiceLabel) -> String {
+        format!("{}/{}", self.domain, label.to_qualified_name())
+    }
+
+    /// Unload the job if it is loaded, and fail unless launchd then agrees it is gone.
+    fn bootout(&self, label: &ServiceLabel) -> io::Result<()> {
+        if self.state(label)? == ServiceStatus::NotInstalled {
+            return Ok(());
+        }
+        let target = self.target(label);
+        let out = (self.launchctl)(&["bootout", &target])?;
+        if !out.status.success() && out.status.code() != Some(LAUNCHCTL_NO_SUCH_PROCESS) {
+            return Err(launchctl_failed("bootout", &out));
+        }
+        match self.state(label)? {
+            ServiceStatus::NotInstalled => Ok(()),
+            _ => Err(io::Error::other(format!("launchctl bootout {target}: still loaded"))),
+        }
+    }
+
+    fn state(&self, label: &ServiceLabel) -> io::Result<ServiceStatus> {
+        let out = (self.launchctl)(&["print", &self.target(label)])?;
+        match out.status.code() {
+            Some(0) => {
+                let running = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|l| l.trim() == "state = running");
+                Ok(if running { ServiceStatus::Running } else { ServiceStatus::Stopped(None) })
+            }
+            Some(LAUNCHCTL_NOT_FOUND) => Ok(ServiceStatus::NotInstalled),
+            _ => Err(launchctl_failed("print", &out)),
+        }
+    }
+}
+
+fn launchctl_failed(cmd: &str, out: &Output) -> io::Error {
+    io::Error::other(format!(
+        "launchctl {cmd} exited {}: {}",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+impl<M: ServiceManager> ServiceManager for Launchd<M> {
+    fn available(&self) -> io::Result<bool> {
+        self.inner.available()
+    }
+    fn install(&self, ctx: ServiceInstallCtx) -> io::Result<()> {
+        self.bootout(&ctx.label)?;
+        self.inner.install(ctx)
+    }
+    fn uninstall(&self, ctx: ServiceUninstallCtx) -> io::Result<()> {
+        // The plist goes only after the job is verified unloaded, so a failed bootout leaves
+        // what a retry needs to find.
+        self.bootout(&ctx.label)?;
+        let plist = self.agents_dir.join(format!("{}.plist", ctx.label.to_qualified_name()));
+        match std::fs::remove_file(plist) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+    fn start(&self, ctx: ServiceStartCtx) -> io::Result<()> {
+        self.inner.start(ctx)
+    }
+    fn stop(&self, ctx: ServiceStopCtx) -> io::Result<()> {
+        self.inner.stop(ctx)
+    }
+    fn level(&self) -> service_manager::ServiceLevel {
+        self.inner.level()
+    }
+    fn set_level(&mut self, level: service_manager::ServiceLevel) -> io::Result<()> {
+        self.inner.set_level(level)
+    }
+    fn status(&self, ctx: ServiceStatusCtx) -> io::Result<ServiceStatus> {
+        self.state(&ctx.label)
     }
 }
 
@@ -220,7 +348,7 @@ impl Deployment {
                 .home
                 .as_ref()
                 .ok_or(ServiceError::NoHome)?
-                .join("Library/LaunchAgents")
+                .join(AGENTS_DIR)
                 .join(format!("{}.plist", self.label)),
             Platform::Systemd => host
                 .systemd_user_dir
@@ -274,22 +402,20 @@ impl Plan {
 
     pub fn install_ctx(&self) -> Result<ServiceInstallCtx, ServiceError> {
         let contents = match self.platform {
-            Platform::Launchd => Some(self.plist()?),
-            Platform::Systemd => None,
+            Platform::Launchd => self.plist()?,
+            Platform::Systemd => self.unit()?,
         };
         Ok(ServiceInstallCtx {
             label: self.deployment.service_label(),
             program: self.program.clone(),
             args: self.args.clone(),
-            contents,
+            contents: Some(contents),
             username: None,
             working_directory: Some(self.deployment.dir.clone()),
             environment: Some(self.environment.clone()),
             autostart: true,
-            // launchd throttles a respawn to ten seconds; the same here keeps systemd under its
-            // default start limit, which would otherwise give up after five quick failures.
             restart_policy: RestartPolicy::OnFailure {
-                delay_secs: Some(10),
+                delay_secs: Some(RESTART_DELAY_SECS),
                 max_retries: None,
                 reset_after_secs: None,
             },
@@ -325,6 +451,67 @@ impl Plan {
         Value::Dictionary(dict).to_writer_xml(&mut out)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
+
+    /// The `--user` unit, with every value quoted and escaped for the directive it is in.
+    fn unit(&self) -> Result<String, ServiceError> {
+        let exec: Vec<_> = std::iter::once(self.program.as_os_str())
+            .chain(self.args.iter().map(OsString::as_os_str))
+            .map(|a| systemd_quoted(&a.to_string_lossy(), true))
+            .collect();
+        let mut unit = format!(
+            "[Unit]\nDescription={label}\n\n[Service]\nWorkingDirectory={dir}\n",
+            label = self.deployment.label,
+            dir = systemd_path(&self.deployment.dir)?,
+        );
+        for (k, v) in &self.environment {
+            unit.push_str(&format!("Environment={}\n", systemd_quoted(&format!("{k}={v}"), false)));
+        }
+        unit.push_str(&format!(
+            "ExecStart={}\nRestart=on-failure\nRestartSec={RESTART_DELAY_SECS}\n\n\
+             [Install]\nWantedBy=default.target\n",
+            exec.join(" ")
+        ));
+        Ok(unit)
+    }
+}
+
+/// One double-quoted word of `ExecStart=` or `Environment=`, both of which unquote and C-unescape
+/// their value. Without the escapes a `%` would expand as a specifier, a quote or backslash would
+/// end or bend the word, a line break would start a new directive from the rest of the value, and
+/// in `ExecStart=` (`dollar`) a `$` would expand as a variable.
+fn systemd_quoted(value: &str, dollar: bool) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            '$' if dollar => out.push_str("$$"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `WorkingDirectory=` takes the rest of the line as is: it expands specifiers but neither
+/// unquotes nor unescapes, so a space needs nothing and a `%` is doubled. A line break, an edge
+/// space that systemd strips and a trailing backslash that continues the line cannot be written.
+fn systemd_path(dir: &Path) -> Result<String, ServiceError> {
+    let value = dir.to_string_lossy();
+    let refuse =
+        |what, ch| Err(ServiceError::Unquotable { what, value: value.clone().into_owned(), ch });
+    if let Some(ch) = value.chars().find(|c| c.is_control()) {
+        return refuse("contains", ch);
+    }
+    if let Some(ch) = value.chars().last().filter(|c| c.is_whitespace() || *c == '\\') {
+        return refuse("ends in", ch);
+    }
+    Ok(value.replace('%', "%%"))
 }
 
 /// The service definition for the config at `config`, which must load: a service started on a
@@ -351,11 +538,7 @@ pub fn plan(config: &Path, host: &Host, platform: Platform) -> Result<Plan, Serv
         environment.push(("SSL_CERT_FILE".into(), cert.to_string_lossy().into_owned()));
     }
     let args = vec![OsString::from("--config"), deployment.config.clone().into_os_string()];
-    let plan = Plan { platform, deployment, program, args, environment };
-    if platform == Platform::Systemd {
-        check_systemd_quoting(&plan)?;
-    }
-    Ok(plan)
+    Ok(Plan { platform, deployment, program, args, environment })
 }
 
 /// `PATH` with every relative entry, and an empty one (which means the cwd), joined onto the
@@ -367,31 +550,6 @@ fn anchor_path(path: &OsStr, cwd: &Path) -> OsString {
     std::env::join_paths(entries).unwrap_or_else(|_| path.to_os_string())
 }
 
-/// The crate writes `ExecStart=` unquoted and `Environment="K=V"`, so a space, a quote, a `$`
-/// or a `%` specifier there would reach the daemon as something else. Refused by name instead.
-fn check_systemd_quoting(plan: &Plan) -> Result<(), ServiceError> {
-    let in_exec = |c: char| c.is_whitespace() || "\"'\\%$;".contains(c);
-    // Inside the crate's quotes a space survives; a quote, a backslash or a `%` does not, and a
-    // line break ends the directive, starting a new one from the rest of the value.
-    let in_env = |c: char| c.is_control() || "\"\\%".contains(c);
-    let check = |what, value: &OsStr, bad: &dyn Fn(char) -> bool| {
-        let value = value.to_string_lossy();
-        match value.chars().find(|c| bad(*c)) {
-            Some(ch) => Err(ServiceError::Unquotable { what, value: value.into_owned(), ch }),
-            None => Ok(()),
-        }
-    };
-    check("the program", plan.program.as_os_str(), &in_exec)?;
-    check("the deployment directory", plan.deployment.dir.as_os_str(), &in_exec)?;
-    for a in &plan.args {
-        check("an argument", a, &in_exec)?;
-    }
-    for (_, v) in &plan.environment {
-        check("an environment value", OsStr::new(v), &in_env)?;
-    }
-    Ok(())
-}
-
 /// What [`install`] did, for the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
@@ -400,7 +558,7 @@ pub struct Installed {
 }
 
 /// Load `config`, write the service definition, and load and start it. A service already
-/// installed for this deployment is stopped first, so the new definition is the one running.
+/// running for this deployment is stopped first, so the new definition is the one running.
 pub fn install(
     manager: &dyn ServiceManager,
     config: &Path,
@@ -409,16 +567,22 @@ pub fn install(
 ) -> Result<Installed, ServiceError> {
     let plan = plan(config, host, platform)?;
     let definition = plan.deployment.definition(platform, host)?;
+    let ctx = plan.install_ctx()?;
     let label = plan.deployment.service_label();
     let fail = |action| {
         let label = label.to_qualified_name();
         move |source| ServiceError::Manager { action, label, source }
     };
-    // Every time, not only when the definition is on disk: a loaded service outlives its deleted
-    // file, and `start` on one still running would leave the old argv and environment in place.
-    // Best-effort, because stopping a service that was never loaded fails.
-    let _ = manager.stop(ServiceStopCtx { label: label.clone() });
-    manager.install(plan.install_ctx()?).map_err(fail("installing"))?;
+    // Asked of the manager, not read off the disk: a loaded service outlives its deleted file,
+    // and `start` on one still running would leave the old argv and environment in place, so a
+    // stop that fails ends the install (#276). One not running is rewritten and started fresh.
+    let status = manager
+        .status(ServiceStatusCtx { label: label.clone() })
+        .map_err(fail("reading the state of"))?;
+    if status == ServiceStatus::Running {
+        manager.stop(ServiceStopCtx { label: label.clone() }).map_err(fail("stopping"))?;
+    }
+    manager.install(ctx).map_err(fail("installing"))?;
     manager.start(ServiceStartCtx { label: label.clone() }).map_err(fail("starting"))?;
     Ok(Installed { plan, definition })
 }
@@ -440,20 +604,27 @@ pub fn uninstall(
     let deployment = Deployment::locate(config, &host.cwd)?;
     let definition = deployment.definition(platform, host)?;
     let label = deployment.label.clone();
-    // The crate's systemd uninstall fails on a unit it never wrote, and its launchd one
-    // succeeds silently; checking the file first gives both the same answer.
-    if !definition.exists() {
-        return Ok(Uninstalled::NeverInstalled { label, definition });
-    }
     let fail = |action| {
         let label = label.clone();
         move |source| ServiceError::Manager { action, label, source }
     };
     let ctx = deployment.service_label();
+    // Both the manager and the disk have to agree it is gone: a unit whose file was removed by
+    // an uninstall that failed to reload is still held by systemd, and a retry has to finish it.
+    let status = manager
+        .status(ServiceStatusCtx { label: ctx.clone() })
+        .map_err(fail("reading the state of"))?;
+    let on_disk = definition
+        .try_exists()
+        .map_err(|source| ServiceError::Path { path: definition.clone(), source })?;
+    if status == ServiceStatus::NotInstalled && !on_disk {
+        return Ok(Uninstalled::NeverInstalled { label, definition });
+    }
     // systemd's `disable` leaves a running unit running after its file is gone, so a stop that
     // fails ends the uninstall rather than reporting a removal that is not one; stopping an
-    // inactive unit succeeds. On launchd the crate's `launchctl remove` stops the job itself.
-    if platform == Platform::Systemd {
+    // inactive unit succeeds, but one systemd never loaded (a file whose install failed to
+    // reload) fails, and only its file is left to remove. On launchd `Launchd` boots it out.
+    if platform == Platform::Systemd && status != ServiceStatus::NotInstalled {
         manager.stop(ServiceStopCtx { label: ctx.clone() }).map_err(fail("stopping"))?;
     }
     manager.uninstall(ServiceUninstallCtx { label: ctx }).map_err(fail("uninstalling"))?;
@@ -485,13 +656,30 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::rc::Rc;
 
     /// Records what would have reached `launchctl` or `systemctl`.
-    #[derive(Default)]
     struct FakeManager {
         calls: Rc<RefCell<Vec<String>>>,
         fail_stop: bool,
+        status: ServiceStatus,
+        /// The definition the last install was given.
+        contents: RefCell<Option<String>>,
+        /// The file uninstall removes, as the crate's does.
+        definition: Option<PathBuf>,
+    }
+
+    impl Default for FakeManager {
+        fn default() -> Self {
+            Self {
+                calls: Rc::default(),
+                fail_stop: false,
+                status: ServiceStatus::NotInstalled,
+                contents: RefCell::default(),
+                definition: None,
+            }
+        }
     }
 
     impl FakeManager {
@@ -506,9 +694,13 @@ mod tests {
             Ok(true)
         }
         fn install(&self, ctx: ServiceInstallCtx) -> io::Result<()> {
+            *self.contents.borrow_mut() = ctx.contents.clone();
             self.record("install", &ctx.label)
         }
         fn uninstall(&self, ctx: ServiceUninstallCtx) -> io::Result<()> {
+            if let Some(definition) = &self.definition {
+                std::fs::remove_file(definition)?;
+            }
             self.record("uninstall", &ctx.label)
         }
         fn start(&self, ctx: ServiceStartCtx) -> io::Result<()> {
@@ -524,11 +716,9 @@ mod tests {
         fn set_level(&mut self, _: service_manager::ServiceLevel) -> io::Result<()> {
             Ok(())
         }
-        fn status(
-            &self,
-            _: service_manager::ServiceStatusCtx,
-        ) -> io::Result<service_manager::ServiceStatus> {
-            Ok(service_manager::ServiceStatus::NotInstalled)
+        fn status(&self, ctx: ServiceStatusCtx) -> io::Result<ServiceStatus> {
+            self.record("status", &ctx.label)?;
+            Ok(self.status.clone())
         }
     }
 
@@ -589,7 +779,7 @@ mod tests {
             );
             assert!(ctx.autostart);
             assert!(matches!(ctx.restart_policy, RestartPolicy::OnFailure { .. }));
-            assert_eq!(ctx.contents.is_some(), platform == Platform::Launchd);
+            assert!(ctx.contents.is_some(), "written here, not by the crate's template");
         }
 
         let plan = plan(&dir.join("crew.toml"), &host, Platform::Launchd).unwrap();
@@ -630,7 +820,7 @@ mod tests {
     #[test]
     fn install_stops_any_running_copy_then_loads_and_starts_it() {
         let (root, host) = sandbox("install");
-        let manager = FakeManager::default();
+        let manager = FakeManager { status: ServiceStatus::Running, ..FakeManager::default() };
         let done =
             install(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Launchd).unwrap();
         assert_eq!(
@@ -639,9 +829,41 @@ mod tests {
         );
         assert_eq!(
             *manager.calls.borrow(),
-            ["stop dev.crewd.acme-api", "install dev.crewd.acme-api", "start dev.crewd.acme-api"],
+            [
+                "status dev.crewd.acme-api",
+                "stop dev.crewd.acme-api",
+                "install dev.crewd.acme-api",
+                "start dev.crewd.acme-api"
+            ],
             "stopped even with no definition on disk: a loaded service outlives its file"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_fails_when_a_running_service_cannot_be_stopped() {
+        let (root, host) = sandbox("install-stuck");
+        let config = Path::new("acme-api/crew.toml");
+        for platform in [Platform::Launchd, Platform::Systemd] {
+            let manager = FakeManager {
+                status: ServiceStatus::Running,
+                fail_stop: true,
+                ..FakeManager::default()
+            };
+            let err = install(&manager, config, &host, platform).unwrap_err();
+            assert!(matches!(err, ServiceError::Manager { action: "stopping", .. }), "{err}");
+            assert_eq!(
+                *manager.calls.borrow(),
+                ["status dev.crewd.acme-api", "stop dev.crewd.acme-api"],
+                "the old argv keeps running, so nothing is rewritten or started"
+            );
+        }
+        // Only a manager that says nothing is loaded makes a stop unnecessary.
+        for status in [ServiceStatus::NotInstalled, ServiceStatus::Stopped(None)] {
+            let manager = FakeManager { status, fail_stop: true, ..FakeManager::default() };
+            install(&manager, config, &host, Platform::Systemd).unwrap();
+            assert!(!manager.calls.borrow().iter().any(|c| c.starts_with("stop")));
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -652,10 +874,18 @@ mod tests {
         std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
         std::fs::write(&unit, "").unwrap();
         let config = Path::new("acme-api/crew.toml");
-        let manager = FakeManager { fail_stop: true, ..FakeManager::default() };
+        let manager = FakeManager {
+            status: ServiceStatus::Running,
+            fail_stop: true,
+            ..FakeManager::default()
+        };
         let err = uninstall(&manager, config, &host, Platform::Systemd).unwrap_err();
         assert!(matches!(err, ServiceError::Manager { action: "stopping", .. }), "{err}");
-        assert_eq!(*manager.calls.borrow(), ["stop dev.crewd.acme-api"], "never disabled");
+        assert_eq!(
+            *manager.calls.borrow(),
+            ["status dev.crewd.acme-api", "stop dev.crewd.acme-api"],
+            "never disabled"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -684,42 +914,162 @@ mod tests {
                 Uninstalled::NeverInstalled { label: "dev.crewd.acme-api".into(), definition }
             );
         }
-        assert!(manager.calls.borrow().is_empty(), "systemctl disable would fail on no unit");
-
-        let unit = root.join("home/.config/systemd/user/dev.crewd.acme-api.service");
-        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-        std::fs::write(&unit, "").unwrap();
-        let got = uninstall(&manager, config, &host, Platform::Systemd).unwrap();
-        assert!(matches!(got, Uninstalled::Removed { .. }));
         assert_eq!(
             *manager.calls.borrow(),
-            ["stop dev.crewd.acme-api", "uninstall dev.crewd.acme-api"]
+            ["status dev.crewd.acme-api", "status dev.crewd.acme-api"],
+            "systemctl disable would fail on no unit"
         );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn a_systemd_unit_refuses_a_path_its_execstart_would_split() {
-        let (root, host) = sandbox("quoting");
+    fn a_deployment_path_with_a_space_installs_on_systemd() {
+        let (root, mut host) = sandbox("quoting");
         let spaced = root.join("acme api");
         std::fs::create_dir_all(&spaced).unwrap();
         std::fs::copy(root.join("acme-api/crew.toml"), spaced.join("crew.toml")).unwrap();
         let config = spaced.join("crew.toml");
-        let err = plan(&config, &host, Platform::Systemd).unwrap_err();
-        assert!(matches!(err, ServiceError::Unquotable { ch: ' ', .. }), "{err}");
-        let launchd = plan(&config, &host, Platform::Launchd).unwrap();
-        let label = &launchd.deployment.label;
+        let manager = FakeManager::default();
+        let done = install(&manager, &config, &host, Platform::Systemd).unwrap();
+        let label = &done.plan.deployment.label;
         assert!(label.starts_with("dev.crewd.acme-api-"), "made unit-safe: {label}");
         assert_ne!(
             label, "dev.crewd.acme-api",
             "and distinct from the deployment it now resembles"
         );
-        let mut broken = host.clone();
-        broken.path =
+        let unit = manager.contents.borrow().clone().unwrap();
+        let lines: Vec<_> = unit.lines().collect();
+        let dir = format!("WorkingDirectory={}", spaced.display());
+        assert!(lines.contains(&dir.as_str()), "{unit}");
+        let exec = format!(
+            "ExecStart=\"{}\" \"--config\" \"{}\"",
+            root.join("bin/crewd").display(),
+            config.display()
+        );
+        assert!(lines.contains(&exec.as_str()), "{unit}");
+
+        // A line break in a captured value is escaped, never a directive of its own.
+        host.path =
             Some(format!("{}:/opt\nExecStartPre=/bin/false", root.join("bin").display()).into());
-        let config = root.join("acme-api/crew.toml");
-        let err = plan(&config, &broken, Platform::Systemd).unwrap_err();
-        assert!(matches!(err, ServiceError::Unquotable { ch: '\n', .. }), "{err}");
+        let manager = FakeManager::default();
+        install(&manager, &config, &host, Platform::Systemd).unwrap();
+        let unit = manager.contents.borrow().clone().unwrap();
+        assert!(!unit.lines().any(|l| l.starts_with("ExecStartPre")), "{unit}");
+        assert!(unit.contains(r"/opt\x0aExecStartPre=/bin/false"), "{unit}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_working_directory_systemd_would_trim_is_refused_by_name() {
+        let (root, host) = sandbox("trailing");
+        let trailing = root.join("acme ");
+        std::fs::create_dir_all(&trailing).unwrap();
+        std::fs::copy(root.join("acme-api/crew.toml"), trailing.join("crew.toml")).unwrap();
+        let manager = FakeManager::default();
+        let err =
+            install(&manager, &trailing.join("crew.toml"), &host, Platform::Systemd).unwrap_err();
+        assert!(matches!(err, ServiceError::Unquotable { what: "ends in", ch: ' ', .. }), "{err}");
+        assert!(manager.calls.borrow().is_empty(), "nothing reached systemctl");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_systemd_unit_escapes_every_value_for_its_directive() {
+        let dir = PathBuf::from("/home/op/.crewd/acme api 100%");
+        let plan = Plan {
+            platform: Platform::Systemd,
+            deployment: Deployment {
+                config: dir.join("crew.toml"),
+                label: "dev.crewd.acme-api-100--1a2b3c4d".into(),
+                dir,
+            },
+            program: "/opt/my $tools/crewd".into(),
+            args: vec!["--config".into(), "/home/op/.crewd/acme api 100%/crew.toml".into()],
+            environment: vec![
+                ("PATH".into(), "/opt/my tools:/a\"b\\c:$HOME/bin".into()),
+                ("SSL_CERT_FILE".into(), "/etc/ca%h.pem".into()),
+            ],
+        };
+        insta::assert_snapshot!(plan.unit().unwrap());
+    }
+
+    #[test]
+    fn uninstall_removes_a_unit_file_systemd_never_loaded_without_stopping_it() {
+        let (root, host) = sandbox("unloaded-unit");
+        let unit = host.systemd_user_dir.clone().unwrap().join("dev.crewd.acme-api.service");
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, "").unwrap();
+        // `systemctl stop` on a unit systemd does not know fails.
+        let manager = FakeManager {
+            fail_stop: true,
+            definition: Some(unit.clone()),
+            ..FakeManager::default()
+        };
+        let got = uninstall(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Systemd);
+        assert!(matches!(got, Ok(Uninstalled::Removed { .. })), "{got:?}");
+        assert_eq!(
+            *manager.calls.borrow(),
+            ["status dev.crewd.acme-api", "uninstall dev.crewd.acme-api"]
+        );
+        assert!(!unit.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_fails_when_the_unit_directory_cannot_be_read() {
+        let (root, host) = sandbox("unreadable");
+        let unit_dir = host.systemd_user_dir.clone().unwrap();
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::set_permissions(&unit_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let manager = FakeManager::default();
+        let got = uninstall(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Systemd);
+        std::fs::set_permissions(&unit_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root reads through any mode, so there is nothing unreadable to assert on.
+        if !nix::unistd::getuid().is_root() {
+            assert!(matches!(got, Err(ServiceError::Path { .. })), "never NeverInstalled: {got:?}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_after_a_failed_reload_finishes_the_reload() {
+        let (root, host) = sandbox("half-uninstall");
+        let unit_dir = host.systemd_user_dir.clone().unwrap();
+        let unit = unit_dir.join("dev.crewd.acme-api.service");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(&unit, "").unwrap();
+        // systemd still holds the unit after its file is gone, until a reload succeeds.
+        let inner = FakeManager {
+            status: ServiceStatus::Stopped(None),
+            definition: Some(unit.clone()),
+            ..FakeManager::default()
+        };
+        let calls = inner.calls.clone();
+        let reloads = calls.clone();
+        let manager = Reloading {
+            inner,
+            reload: Box::new(move || {
+                let mut calls = reloads.borrow_mut();
+                calls.push("daemon-reload".into());
+                match calls.iter().filter(|c| *c == "daemon-reload").count() {
+                    1 => Err(io::Error::other("Failed to reload daemon")),
+                    _ => Ok(()),
+                }
+            }),
+            unit_dir,
+        };
+        let config = Path::new("acme-api/crew.toml");
+        let err = uninstall(&manager, config, &host, Platform::Systemd).unwrap_err();
+        assert!(matches!(err, ServiceError::Manager { action: "uninstalling", .. }), "{err}");
+        assert!(!unit.exists(), "the crate removed the file before the reload failed");
+
+        let got = uninstall(&manager, config, &host, Platform::Systemd).unwrap();
+        assert!(matches!(got, Uninstalled::Removed { .. }), "not NeverInstalled: {got:?}");
+        assert_eq!(
+            calls.borrow()[4..],
+            ["status dev.crewd.acme-api", "stop dev.crewd.acme-api", "daemon-reload"],
+            "the retry reloads, and does not disable a unit file that is gone"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -755,10 +1105,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// What `launchctl` holds in `gui/501`: a loaded label maps to whether it is running, and
+    /// `bootout` unloads it unless `stuck`. Every argv is recorded.
+    #[derive(Default)]
+    struct FakeLaunchctl {
+        loaded: RefCell<std::collections::HashMap<String, bool>>,
+        stuck: bool,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeLaunchctl {
+        fn run(&self, args: &[&str]) -> io::Result<Output> {
+            self.calls.borrow_mut().push(args.join(" "));
+            let label = args[1].strip_prefix("gui/501/").expect("a gui/501 target");
+            let exit = |code: i32, stdout: &str| Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            let loaded = self.loaded.borrow().get(label).copied();
+            Ok(match (args[0], loaded) {
+                ("print", Some(true)) => exit(0, "\tstate = running\n"),
+                ("print", Some(false)) => exit(0, "\tstate = not running\n"),
+                ("print", None) => exit(LAUNCHCTL_NOT_FOUND, ""),
+                ("bootout", None) => exit(LAUNCHCTL_NO_SUCH_PROCESS, ""),
+                ("bootout", Some(_)) => {
+                    if !self.stuck {
+                        self.loaded.borrow_mut().remove(label);
+                    }
+                    exit(0, "")
+                }
+                _ => unreachable!("only print and bootout are run"),
+            })
+        }
+    }
+
+    fn launchd(fake: Rc<FakeLaunchctl>, host: &Host) -> Launchd<FakeManager> {
+        Launchd {
+            inner: FakeManager::default(),
+            launchctl: Box::new(move |args| fake.run(args)),
+            domain: "gui/501".into(),
+            agents_dir: host.home.clone().unwrap().join(AGENTS_DIR),
+        }
+    }
+
+    #[test]
+    fn launchd_status_is_the_exact_label_not_a_neighbour_it_prefixes() {
+        let (root, host) = sandbox("launchd-exact");
+        let acme = root.join("acme");
+        std::fs::create_dir_all(&acme).unwrap();
+        std::fs::copy(root.join("acme-api/crew.toml"), acme.join("crew.toml")).unwrap();
+        let fake = Rc::new(FakeLaunchctl::default());
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), true);
+        let manager = launchd(fake.clone(), &host);
+        install(&manager, &acme.join("crew.toml"), &host, Platform::Launchd).unwrap();
+        assert_eq!(
+            *manager.inner.calls.borrow(),
+            ["install dev.crewd.acme", "start dev.crewd.acme"],
+            "a running dev.crewd.acme-api is not dev.crewd.acme's to stop"
+        );
+        assert!(fake.calls.borrow().iter().all(|c| c.ends_with("/dev.crewd.acme")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_launchd_uninstall_reports_removed_only_once_the_job_is_unloaded() {
+        let (root, host) = sandbox("launchd-uninstall");
+        let config = Path::new("acme-api/crew.toml");
+        let plist = Deployment::locate(config, &host.cwd)
+            .unwrap()
+            .definition(Platform::Launchd, &host)
+            .unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "").unwrap();
+        let fake = Rc::new(FakeLaunchctl { stuck: true, ..FakeLaunchctl::default() });
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), true);
+        let err =
+            uninstall(&launchd(fake.clone(), &host), config, &host, Platform::Launchd).unwrap_err();
+        assert!(matches!(err, ServiceError::Manager { action: "uninstalling", .. }), "{err}");
+        assert!(plist.exists(), "kept for the retry that finds the job still loaded");
+
+        let fake = Rc::new(FakeLaunchctl::default());
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), true);
+        let got = uninstall(&launchd(fake.clone(), &host), config, &host, Platform::Launchd);
+        assert!(matches!(got, Ok(Uninstalled::Removed { .. })), "{got:?}");
+        assert!(!plist.exists());
+        assert!(fake.loaded.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_launchd_reinstall_unloads_a_job_whose_plist_is_gone() {
+        let (root, host) = sandbox("launchd-orphan");
+        let fake = Rc::new(FakeLaunchctl::default());
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), false);
+        let manager = launchd(fake.clone(), &host);
+        install(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Launchd).unwrap();
+        assert!(fake.loaded.borrow().is_empty(), "unloaded before the new plist is loaded");
+        assert!(fake.calls.borrow().contains(&"bootout gui/501/dev.crewd.acme-api".to_string()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_systemd_reinstall_reloads_the_unit_before_starting_it() {
         let (root, host) = sandbox("reload");
-        let inner = FakeManager::default();
+        let inner = FakeManager { status: ServiceStatus::Running, ..FakeManager::default() };
         let calls = inner.calls.clone();
         let reloads = calls.clone();
         let manager = Reloading {
@@ -767,11 +1218,13 @@ mod tests {
                 reloads.borrow_mut().push("daemon-reload".into());
                 Ok(())
             }),
+            unit_dir: host.systemd_user_dir.clone().unwrap(),
         };
         install(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Systemd).unwrap();
         assert_eq!(
             *calls.borrow(),
             [
+                "status dev.crewd.acme-api",
                 "stop dev.crewd.acme-api",
                 "install dev.crewd.acme-api",
                 "daemon-reload",

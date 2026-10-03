@@ -188,7 +188,7 @@ this file.
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
-| `nix` (`signal`, `fs`) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, the `access(X_OK)` check on a worker's binary in `src/worker/resolve.rs` (#218), and the store's `flock` in `src/store/lock.rs`, without `unsafe` | Replaced `libc` (#50). `fs` is the `flock` wrapper (#217); a separate locking crate would add a second binding to the same call |
+| `nix` (`signal`, `fs`, `user`) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, the `access(X_OK)` check on a worker's binary in `src/worker/resolve.rs` (#218), the store's `flock` in `src/store/lock.rs`, and the uid that names the launchd domain in `src/service.rs` (#276), without `unsafe` | Replaced `libc` (#50). `fs` is the `flock` wrapper (#217); a separate locking crate would add a second binding to the same call |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
@@ -213,15 +213,18 @@ its crypto backends would add a second RSA implementation for one signature. #64
 three for the same reason, and whichever lands second keeps one JWT signer.
 
 `service-manager` and `plist` arrived with `crewd service install` (#246). The crate replaces
-writing a launchd plist and a systemd unit by hand and driving `launchctl` and `systemctl`
-directly, which is a second copy of each manager's load, enable and remove quirks; Homebrew's
-`service do` block was the alternative, and it covers neither a crates.io nor a tarball install.
-Its `encoding` default only decodes Windows command output and is off. It adds `plist`,
-`xml-rs`, `quick-xml`, `which` and `dirs` to the tree. `plist` is named directly because the
-crate's own plist has no `StandardOutPath`, so the agent's definition is written here and
-passed through the crate's `contents` override. The one `systemctl` call crewd still makes itself is
-`daemon-reload`, after writing or removing a unit, because the crate does not reload and a
-reinstall would otherwise start the cached definition (`Reloading` in `src/service.rs`).
+driving `launchctl` and `systemctl` directly, which is a second copy of each manager's load,
+enable and remove quirks; Homebrew's `service do` block was the alternative, and it covers
+neither a crates.io nor a tarball install. Its `encoding` default only decodes Windows command
+output and is off. It adds `plist`, `xml-rs`, `quick-xml`, `which` and `dirs` to the tree. Both
+definitions are written here and passed through the crate's `contents` override: `plist` is
+named directly because the crate's own plist has no `StandardOutPath`, and the crate's systemd
+template leaves `ExecStart` unquoted, so a `--config` path with a space would split (#276). crewd still runs three manager calls itself. One is `systemctl --user daemon-reload`,
+after writing or removing a unit, because the crate does not reload and a reinstall would
+otherwise start the cached definition (`Reloading` in `src/service.rs`). The others are
+`launchctl print` and `launchctl bootout` against `gui/<uid>/<label>`, because the crate's
+launchd `status` matches labels by substring and its `uninstall` reports success with the job
+still loaded (`Launchd` in `src/service.rs`).
 
 `vergen-gitcl` arrived with the build string (#244). It replaces a hand-written build script
 that shells out to `git rev-parse` and `git status` and has to get the no-git case right:
