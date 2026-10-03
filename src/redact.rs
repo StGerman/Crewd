@@ -74,7 +74,7 @@ static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
             quoted.clone(),
         ),
         (format!(r#"{kv_name}({quoted_sep})(")(?:[^"\\]|\\.)+(")"#), quoted.clone()),
-        (format!(r#"{kv_name}({quoted_sep})(')[^'\n]+(')"#), quoted),
+        (format!(r#"{kv_name}({quoted_sep})(')(?:[^'\\\n]|\\.)+(')"#), quoted),
         // The name must end in the keyword, so `input_tokens` and `token_count` are left alone:
         // every usage event in a stream carries the first. A value opening with `[` is skipped,
         // so a value already redacted above is not read again with what follows it.
@@ -230,6 +230,7 @@ mod tests {
             format!(r#"{{"secret": "{MARKER}", "n": 1}}"#)
         );
         assert_eq!(redact("token='a b c' rest"), format!("token='{MARKER}' rest"));
+        assert_eq!(redact(r"api_key='abc\'def ghi' rest"), format!("api_key='{MARKER}' rest"));
     }
 
     #[test]
@@ -367,6 +368,22 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, emit);
         String::from_utf8(capture.0.lock().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_pem_block_logged_one_warning_per_line_leaves_no_key_material() {
+        let mut r = LineRedactor::default();
+        let log = capture_log(false, || {
+            for line in [
+                "-----BEGIN PRIVATE KEY-----",
+                "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn",
+                "-----END PRIVATE KEY-----",
+            ] {
+                tracing::warn!(line = %r.redact(line), "malformed stream-json line; skipping");
+            }
+        });
+        assert_eq!(log.matches("malformed stream-json line").count(), 3, "{log}");
+        assert!(!log.contains("MIIEow"), "the key body reached the log: {log}");
     }
 
     #[test]

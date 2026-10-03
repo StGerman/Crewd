@@ -386,6 +386,9 @@ fn run_reader(
     // Latest reduced `in_progress` update per call. Written only if the stream ends first (#172).
     let mut pending_tools: BTreeMap<String, String> = BTreeMap::new();
 
+    // Each warning below is its own log event, so the log writer's redaction cannot see that a
+    // base64 line belongs to a PEM block a previous line opened.
+    let mut log_redactor = crate::redact::LineRedactor::default();
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
         // `raw`, not the reduced line: rewriting what the parser reads would make `text`,
@@ -409,7 +412,7 @@ fn run_reader(
         let value: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, line, "malformed streaming-json line; skipping");
+                tracing::warn!(error = %e, line = %log_redactor.redact(line), "malformed streaming-json line; skipping");
                 continue;
             }
         };
