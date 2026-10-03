@@ -233,6 +233,7 @@ linked issue.
 | `bon` | Builders for signatures over the parameter limit | #60 |
 | `serde_rusqlite` | Derived row mapping in the store | #61 |
 | `strum` | Derived enum labels | #62 |
+| `vergen-gitcl` (build) | The commit in the build string | #244 |
 
 ### Needs an ADR first
 
