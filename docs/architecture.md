@@ -478,7 +478,11 @@ round; the turn budget is checked before any round opens, so one past `max_turns
 handed off rather than dispatched. The
 answer says which it did: `park lifted`, or `delivery resumed on <pr url>`. Only the unblock
 resumes it: `dispatch_new` keeps a handed-off delivery's park even when its ticket moves between
-active states, since a run dispatched there would restart delivery with its `Done`. `Scheduler::unblock`
+active states, since a run dispatched there would restart delivery with its `Done`. It keeps a
+`pending`, `awaiting` or `ready` delivery's park the same way while delivery is on, which is
+what a resumed delivery is, since an ordinary run beside it would work without its review
+feedback and outside the round bounds (#266); with delivery off nothing advances such a row, so
+the ticket's move lifts the park as it would any other. `Scheduler::unblock`
 also reads the ticket fresh and keeps a park, or a handoff, whose ticket is no longer active or
 routable, since
 `sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what

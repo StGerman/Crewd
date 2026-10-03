@@ -5665,6 +5665,40 @@ fn a_ready_delivery_keeps_its_park_when_the_ticket_moves_between_active_states()
     assert_eq!(forge.open_prs().len(), 1);
 }
 
+/// Review on #266: with delivery off, nothing advances a `ready` row a previous run left, and
+/// `Store::unblock` refuses one. Keeping its park there would leave the issue parked for good,
+/// so the ticket's move lifts it as it would any other.
+#[test]
+fn a_ready_delivery_left_behind_with_delivery_off_is_released_by_its_ticket_moving() {
+    let dir = tmp_dir("ready-delivery-off");
+    let db = dir.join("crew.db");
+    let tune =
+        |c: &mut Config| c.tracker.active_states = vec!["in progress".into(), "in review".into()];
+    {
+        let (mut h, _forge) = delivery_harness(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            tune,
+        );
+        run_once(&mut h);
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    }
+
+    let root = dir.join("workspaces");
+    let mut h = harness_over(
+        vec![issue(1, "In Review", Some(1))],
+        root.clone(),
+        Store::open(&db).unwrap(),
+        Arc::new(DirWorkspace::new(&root).unwrap()),
+        tune,
+    );
+    h.worker.set_default(Script::succeeds_in(600_000));
+    restart_took_time(&h);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.sched.running_count(), 1, "the moved ticket is dispatched");
+}
+
 /// Review on #264: a resumed delivery's round is a retry, and `dispatch_due_retries` drops one
 /// for a ticket that has lost its dispatch marker, leaving the delivery `redispatched` with
 /// nothing running and nothing polling it. So the unblock refuses, and the handoff stands.
