@@ -1,10 +1,8 @@
 //! Secret redaction for the lines crewd stores: transcript lines and its own log lines (#138).
 //!
-//! A transcript copies every worker stream line through before the parser decides whether it
-//! has a use for it, so a token the agent read and printed would otherwise sit on disk for as
-//! long as retention keeps the run. Nothing on the host confines that: a worker that cannot reach
-//! `github.com` can still print what it read. The line is kept, because it is the post-mortem;
-//! only the secret in it is replaced, by [`MARKER`].
+//! Without it, a token a worker printed stays on disk for as long as retention keeps the run,
+//! however the worker is confined. The line is kept, because it is the post-mortem; only the
+//! secret in it is replaced, by [`MARKER`].
 //!
 //! Matching is by shape, never by the values crewd knows: the agent's environment and tool
 //! results hold credentials crewd never saw. A shape that is not listed here is not redacted,
@@ -66,7 +64,15 @@ static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
         (r"(?i)\b(bearer)(\s+)[A-Za-z0-9._~+/-]{8,}=*".into(), format!("${{1}}${{2}}{MARKER}")),
         // A quoted value runs to its closing quote, JSON-escaped or not: stopping at whitespace
         // would leave `horse battery staple` of a quoted passphrase in place.
-        (format!(r#"{kv_name}({quoted_sep})(\\")(?:[^"\\]|\\[^"])+(\\")"#), quoted.clone()),
+        // Inside an escaped string a token is a plain character, an outer escape such as `\n`, or
+        // an inner escape `\\` plus its character; only a lone `\"` closes, so an escaped quote in
+        // the secret is consumed with it.
+        (
+            format!(
+                r#"{kv_name}({quoted_sep})(\\")(?:[^"\\]|\\\\(?:\\"|\\\\|[^"\\])|\\[^"\\])+(\\")"#
+            ),
+            quoted.clone(),
+        ),
         (format!(r#"{kv_name}({quoted_sep})(")(?:[^"\\]|\\.)+(")"#), quoted.clone()),
         (format!(r#"{kv_name}({quoted_sep})(')[^'\n]+(')"#), quoted),
         // The name must end in the keyword, so `input_tokens` and `token_count` are left alone:
@@ -129,8 +135,10 @@ impl LineRedactor {
 
 /// A `tracing_subscriber` writer that redacts each formatted event before it reaches `W`.
 ///
-/// The formatter hands its writer one whole event per `write_all`, so a secret is never split
-/// across two calls to [`Write::write`] here. A short write from the formatter would break
+/// The formatter renders a whole event into one buffer and hands it over in a single
+/// `write_all` (`fmt::Layer::on_event`), so a field's name and value never arrive in two calls
+/// to [`Write::write`] here; `a_structured_secret_field_is_logged_without_its_value` fails if a
+/// `tracing-subscriber` upgrade changes that. A short write from the formatter would break
 /// that, which is why `write` reports the caller's length only after the whole redacted buffer
 /// went through.
 pub struct Redacting<W>(pub W);
@@ -225,6 +233,27 @@ mod tests {
     }
 
     #[test]
+    fn an_escaped_quote_inside_a_nested_secret_is_redacted_with_the_rest_of_it() {
+        // The inner JSON `{"password":"pa\"ss word","n":1}`, carried in an outer JSON string.
+        let line = r#"{"content":"{\"password\":\"pa\\\"ss word\\\\\",\"n\":1}"}"#;
+        assert_eq!(
+            redact(line),
+            format!(r#"{{"content":"{{\"password\":\"{MARKER}\",\"n\":1}}"}}"#)
+        );
+    }
+
+    #[test]
+    fn a_structured_secret_field_is_logged_without_its_value() {
+        for ansi in [false, true] {
+            let log = capture_log(ansi, || {
+                tracing::warn!(password = "correct horse battery staple", "login failed");
+            });
+            assert!(log.contains("login failed"), "{log}");
+            assert!(!log.contains("horse"), "the password reached the log: {log:?}");
+        }
+    }
+
+    #[test]
     fn a_recorded_grok_stream_passes_through_unchanged() {
         for name in ["stream.jsonl", "resume.jsonl", "sigterm.jsonl"] {
             let path = format!("{}/tests/fixtures/grok/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -315,8 +344,8 @@ mod tests {
         assert_eq!(redact(line), format!("\x1b[3mauth_token\x1b[0m\x1b[2m=\x1b[0m{MARKER} next"));
     }
 
-    #[test]
-    fn a_url_with_an_access_token_is_logged_without_the_token() {
+    /// Every event a real `fmt` subscriber over [`RedactingMakeWriter`] wrote while `emit` ran.
+    fn capture_log(ansi: bool, emit: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Capture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
         impl Write for Capture {
@@ -333,16 +362,21 @@ mod tests {
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
+            .with_ansi(ansi)
             .with_writer(RedactingMakeWriter(move || writer.clone()))
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(capture.0.lock().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_url_with_an_access_token_is_logged_without_the_token() {
+        let log = capture_log(false, || {
             tracing::warn!(
                 url = "https://api.example.com/v1/items?access_token=gho_s3cr3tvalue&page=2",
                 "tracker call failed"
             );
         });
-
-        let log = String::from_utf8(capture.0.lock().clone()).unwrap();
         assert!(log.contains("tracker call failed"), "the line is kept: {log}");
         assert!(log.contains(&format!("access_token={MARKER}&page=2")), "{log}");
         assert!(!log.contains("gho_s3cr3tvalue"), "the token reached the log: {log}");
