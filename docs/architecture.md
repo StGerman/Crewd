@@ -15,7 +15,7 @@ This file keeps the reasoning; an ADR records the decision and what it ruled out
 | ADR | Decision |
 |---|---|
 | [1. Where new work lands](adr/0001-extension-boundaries.md) | crewd stays one daemon with one authority; new work is a trait implementation, an external `crewctl-<name>` command, a hook, or a core change that protects an invariant |
-| [3. A worker runs in the sandbox its config names](adr/0003-sandbox-modes.md) (Proposed) | `[sandbox] mode = "off" \| "wrapper" \| "microvm"`, default `off`; the whole worker and the gate run inside it, with egress through a crewd allowlist proxy; `container`, `remote` and `kubernetes` are reserved and stop startup |
+| [3. A worker runs in the sandbox its config names](adr/0003-sandbox-modes.md) (Proposed) | `[sandbox] mode = "off" \| "wrapper" \| "microvm"`, default `off`; the whole worker and the gate's commands run inside it (host-side git stays on the host and verifies the files it trusts); egress goes through a crewd allowlist proxy under `wrapper` and smolvm's allowlist under `microvm`; `container`, `remote` and `kubernetes` are reserved and stop startup |
 
 The async-versus-sync decision (#57) will be ADR 2. The incident stories under **Subsystems**
 move into ADRs under #63.
