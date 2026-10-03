@@ -1,0 +1,26 @@
+---
+source: tests/api.rs
+expression: "out.join(\"\\n\")"
+---
+POST /api/v1/unquarantine/iss-1 -> 200
+  cleared: bool
+  detail: string
+  identifier: string
+  issue_id: string
+POST /api/v1/unblock/iss-2 -> 200
+  cleared: bool
+  detail: string
+  identifier: string
+  issue_id: string
+POST /api/v1/unblock/MT-1 -> 409
+  error: string
+  issue_ids: array
+  issue_ids[]: string
+GET /api/v1/issues/MT-404 -> 404
+  error: string
+GET /api/v1/refresh -> 405
+  error: string
+GET /metrics -> 404
+  error: string
+POST /api/v1/refresh -> 500
+  error: string
