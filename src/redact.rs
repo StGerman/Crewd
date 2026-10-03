@@ -33,6 +33,8 @@ const ANSI: &str = r"(?:\x1b\[[0-9;]*m)*";
 static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
     let kv_name = r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?))";
     let sep = format!(r#"({ANSI}\\?["']?{ANSI}\s*[:=]{ANSI}\s*\\?["']?)"#);
+    let quoted_sep = format!(r#"{ANSI}\\?["']?{ANSI}\s*[:=]{ANSI}\s*"#);
+    let quoted = format!("${{1}}${{2}}${{3}}{MARKER}${{4}}");
     let url_params = r"(?i)([?&](?:access_token|refresh_token|id_token|token|api_key|apikey|key|password|passwd|pwd|secret|client_secret|state|code|sig|signature|auth|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\s#\x22'\\]+";
     let table: Vec<(String, String)> = vec![
         // Multi-line in a log, `\n`-escaped inside a JSON stream line; an unterminated block
@@ -53,9 +55,14 @@ static PATTERNS: LazyLock<Vec<(Regex, String)>> = LazyLock::new(|| {
         (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b".into(), MARKER.into()),
         (r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+".into(), MARKER.into()),
         (r"(?i)\b(bearer|authorization:\s*basic)(\s+)[A-Za-z0-9._~+/-]{8,}=*".into(), format!("${{1}}${{2}}{MARKER}")),
+        // A quoted value runs to its closing quote, JSON-escaped or not: stopping at whitespace
+        // would leave `horse battery staple` of a quoted passphrase in place.
+        (format!(r#"{kv_name}({quoted_sep})(\\")(?:[^"\\]|\\[^"])+(\\")"#), quoted.clone()),
+        (format!(r#"{kv_name}({quoted_sep})(")(?:[^"\\]|\\.)+(")"#), quoted.clone()),
+        (format!(r#"{kv_name}({quoted_sep})(')[^'\n]+(')"#), quoted),
         // The name must end in the keyword, so `input_tokens` and `token_count` are left alone:
         // every usage event in a stream carries the first. A value opening with `[` is skipped,
-        // so a URL parameter already redacted above is not read again with its fragment.
+        // so a value already redacted above is not read again with what follows it.
         (format!(r#"{kv_name}{sep}[^\s"'\\&,;\x1b\[][^\s"'\\&,;\x1b]*"#), format!("${{1}}${{2}}{MARKER}")),
     ];
     table
@@ -147,6 +154,9 @@ mod tests {
             r#"before {\"password\": \"hunter2hunter2\"} after"#.to_string(),
             "before GITHUB_TOKEN=abc123def after".to_string(),
             "before https://deploy:s3cr3t@example.com/repo.git after".to_string(),
+            r#"before password=\"correct horse, battery; staple!\" after"#.to_string(),
+            r#"before "client_secret": "a b\"c d" after"#.to_string(),
+            "before api_key='open sesame & co' after".to_string(),
         ];
         for line in cases {
             let out = redact(&line);
@@ -156,6 +166,19 @@ mod tests {
         let line = format!("{{\"text\":\"use {gh}\"}}");
         let out = redact(&line);
         assert!(!out.contains(&gh), "{out}");
+    }
+
+    #[test]
+    fn a_quoted_secret_with_spaces_is_replaced_through_its_closing_quote() {
+        assert_eq!(
+            redact(r#"{"content":"password=\"correct horse battery staple\" next"}"#),
+            format!(r#"{{"content":"password=\"{MARKER}\" next"}}"#)
+        );
+        assert_eq!(
+            redact(r#"{"secret": "in the, tool result", "n": 1}"#),
+            format!(r#"{{"secret": "{MARKER}", "n": 1}}"#)
+        );
+        assert_eq!(redact("token='a b c' rest"), format!("token='{MARKER}' rest"));
     }
 
     #[test]
