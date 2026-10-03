@@ -29,7 +29,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceManager, ServiceStartCtx, ServiceStatus,
@@ -105,7 +105,12 @@ impl Platform {
     /// The crate's manager for this platform, at user level.
     pub fn manager(self, host: &Host) -> Result<Box<dyn ServiceManager>, ServiceError> {
         Ok(match self {
-            Self::Launchd => Box::new(service_manager::LaunchdServiceManager::user()),
+            Self::Launchd => Box::new(Launchd {
+                inner: service_manager::LaunchdServiceManager::user(),
+                launchctl: Box::new(|args| Command::new("launchctl").args(args).output()),
+                domain: format!("gui/{}", nix::unistd::getuid()),
+                agents_dir: host.home.as_ref().ok_or(ServiceError::NoHome)?.join(AGENTS_DIR),
+            }),
             Self::Systemd => Box::new(Reloading {
                 inner: service_manager::SystemdServiceManager::user(),
                 reload: Box::new(daemon_reload),
@@ -159,6 +164,109 @@ impl<M: ServiceManager> ServiceManager for Reloading<M> {
         ctx: service_manager::ServiceStatusCtx,
     ) -> io::Result<service_manager::ServiceStatus> {
         self.inner.status(ctx)
+    }
+}
+
+/// Where a per-user launchd agent's plist lives, under `HOME`.
+const AGENTS_DIR: &str = "Library/LaunchAgents";
+
+/// Runs `launchctl` with these arguments; a test answers in its place.
+pub type Launchctl = dyn Fn(&[&str]) -> io::Result<Output>;
+
+/// `launchctl print` exits with this for a target its domain does not hold.
+const LAUNCHCTL_NOT_FOUND: i32 = 113;
+/// `launchctl bootout` exits with this (ESRCH) for a job that is not loaded.
+const LAUNCHCTL_NO_SUCH_PROCESS: i32 = 3;
+
+/// A launchd manager whose `status` and `uninstall` are exact (#276). The crate's `status`
+/// matches `launchctl print` suggestions by substring, so `dev.crewd.acme` can read as
+/// `dev.crewd.acme-api`'s state; its `uninstall` discards a failed `launchctl remove` and reports
+/// success with the job still loaded; and its `install` unloads only a job whose plist is on
+/// disk, so a loaded job whose plist was deleted would keep running the old definition.
+pub struct Launchd<M> {
+    pub inner: M,
+    pub launchctl: Box<Launchctl>,
+    /// `gui/<uid>`, the domain a per-user agent is loaded in.
+    pub domain: String,
+    pub agents_dir: PathBuf,
+}
+
+impl<M> Launchd<M> {
+    fn target(&self, label: &ServiceLabel) -> String {
+        format!("{}/{}", self.domain, label.to_qualified_name())
+    }
+
+    /// Unload the job if it is loaded, and fail unless launchd then agrees it is gone.
+    fn bootout(&self, label: &ServiceLabel) -> io::Result<()> {
+        if self.state(label)? == ServiceStatus::NotInstalled {
+            return Ok(());
+        }
+        let target = self.target(label);
+        let out = (self.launchctl)(&["bootout", &target])?;
+        if !out.status.success() && out.status.code() != Some(LAUNCHCTL_NO_SUCH_PROCESS) {
+            return Err(launchctl_failed("bootout", &out));
+        }
+        match self.state(label)? {
+            ServiceStatus::NotInstalled => Ok(()),
+            _ => Err(io::Error::other(format!("launchctl bootout {target}: still loaded"))),
+        }
+    }
+
+    fn state(&self, label: &ServiceLabel) -> io::Result<ServiceStatus> {
+        let out = (self.launchctl)(&["print", &self.target(label)])?;
+        match out.status.code() {
+            Some(0) => {
+                let running = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|l| l.trim() == "state = running");
+                Ok(if running { ServiceStatus::Running } else { ServiceStatus::Stopped(None) })
+            }
+            Some(LAUNCHCTL_NOT_FOUND) => Ok(ServiceStatus::NotInstalled),
+            _ => Err(launchctl_failed("print", &out)),
+        }
+    }
+}
+
+fn launchctl_failed(cmd: &str, out: &Output) -> io::Error {
+    io::Error::other(format!(
+        "launchctl {cmd} exited {}: {}",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+impl<M: ServiceManager> ServiceManager for Launchd<M> {
+    fn available(&self) -> io::Result<bool> {
+        self.inner.available()
+    }
+    fn install(&self, ctx: ServiceInstallCtx) -> io::Result<()> {
+        self.bootout(&ctx.label)?;
+        self.inner.install(ctx)
+    }
+    fn uninstall(&self, ctx: ServiceUninstallCtx) -> io::Result<()> {
+        // The plist goes only after the job is verified unloaded, so a failed bootout leaves
+        // what a retry needs to find.
+        self.bootout(&ctx.label)?;
+        let plist = self.agents_dir.join(format!("{}.plist", ctx.label.to_qualified_name()));
+        match std::fs::remove_file(plist) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+    fn start(&self, ctx: ServiceStartCtx) -> io::Result<()> {
+        self.inner.start(ctx)
+    }
+    fn stop(&self, ctx: ServiceStopCtx) -> io::Result<()> {
+        self.inner.stop(ctx)
+    }
+    fn level(&self) -> service_manager::ServiceLevel {
+        self.inner.level()
+    }
+    fn set_level(&mut self, level: service_manager::ServiceLevel) -> io::Result<()> {
+        self.inner.set_level(level)
+    }
+    fn status(&self, ctx: ServiceStatusCtx) -> io::Result<ServiceStatus> {
+        self.state(&ctx.label)
     }
 }
 
@@ -239,7 +347,7 @@ impl Deployment {
                 .home
                 .as_ref()
                 .ok_or(ServiceError::NoHome)?
-                .join("Library/LaunchAgents")
+                .join(AGENTS_DIR)
                 .join(format!("{}.plist", self.label)),
             Platform::Systemd => host
                 .systemd_user_dir
@@ -543,6 +651,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::rc::Rc;
 
     /// Records what would have reached `launchctl` or `systemctl`.
@@ -965,6 +1074,107 @@ mod tests {
         let err = plan(Path::new("acme-api/crew.toml"), &host, Platform::Launchd).unwrap_err();
         let expected = root.join("acme-api/app.toml").display().to_string();
         assert!(err.to_string().contains(&expected), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// What `launchctl` holds in `gui/501`: a loaded label maps to whether it is running, and
+    /// `bootout` unloads it unless `stuck`. Every argv is recorded.
+    #[derive(Default)]
+    struct FakeLaunchctl {
+        loaded: RefCell<std::collections::HashMap<String, bool>>,
+        stuck: bool,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeLaunchctl {
+        fn run(&self, args: &[&str]) -> io::Result<Output> {
+            self.calls.borrow_mut().push(args.join(" "));
+            let label = args[1].strip_prefix("gui/501/").expect("a gui/501 target");
+            let exit = |code: i32, stdout: &str| Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            let loaded = self.loaded.borrow().get(label).copied();
+            Ok(match (args[0], loaded) {
+                ("print", Some(true)) => exit(0, "\tstate = running\n"),
+                ("print", Some(false)) => exit(0, "\tstate = not running\n"),
+                ("print", None) => exit(LAUNCHCTL_NOT_FOUND, ""),
+                ("bootout", None) => exit(LAUNCHCTL_NO_SUCH_PROCESS, ""),
+                ("bootout", Some(_)) => {
+                    if !self.stuck {
+                        self.loaded.borrow_mut().remove(label);
+                    }
+                    exit(0, "")
+                }
+                _ => unreachable!("only print and bootout are run"),
+            })
+        }
+    }
+
+    fn launchd(fake: Rc<FakeLaunchctl>, host: &Host) -> Launchd<FakeManager> {
+        Launchd {
+            inner: FakeManager::default(),
+            launchctl: Box::new(move |args| fake.run(args)),
+            domain: "gui/501".into(),
+            agents_dir: host.home.clone().unwrap().join(AGENTS_DIR),
+        }
+    }
+
+    #[test]
+    fn launchd_status_is_the_exact_label_not_a_neighbour_it_prefixes() {
+        let (root, host) = sandbox("launchd-exact");
+        let acme = root.join("acme");
+        std::fs::create_dir_all(&acme).unwrap();
+        std::fs::copy(root.join("acme-api/crew.toml"), acme.join("crew.toml")).unwrap();
+        let fake = Rc::new(FakeLaunchctl::default());
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), true);
+        let manager = launchd(fake.clone(), &host);
+        install(&manager, &acme.join("crew.toml"), &host, Platform::Launchd).unwrap();
+        assert_eq!(
+            *manager.inner.calls.borrow(),
+            ["install dev.crewd.acme", "start dev.crewd.acme"],
+            "a running dev.crewd.acme-api is not dev.crewd.acme's to stop"
+        );
+        assert!(fake.calls.borrow().iter().all(|c| c.ends_with("/dev.crewd.acme")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_launchd_uninstall_reports_removed_only_once_the_job_is_unloaded() {
+        let (root, host) = sandbox("launchd-uninstall");
+        let config = Path::new("acme-api/crew.toml");
+        let plist = Deployment::locate(config, &host.cwd)
+            .unwrap()
+            .definition(Platform::Launchd, &host)
+            .unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "").unwrap();
+        let fake = Rc::new(FakeLaunchctl { stuck: true, ..FakeLaunchctl::default() });
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), true);
+        let err =
+            uninstall(&launchd(fake.clone(), &host), config, &host, Platform::Launchd).unwrap_err();
+        assert!(matches!(err, ServiceError::Manager { action: "uninstalling", .. }), "{err}");
+        assert!(plist.exists(), "kept for the retry that finds the job still loaded");
+
+        let fake = Rc::new(FakeLaunchctl::default());
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), true);
+        let got = uninstall(&launchd(fake.clone(), &host), config, &host, Platform::Launchd);
+        assert!(matches!(got, Ok(Uninstalled::Removed { .. })), "{got:?}");
+        assert!(!plist.exists());
+        assert!(fake.loaded.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_launchd_reinstall_unloads_a_job_whose_plist_is_gone() {
+        let (root, host) = sandbox("launchd-orphan");
+        let fake = Rc::new(FakeLaunchctl::default());
+        fake.loaded.borrow_mut().insert("dev.crewd.acme-api".into(), false);
+        let manager = launchd(fake.clone(), &host);
+        install(&manager, Path::new("acme-api/crew.toml"), &host, Platform::Launchd).unwrap();
+        assert!(fake.loaded.borrow().is_empty(), "unloaded before the new plist is loaded");
+        assert!(fake.calls.borrow().contains(&"bootout gui/501/dev.crewd.acme-api".to_string()));
         let _ = std::fs::remove_dir_all(root);
     }
 
