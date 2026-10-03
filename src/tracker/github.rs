@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{Tracker, TrackerError};
+use super::{LabelOutcome, RepoLabels, Tracker, TrackerError};
 use crate::broker::TrackerWrites;
 use crate::credentials::{Credentials, StaticToken};
 use crate::http::{self, AuthScheme, Http, HttpResponse, HttpTransportError};
@@ -421,6 +421,29 @@ impl<H: Http> TrackerWrites for GithubTracker<H> {
     }
 }
 
+/// One request per label, a create that GitHub refuses as `already_exists` rather than a list
+/// read first: the list is paginated, and a short page would read as a missing label and
+/// still end in this same refusal.
+impl<H: Http> RepoLabels for GithubTracker<H> {
+    fn ensure_label(&self, name: &str) -> Result<LabelOutcome, TrackerError> {
+        let url = format!("{API_BASE}/repos/{}/{}/labels", self.owner, self.repo);
+        let payload = serde_json::to_vec(&json!({ "name": name, "color": "ededed" }))
+            .map_err(|e| TrackerError::Response(e.to_string()))?;
+        let resp = self.authed(|h| self.http.send_json("POST", &url, h, &payload))?;
+        if resp.status == 422 && already_exists(&resp) {
+            return Ok(LabelOutcome::Kept);
+        }
+        classify(resp).map(|_| LabelOutcome::Created)
+    }
+}
+
+fn already_exists(resp: &HttpResponse) -> bool {
+    let body: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
+    body.get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errs| errs.iter().any(|e| e["code"] == "already_exists"))
+}
+
 /// The `html_url` of whatever was just created, when the response carries one — a comment URL
 /// is the most useful thing the agent can be handed back.
 fn created_url(resp: &HttpResponse) -> Option<String> {
@@ -459,6 +482,31 @@ mod tests {
 
     fn tracker(http: FakeHttp) -> GithubTracker<FakeHttp> {
         GithubTracker::new(http, "o", "r", "tok", &["agent".to_string()])
+    }
+
+    #[test]
+    fn a_label_github_refuses_as_already_existing_is_kept_and_any_other_refusal_is_an_error() {
+        use crate::tracker::test_http::status_body;
+        let http = std::sync::Arc::new(FakeHttp::new());
+        let t = GithubTracker::new(http.clone(), "o", "r", "tok", &[]);
+        http.push(status_body(201, serde_json::json!({ "name": "agent" })));
+        http.push(status_body(
+            422,
+            serde_json::json!({ "message": "Validation Failed",
+                                "errors": [{ "resource": "Label", "code": "already_exists" }] }),
+        ));
+        http.push(status_body(
+            422,
+            serde_json::json!({ "message": "Validation Failed",
+                                "errors": [{ "resource": "Label", "code": "invalid" }] }),
+        ));
+        assert_eq!(t.ensure_label("agent").unwrap(), LabelOutcome::Created);
+        assert_eq!(t.ensure_label("agent").unwrap(), LabelOutcome::Kept);
+        assert!(matches!(t.ensure_label("bad,name"), Err(TrackerError::Status(_))));
+        let writes = http.writes();
+        assert_eq!(writes[0].0, "POST");
+        assert_eq!(writes[0].1, "https://api.github.com/repos/o/r/labels");
+        assert_eq!(writes[0].2["name"], "agent");
     }
 
     #[test]

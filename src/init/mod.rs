@@ -14,14 +14,16 @@
 //! back over the App's own JWT, so a file that exists is a file #64's `tracker.github_app` can use.
 //!
 //! Output is `<dir>/github-app.toml` (`app_id`, `installation_id`, `private_key_path`) and
-//! `<dir>/github-app.pem` at mode 600, in a directory at mode 700. `init` never edits the daemon's
-//! config — that names the settings file with one line — and never overwrites either file, so
-//! re-running it is safe and a second App is a deliberate act.
+//! `<dir>/github-app.pem` at mode 600, in a directory at mode 700. Registration never overwrites
+//! either file: with the settings file present, `crewd init` skips it, so re-running it is safe
+//! and a second App is a deliberate act. What init writes after the App, a deployment, is
+//! [`deploy`] (#247).
 //!
 //! This is not the only path: `GITHUB_TOKEN` and a hand-registered App written into the same
 //! settings file are untouched by it.
 
 pub mod callback;
+pub mod deploy;
 pub mod github;
 pub mod manifest;
 
@@ -95,6 +97,50 @@ pub enum InitError {
         key: PathBuf,
         settings: PathBuf,
     },
+    #[error("{} is not inside a git clone; run crewd init in the clone it should work on", dir.display())]
+    NotAClone { dir: PathBuf },
+    #[error("the clone's origin is not a GitHub repository ({url}); crewd delivers to GitHub only")]
+    NotGithub { url: String },
+    #[error(
+        "the App is not installed on {owner}/{repo}. Install it there at {install_url}, then run \
+         `crewd init` again"
+    )]
+    NotInstalledOnRepo { owner: String, repo: String, install_url: String },
+    #[error(
+        "{owner}/{repo} is under installation {found}, but {} names installation {named}: that \
+         settings file mints tokens for another account. Run `crewd init --dir <another dir>` to \
+         write one for this account",
+        settings.display()
+    )]
+    OtherInstallation { owner: String, repo: String, found: u64, named: u64, settings: PathBuf },
+    #[error(
+        "no terminal to ask on, and these questions have no flag answering them: {flags}. A \
+         script must turn agents and pull requests on or off itself"
+    )]
+    NoTerminal { flags: String },
+    #[error(
+        "{} is kept and names {named}, but this clone is {clone}. Choose another deployment with \
+         --name",
+        config.display()
+    )]
+    OtherRepo { config: PathBuf, named: String, clone: String },
+    #[error(
+        "{} is a linked git worktree, which crewd cannot run over; run crewd init in the main \
+         clone, {}",
+        path.display(), main.display()
+    )]
+    LinkedWorktree { path: PathBuf, main: PathBuf },
+    #[error("{} exists and is kept, but does not load: {detail}", config.display())]
+    KeptConfig { config: PathBuf, detail: String },
+    /// The template shipped in this binary names a key `deploy::write` has no value for.
+    #[error("the built-in config template is broken: {0}")]
+    Template(String),
+    #[error("`{name}` cannot name a deployment directory; choose another with --name")]
+    BadName { name: String },
+    #[error("no free loopback port pair from {from} up for the ops API and MCP; set [api] by hand")]
+    NoFreePorts { from: u16 },
+    #[error("creating the label `{name}` failed: {detail}. Run `crewd init` again to retry")]
+    Label { name: String, detail: String },
 }
 
 pub struct Options {
@@ -107,6 +153,10 @@ pub struct Options {
     /// How many times to read the installation list, with [`Operator::wait`] between reads,
     /// before handing the rest to the operator.
     pub install_polls: u32,
+    /// The `owner/repo` the App must end up installed on. Set, the poll reads that repository's
+    /// installation, whoever owns the App: a personal App installed only on an organization's
+    /// repository is never found among the creator's own installations (#247).
+    pub repo: Option<(String, String)>,
 }
 
 /// The human half of the flow. The binary prints and opens; tests play the browser.
@@ -181,7 +231,10 @@ pub fn run(
             return Err(e);
         }
     };
-    let owner = opts.org.clone().unwrap_or_else(|| created.owner.clone());
+    let owner = match &opts.repo {
+        Some((owner, _)) => owner.clone(),
+        None => opts.org.clone().unwrap_or_else(|| created.owner.clone()),
+    };
     let install_url = format!("https://github.com/apps/{}/installations/new", created.slug);
     cb.redirect(&install_url, &manifest::installing(&install_url));
     operator.show("Install the App on the repositories crewd should work on", &install_url);
@@ -191,7 +244,10 @@ pub fn run(
         if poll > 0 {
             operator.wait();
         }
-        installation_id = auth.installation(http, &owner, clock.wall())?;
+        installation_id = match &opts.repo {
+            Some((owner, repo)) => auth.repo_installation(http, owner, repo, clock.wall())?,
+            None => auth.installation(http, &owner, clock.wall())?,
+        };
         if installation_id.is_some() {
             break;
         }
@@ -208,6 +264,38 @@ pub fn run(
 
     write_new(&settings, settings_toml(created.app_id, installation_id, &key).as_bytes())?;
     Ok(Registered { app_id: created.app_id, installation_id, slug: created.slug, settings, key })
+}
+
+/// Step 2 of #247: the App the settings file names must be the installation that covers this
+/// repository, or every token the daemon mints is refused on its first poll.
+pub fn installed_on(
+    http: &dyn Http,
+    clock: &dyn Clock,
+    settings: &Path,
+    owner: &str,
+    repo: &str,
+) -> Result<(), InitError> {
+    let file = crate::credentials::GithubAppFile::load(settings)
+        .map_err(|e| InitError::Key(e.to_string()))?;
+    let auth = github::AppAuth::from_file(&file)?;
+    match auth.repo_installation(http, owner, repo, clock.wall())? {
+        Some(found) if found == file.installation_id => Ok(()),
+        Some(found) => Err(InitError::OtherInstallation {
+            owner: owner.into(),
+            repo: repo.into(),
+            found,
+            named: file.installation_id,
+            settings: settings.to_path_buf(),
+        }),
+        None => {
+            let slug = auth.slug(http, clock.wall())?;
+            Err(InitError::NotInstalledOnRepo {
+                owner: owner.into(),
+                repo: repo.into(),
+                install_url: format!("https://github.com/apps/{slug}/installations/new"),
+            })
+        }
+    }
 }
 
 /// A suffix for the default App name when there is no login to put there: unique enough that two
@@ -236,7 +324,7 @@ fn write_key(dir: &Path, key: &Path, pem: &github::Pem) -> Result<(), InitError>
 /// `create_new` rather than the existence check at the top of [`run`] alone: that check is minutes
 /// earlier, and the mode is set at creation so the key is never readable to anyone else, even
 /// briefly.
-fn write_new(path: &Path, contents: &[u8]) -> Result<(), InitError> {
+pub(crate) fn write_new(path: &Path, contents: &[u8]) -> Result<(), InitError> {
     let mut file =
         std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(
             |source| match source.kind() {

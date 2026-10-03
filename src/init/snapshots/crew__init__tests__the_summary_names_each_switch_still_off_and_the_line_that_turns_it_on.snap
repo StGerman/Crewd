@@ -1,0 +1,21 @@
+---
+source: src/init/tests.rs
+expression: "deploy::summary(&shown, &cfg, &labels)"
+---
+Deployment /home/op/.crewd/acme-api
+  config: /home/op/.crewd/acme-api/crewd.toml (written)
+  label:  agent (kept: it already existed)
+  label:  state:in-progress (created)
+  ops API: 127.0.0.1:8787, MCP: 127.0.0.1:8788
+
+Still off, each turned on by one line in crewd.toml:
+  Agents do not work issues: under [worker], set
+    kind = "claude"
+  No pull requests are opened: under [delivery], set
+    enabled = true
+  The gate only brings branches onto the base: under [gate], set
+    commands = [["<program>", "<arg>"]]   # this repository's own checks
+
+Next:
+  crewd service install --config '/home/op/.crewd/acme-api/crewd.toml'
+then label an issue `agent`.

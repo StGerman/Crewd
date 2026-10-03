@@ -586,7 +586,14 @@ App Manifest flow (#65): a loopback page posts the manifest to GitHub, the opera
 id and private key, then sends the browser on to *Install* and reads the installation id back
 over the App's own JWT. It writes `~/.crewd/github-app.pem` (600) and `~/.crewd/github-app.toml`
 (`app_id`, `installation_id`, `private_key_path`) in a 700 directory — the file #64's
-`tracker.github_app` names — and never edits the daemon's config or overwrites either file.
+`tracker.github_app` names — and never overwrites either file; with the settings file present,
+a re-run skips registration. Run inside a git clone, it then leaves a deployment (#247,
+[src/init/deploy.rs](../src/init/deploy.rs)): it checks the App's installation covers the
+`origin` repository, asks whether agents work issues and whether it opens pull requests (flags
+answer both, and with no terminal an unanswered one stops it), and writes
+`~/.crewd/<owner>-<repo>/crewd.toml` from a template in the binary, not from `crew.github.toml`.
+Then it creates the dispatch label and each `state:` label that config names through the App's
+own `Credentials`. A config or label that exists is kept and reported, never rewritten.
 Each operator registers their own App because the key is the App owner's; `GITHUB_TOKEN` and
 a hand-registered App written into the same file stay supported. The listener reuses the broker
 transport's `read_request`, `Limits` and `ConnSlot` cap, not its MCP service: it binds loopback, answers only

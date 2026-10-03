@@ -1,0 +1,52 @@
+# Written by `crewd init` for {{owner}}/{{repo}}. Re-running init never overwrites it: delete it
+# and run init again to start over. A key not named here takes its default; crewd's own
+# `crew.github.toml` explains each one.
+
+[tracker]
+kind = "github"
+owner = {{owner}}
+repo = {{repo}}
+# Carrying this label is what makes an issue dispatchable; an assignee is neither needed nor
+# enough. `crewd init` created it.
+dispatch_label = "agent"
+# An open issue with no `state:` label is "open". An agent may move its issue to
+# `state:in-progress`, which `crewd init` created too.
+active_states = ["open", "in-progress"]
+terminal_states = ["closed"]
+# Every comment, label, push and pull request is authored by this App, not by you.
+github_app = {{github_app}}
+
+[workspace]
+repo = {{workspace_repo}}
+root = "workspaces"
+
+# "fake" watches real dispatch decisions and spawns nothing. "claude" runs Claude Code in each
+# issue's worktree, as you, with `--permission-mode bypassPermissions`.
+[worker]
+kind = {{worker_kind}}
+
+[agent]
+max_concurrent = 1
+# A real agent's one long tool call, a cold build, sends no event for minutes; a shorter bound
+# kills working agents.
+stall_timeout_ms = 300000
+
+# Before a "done" is believed, the branch is brought onto the base and these run in its
+# worktree, each an argv exec'd with no shell. Empty: bringing the branch onto the base is the
+# whole gate.
+[gate]
+enabled = true
+commands = {{gate_commands}}
+
+# Pushes each finished branch and opens a pull request against `base`. Nothing merges.
+[delivery]
+enabled = {{delivery_enabled}}
+base = {{base}}
+remote = "origin"
+
+# Loopback only. `crewctl --config <this file> status` reads `bind` from here.
+[api]
+enabled = true
+bind = {{api_bind}}
+mcp_enabled = true
+mcp_bind = {{mcp_bind}}
