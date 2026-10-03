@@ -19,7 +19,9 @@ fn main() {
 /// vergen watches only `HEAD`, which on a branch holds the branch's name and does not change on
 /// a commit or a pull, so the build would keep reporting the sha it was first built at. The
 /// branch's ref, `packed-refs` and the index do change. An unstaged edit changes none of them,
-/// so `-dirty` can lag until the next stage or commit.
+/// so every tracked file is watched too, or `-dirty` would lag until the next stage or commit.
+/// Tracked files only: `target/` is never among them, and an untracked file does not make the
+/// build dirty.
 fn rerun_on_commit() {
     let git = |args: &[&str]| {
         let out = Command::new("git").args(args).output().ok().filter(|o| o.status.success())?;
@@ -35,6 +37,15 @@ fn rerun_on_commit() {
             && Path::new(&path).exists()
         {
             println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    // A deleted tracked file is kept: it reruns the script on every build while it is missing,
+    // which is what keeps `-dirty` true until it is restored or the deletion committed.
+    if let Some(top) = git(&["rev-parse", "--show-toplevel"])
+        && let Some(files) = git(&["-C", &top, "ls-files"])
+    {
+        for file in files.lines() {
+            println!("cargo:rerun-if-changed={}", Path::new(&top).join(file).display());
         }
     }
 }
