@@ -320,6 +320,283 @@ mod tests {
         assert!(read.halted_workers.is_empty());
     }
 
+    /// Every field set: each `Option` is `Some` and each list holds one entry, so the walk below
+    /// reaches every key path a v1 client can read. `fully_populated_leaves_no_path_unpinned`
+    /// refuses a `null` or an empty list, which is how a new field left at its default fails here
+    /// instead of slipping past the shape snapshot.
+    fn fully_populated() -> Snapshot {
+        let run = RunRecord {
+            run_id: "r".into(),
+            issue_id: "i".into(),
+            started_at: 1,
+            ended_at: Some(2),
+            outcome: Some("done".into()),
+            session_id: Some("s".into()),
+            turns: 3,
+            in_tok: Some(4),
+            out_tok: Some(5),
+            transcript: Some("t.jsonl".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            worker: Some("claude".into()),
+        };
+        let row = Row {
+            issue_id: "i".into(),
+            identifier: "#1".into(),
+            title: "t".into(),
+            url: Some("u".into()),
+            tracker_state: "open".into(),
+            phase: Phase::Running,
+            attempt: 1,
+            turns: 2,
+            tokens: Some(TokenUsage { input: 1, output: 2 }),
+            age_ms: 3,
+            retry_in_ms: Some(4),
+            holds_slot: true,
+            quarantined: false,
+            last_error: Some("e".into()),
+            last_event: Some("ev".into()),
+            workspace: Some("w".into()),
+            branch: Some("b".into()),
+            runs: vec![run],
+            transcript: Some("t.jsonl".into()),
+            delivery: Some(DeliveryView {
+                stage: "awaiting".into(),
+                pr_number: Some(1),
+                pr_url: Some("p".into()),
+                base: Some("master".into()),
+                rounds_pr: 1,
+                rounds_issue: 2,
+                review_error: Some("r".into()),
+                handoff_reason: Some("h".into()),
+            }),
+            worker: Some("claude".into()),
+        };
+        Snapshot {
+            build: "0.1.0 (abc1234)".into(),
+            generated_at: 1,
+            rows: vec![row],
+            running: 1,
+            reserved: 1,
+            limit: 2,
+            retrying: 0,
+            quarantined: 0,
+            tokens: TokenUsage { input: 1, output: 2 },
+            uncounted_runs: 0,
+            ticks: 1,
+            last_tick_at: Some(1),
+            last_error: Some("e".into()),
+            rate_limit_pauses: vec![pause("claude")],
+            halted_workers: vec![HaltedWorker {
+                worker: "grok".into(),
+                binary: "/bin/grok".into(),
+                reason: HaltReason::AccountExhausted,
+            }],
+        }
+    }
+
+    /// One line per key path, `path: type`, sorted; a list's element is the path plus `[]`.
+    fn shape(path: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+        use serde_json::Value;
+        let ty = match v {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(n) if n.is_f64() => "float",
+            Value::Number(_) => "integer",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        if !path.is_empty() {
+            out.push(format!("{path}: {ty}"));
+        }
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                    shape(&p, child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    shape(&format!("{path}[]"), item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn populated_shape() -> Vec<String> {
+        let mut out = Vec::new();
+        shape("", &serde_json::to_value(fully_populated()).unwrap(), &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// A v1 payload as the API wrote it when the promise was made (#245), with every optional
+    /// field `null`. **Never edit it for an addition**: it stands for a daemon older than the
+    /// addition, which a newer client still has to read.
+    const FROZEN_V1: &str = include_str!("testdata/snapshot_v1_frozen.json");
+
+    /// Key paths that may be `null`: those [`FROZEN_V1`] sends as `null`, and those the current
+    /// types write back as `null` after reading it, which is how a new `Option` field shows up.
+    fn nullable_paths() -> std::collections::BTreeSet<String> {
+        let raw: serde_json::Value = serde_json::from_str(FROZEN_V1).unwrap();
+        let read: Snapshot = serde_json::from_str(FROZEN_V1).unwrap();
+        let mut lines = Vec::new();
+        shape("", &raw, &mut lines);
+        shape("", &serde_json::to_value(read).unwrap(), &mut lines);
+        lines.iter().filter_map(|l| l.strip_suffix(": null")).map(String::from).collect()
+    }
+
+    /// [`populated_shape`] with `| null` on each path that may be `null`, so making a field
+    /// required, or a new one optional, rewrites a line of the pinned snapshot.
+    fn snapshot_shape() -> Vec<String> {
+        let nullable = nullable_paths();
+        populated_shape()
+            .into_iter()
+            .map(|l| {
+                let path = l.split_once(": ").unwrap().0;
+                if nullable.contains(path) { format!("{l} | null") } else { l }
+            })
+            .collect()
+    }
+
+    /// A newer client must read an older daemon (docs/api-v1.md, #245). A new field that does not
+    /// read when absent (neither an `Option` nor `#[serde(default)]`), or an `Option` made
+    /// required, fails to read this payload.
+    #[test]
+    fn a_v1_payload_from_before_any_addition_still_reads() {
+        let read: Snapshot = serde_json::from_str(FROZEN_V1)
+            .unwrap_or_else(|e| panic!("a v1 payload no longer reads: {e}"));
+        assert_eq!(read.rows.len(), 2);
+        assert_eq!(read.rows[1].runs.len(), 1);
+    }
+
+    /// Every `Phase`, in declaration order. `next` matches with no wildcard, so a new variant
+    /// does not compile until it is given a place in this chain, and so in the pinned snapshot.
+    fn every_phase() -> Vec<Phase> {
+        fn next(p: Phase) -> Option<Phase> {
+            match p {
+                Phase::Queued => Some(Phase::Running),
+                Phase::Running => Some(Phase::RetryQueued),
+                Phase::RetryQueued => Some(Phase::Quarantined),
+                Phase::Quarantined => Some(Phase::Released),
+                Phase::Released => None,
+            }
+        }
+        std::iter::successors(Some(Phase::Queued), |&p| next(p)).collect()
+    }
+
+    /// Every `HaltReason`, kept exhaustive the way [`every_phase`] is.
+    fn every_halt_reason() -> Vec<HaltReason> {
+        fn next(r: HaltReason) -> Option<HaltReason> {
+            match r {
+                HaltReason::BinaryNotFound => Some(HaltReason::AccountExhausted),
+                HaltReason::AccountExhausted => None,
+            }
+        }
+        std::iter::successors(Some(HaltReason::BinaryNotFound), |&r| next(r)).collect()
+    }
+
+    /// The v1 promise (docs/api-v1.md, #245): `/api/v1/snapshot` and `/api/v1/issues/:id` only
+    /// grow. Renaming or removing a field, or changing its JSON type, rewrites a line here, and
+    /// that diff is the review question "does this need `/api/v2`?". A new field adds a line,
+    /// allowed only for a field that reads when absent and has a row in docs/api-v1.md. The
+    /// enum spellings are pinned too, because a client matches on them.
+    #[test]
+    fn the_v1_snapshot_shape_only_grows() {
+        let mut lines = snapshot_shape();
+        for p in every_phase() {
+            lines.push(format!("enum phase: {}", serde_json::to_value(p).unwrap()));
+        }
+        for r in every_halt_reason() {
+            lines.push(format!("enum reason: {}", serde_json::to_value(r).unwrap()));
+        }
+        insta::assert_snapshot!(lines.join("\n"));
+    }
+
+    /// A path the fixture leaves `null` or empty would be pinned as `null`, or not at all, so a
+    /// later rename of it would pass. Every `Option` and list in [`fully_populated`] must be set.
+    #[test]
+    fn fully_populated_leaves_no_path_unpinned() {
+        let lines = populated_shape();
+        let unset: Vec<&String> = lines.iter().filter(|l| l.ends_with(": null")).collect();
+        assert!(unset.is_empty(), "set these in fully_populated(): {unset:?}");
+        let mut empty = Vec::new();
+        fn empties(path: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Array(a) if a.is_empty() => out.push(path.into()),
+                serde_json::Value::Array(a) => {
+                    a.iter().for_each(|i| empties(&format!("{path}[]"), i, out))
+                }
+                serde_json::Value::Object(m) => {
+                    m.iter().for_each(|(k, c)| empties(&format!("{path}.{k}"), c, out))
+                }
+                _ => {}
+            }
+        }
+        empties("", &serde_json::to_value(fully_populated()).unwrap(), &mut empty);
+        assert!(empty.is_empty(), "give these lists an entry in fully_populated(): {empty:?}");
+    }
+
+    /// The docs/api-v1.md section that documents the object a key path's last key sits in.
+    /// Unknown parents fail rather than default, so a new nested object needs a section here.
+    fn section_of(path: &str) -> &'static str {
+        let parent = path.rsplit_once('.').map_or("", |(p, _)| p);
+        match parent {
+            "" => "Snapshot",
+            "rows[]" => "Row",
+            "rows[].runs[]" => "RunRecord",
+            "rows[].delivery" => "DeliveryView",
+            "tokens" | "rows[].tokens" => "TokenUsage",
+            "rate_limit_pause" | "rate_limit_pauses[]" => "RateLimitPause",
+            "missing_binaries[]" => "HaltedWorker",
+            other => panic!("no docs/api-v1.md section for the object at {other:?}"),
+        }
+    }
+
+    /// docs/api-v1.md is the contract a client reads, so a field the shape pins and the table
+    /// leaves out is a promise nobody wrote down. Checked per section, since `issue_id`, `turns`,
+    /// `transcript` and `worker` each appear in more than one object.
+    #[test]
+    fn api_v1_md_names_every_pinned_field() {
+        let doc = include_str!("../../docs/api-v1.md");
+        let section = |name: &str| -> &str {
+            let start = doc
+                .find(&format!("\n## {name}\n"))
+                .unwrap_or_else(|| panic!("docs/api-v1.md has no section {name}"));
+            let body = &doc[start + 1..];
+            &body[..body[3..].find("\n## ").map_or(body.len(), |e| e + 3)]
+        };
+        let nullable = nullable_paths();
+        let mut missing = Vec::new();
+        let mut optionality = Vec::new();
+        for path in populated_shape().iter().filter_map(|l| l.split(':').next()) {
+            if path.ends_with("[]") {
+                continue;
+            }
+            let key = path.rsplit('.').next().unwrap().trim_end_matches("[]");
+            let row =
+                section(section_of(path)).lines().find(|l| l.starts_with(&format!("| `{key}` |")));
+            let Some(row) = row else {
+                missing.push(format!("{path} in {}", section_of(path)));
+                continue;
+            };
+            let documented = row.split('|').nth(2).unwrap().trim().starts_with("optional");
+            if documented != nullable.contains(path) {
+                optionality.push(path.to_string());
+            }
+        }
+        assert!(missing.is_empty(), "add these to docs/api-v1.md: {missing:?}");
+        assert!(
+            optionality.is_empty(),
+            "docs/api-v1.md says optional exactly where the wire may send null; these disagree: \
+             {optionality:?}"
+        );
+    }
+
     /// A daemon from before #237 sends no `reason`; every worker it halted had a missing binary.
     #[test]
     fn a_halted_worker_without_a_reason_reads_as_a_missing_binary() {

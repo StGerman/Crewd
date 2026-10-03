@@ -79,6 +79,7 @@ impl Default for ApiConfig {
 pub const API_MARKER_HEADER: &str = "X-Crew-Ops-Api";
 /// A version rather than a bare flag, so a wire-incompatible future change has somewhere to say
 /// so. Today the client only checks that this equals what it expects.
+/// What this version keeps stable is docs/api-v1.md (#245).
 pub const API_MARKER_VERSION: &str = "1";
 
 /// The one normalization `api.bind` gets before it is treated as an address. Shared with

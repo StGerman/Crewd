@@ -453,10 +453,7 @@ async fn main() -> anyhow::Result<()> {
                 // client went away, and nothing here waits to find out.
                 match command {
                     Command::Tick(reply) => {
-                        if let Err(e) = sched.tick() { tracing::error!(error = %e, "api tick failed"); }
-                        let snap = sched.snapshot();
-                        if let Ok(s) = &snap { let _ = snap_tx.send(s.clone()); }
-                        let _ = reply.send(snap);
+                        let _ = reply.send(crew::api::answer_tick(&mut sched, &snap_tx));
                     }
                     Command::Unquarantine { issue_id, reply } => {
                         let cleared = sched.unquarantine(&issue_id);

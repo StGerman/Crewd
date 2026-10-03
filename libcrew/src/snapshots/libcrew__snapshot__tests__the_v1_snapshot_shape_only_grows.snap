@@ -1,0 +1,86 @@
+---
+source: libcrew/src/snapshot.rs
+expression: "lines.join(\"\\n\")"
+---
+build: string
+generated_at: integer
+last_error: string | null
+last_tick_at: integer | null
+limit: integer
+missing_binaries: array
+missing_binaries[].binary: string
+missing_binaries[].reason: string
+missing_binaries[].worker: string
+missing_binaries[]: object
+quarantined: integer
+rate_limit_pause.kind: string
+rate_limit_pause.resets_at: integer
+rate_limit_pause.worker: string
+rate_limit_pause: object | null
+rate_limit_pauses: array
+rate_limit_pauses[].kind: string
+rate_limit_pauses[].resets_at: integer
+rate_limit_pauses[].worker: string
+rate_limit_pauses[]: object
+reserved: integer
+retrying: integer
+rows: array
+rows[].age_ms: integer
+rows[].attempt: integer
+rows[].branch: string | null
+rows[].delivery.base: string | null
+rows[].delivery.handoff_reason: string | null
+rows[].delivery.pr_number: integer | null
+rows[].delivery.pr_url: string | null
+rows[].delivery.review_error: string | null
+rows[].delivery.rounds_issue: integer
+rows[].delivery.rounds_pr: integer
+rows[].delivery.stage: string
+rows[].delivery: object | null
+rows[].holds_slot: bool
+rows[].identifier: string
+rows[].issue_id: string
+rows[].last_error: string | null
+rows[].last_event: string | null
+rows[].phase: string
+rows[].quarantined: bool
+rows[].retry_in_ms: integer | null
+rows[].runs: array
+rows[].runs[].effort: string | null
+rows[].runs[].ended_at: integer | null
+rows[].runs[].in_tok: integer | null
+rows[].runs[].issue_id: string
+rows[].runs[].model: string | null
+rows[].runs[].out_tok: integer | null
+rows[].runs[].outcome: string | null
+rows[].runs[].run_id: string
+rows[].runs[].session_id: string | null
+rows[].runs[].started_at: integer
+rows[].runs[].transcript: string | null
+rows[].runs[].turns: integer
+rows[].runs[].worker: string | null
+rows[].runs[]: object
+rows[].title: string
+rows[].tokens.input: integer
+rows[].tokens.output: integer
+rows[].tokens: object | null
+rows[].tracker_state: string
+rows[].transcript: string | null
+rows[].turns: integer
+rows[].url: string | null
+rows[].worker: string | null
+rows[].workspace: string | null
+rows[]: object
+running: integer
+ticks: integer
+tokens.input: integer
+tokens.output: integer
+tokens: object
+uncounted_runs: integer
+enum phase: "queued"
+enum phase: "running"
+enum phase: "retry"
+enum phase: "quarantine"
+enum phase: "released"
+enum reason: "binary_not_found"
+enum reason: "account_exhausted"

@@ -226,6 +226,9 @@ pub struct Scheduler {
     /// Cleared at the start of each tick's dispatch, so the next tick tries again.
     base_unreachable: bool,
     ticks: u64,
+    /// When the last tick started, wall-clock, for `Snapshot::last_tick_at`. `None` before the
+    /// first, since a snapshot is published before it and on every repaint (#245).
+    last_tick_at: Option<Wall>,
     last_error: Option<String>,
 }
 
@@ -275,6 +278,7 @@ impl Scheduler {
             halted_workers: HashMap::new(),
             base_unreachable: false,
             ticks: 0,
+            last_tick_at: None,
             last_error: None,
         }
     }
@@ -321,6 +325,7 @@ impl Scheduler {
 
     pub fn tick(&mut self) -> anyhow::Result<()> {
         self.ticks += 1;
+        self.last_tick_at = Some(self.clock.wall());
         self.last_error = None;
 
         // Once, ahead of everything else — including the config gate, because a stranded claim
@@ -1973,7 +1978,7 @@ impl Scheduler {
             tokens: totals.counted,
             uncounted_runs: totals.uncounted_runs,
             ticks: self.ticks,
-            last_tick_at: Some(now_wall),
+            last_tick_at: self.last_tick_at.map(|w| w.0),
             last_error: self.last_error.clone(),
             rate_limit_pauses: self.published_pauses(),
             halted_workers: self.published_halts(),
