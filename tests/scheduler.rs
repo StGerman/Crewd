@@ -6172,6 +6172,146 @@ fn a_commit_pushed_to_the_branch_by_someone_else_reaches_the_worktree_before_the
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A harness delivering over real git to a bare remote, gated by a `FakeGate`, for the tests
+/// that need the lease `GitWorktreeWorkspace` keeps rather than the fake forge's.
+fn real_git_gated_delivery(name: &str) -> (PathBuf, PathBuf, PathBuf, Harness, Arc<FakeGate>) {
+    let dir = tmp_dir(name);
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+    let bare = dir.join("remote.git");
+    git(&dir, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let ws = Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap());
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root,
+        Store::open_in_memory().unwrap(),
+        ws.clone(),
+        |c| {
+            c.delivery.enabled = true;
+            c.delivery.poll_interval_ms = 1_000;
+            c.delivery.base = "main".into();
+            c.delivery.remote = "origin".into();
+        },
+    );
+    let publisher: Arc<dyn Publisher> = ws;
+    h.sched.set_delivery(Some(Arc::new(FakeForge::new())), Some(publisher)).unwrap();
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    h.worker.set_default(Script::succeeds_in(1_000));
+    (dir, bare, repo, h, gate)
+}
+
+/// Stands in for the gate's rebase onto a base that has moved: every commit is rewritten.
+fn rebase_onto_moved_base(repo: &Path, worktree: &Path) -> String {
+    commit_in(repo, "base.txt", "base moved");
+    git(repo, &["push", "-q", "origin", "main"]);
+    git(worktree, &["fetch", "-q", "origin", "main"]);
+    git(worktree, &["rebase", "-q", "FETCH_HEAD"]);
+    git_out(worktree, &["rev-parse", "HEAD"]).unwrap()
+}
+
+/// #269: a head the agent pushed itself is not merged back after the gate rebases it.
+#[test]
+fn a_branch_the_gate_rebased_is_not_merged_with_its_own_earlier_push_at_the_next_dispatch() {
+    let (dir, bare, repo, mut h, gate) = real_git_gated_delivery("gate-rebased-own-push");
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
+        step: "cargo test".into(),
+        output: "test a_thing ... FAILED".into(),
+        on_base: true,
+    }));
+
+    h.sched.tick().unwrap();
+    let wt = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    commit_in(&wt, "a.txt", "the agent's work");
+    git(&wt, &["push", "-q", "origin", &branch]);
+    let pushed = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "the run's Done is being gated");
+    assert_eq!(
+        git_out(&wt, &["rev-parse", &format!("refs/crew/lease/{branch}")]),
+        Some(pushed.clone()),
+        "the sync before the gate recorded the agent's own push as the lease"
+    );
+    let rebased = rebase_onto_moved_base(&repo, &wt);
+    assert_ne!(rebased, pushed, "the gate rewrote the pushed commit");
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 2, "the continuation is dispatched");
+    assert_eq!(
+        git_out(&wt, &["rev-parse", "HEAD"]),
+        Some(rebased),
+        "the branch is the rebase and nothing more"
+    );
+    assert_eq!(git_out(&wt, &["rev-list", "--merges", "main..HEAD"]), Some(String::new()));
+    assert!(
+        git_out(&wt, &["merge-base", "--is-ancestor", &pushed, "HEAD"]).is_none(),
+        "the pre-rebase copy was not merged back in"
+    );
+    assert_eq!(
+        git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]),
+        Some(pushed),
+        "nothing was pushed: the next delivery's push replaces the remote"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #269 stops at heads the worktree held. A commit someone else pushed on top of the head the
+/// lease names, while the gate rewrote the branch, is still taken in before the next run (#163).
+#[test]
+fn a_commit_someone_else_pushed_after_crewds_push_is_still_taken_in() {
+    let (dir, bare, repo, mut h, gate) = real_git_gated_delivery("gate-rebased-theirs");
+
+    h.sched.tick().unwrap();
+    let wt = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    let branch = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    commit_in(&wt, "a.txt", "the agent's work");
+    git(&wt, &["push", "-q", "origin", &branch]);
+
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
+        step: "cargo test".into(),
+        output: "test a_thing ... FAILED".into(),
+        on_base: true,
+    }));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "the lease names the agent's push from here");
+    let other = dir.join("operator");
+    git(&dir, &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    git(&other, &["config", "user.email", "op@example.com"]);
+    git(&other, &["config", "user.name", "op"]);
+    git(&other, &["checkout", "-q", &branch]);
+    commit_in(&other, "theirs.txt", "the operator's commit");
+    git(&other, &["push", "-q", "origin", &branch]);
+    let theirs = git_out(&other, &["rev-parse", "HEAD"]).unwrap();
+    rebase_onto_moved_base(&repo, &wt);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.worker.feedback_for("iss-1").len(), 2, "the continuation is dispatched");
+    assert!(
+        git_out(&wt, &["merge-base", "--is-ancestor", &theirs, "HEAD"]).is_some(),
+        "the operator's commit is on the branch the run works on"
+    );
+    assert!(wt.join("theirs.txt").exists());
+    assert!(wt.join("base.txt").exists(), "the rebase onto the moved base was kept");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A conflict with the remote branch that no `gate.agent_resolvable` pattern covers is a
 /// human's, as a gate conflict is: the run is not spawned onto a branch that would push over
 /// the operator's work, and the issue parks `Blocked` naming the paths.
