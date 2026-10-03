@@ -555,6 +555,7 @@ impl Scheduler {
                     tracing::warn!(run_id = %r.run_id, error = %e, "progress checkpoint failed");
                 }
 
+                self.sync_before_gate(&issue_id, &r.workspace);
                 let handle = gate.start(&r.issue, &r.workspace);
                 let now = self.clock.mono();
                 tracing::info!(

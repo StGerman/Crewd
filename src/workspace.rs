@@ -1249,6 +1249,24 @@ impl Workspace for GitWorktreeWorkspace {
 impl Publisher for GitWorktreeWorkspace {
     fn sync(&self, worktree: &Path, branch: &str, remote: &str) -> Result<Synced, ForgeError> {
         self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        // A merge into a worktree the agent left mid-rebase or mid-merge would land on the
+        // rebase's detached head, or abort the agent's own merge on the way out; one into
+        // tracked edits git lets through moves `HEAD` under them. The gate after the sync before
+        // it (#269) would then never see the state it reports. Unreadable counts as unsafe, as
+        // the gate's own checks do.
+        let in_progress = ["rebase-merge", "rebase-apply", "MERGE_HEAD"].iter().any(|p| {
+            Self::git(worktree, &["rev-parse", "--path-format=absolute", "--git-path", p])
+                .map_or(true, |p| Path::new(&p).exists())
+        });
+        let dirty = Self::git(worktree, &["status", "--porcelain", "--untracked-files=no"])
+            .map_or(true, |s| !s.is_empty());
+        if in_progress || dirty {
+            return Err(ForgeError::Permanent(format!(
+                "{} is mid-rebase or mid-merge, or has uncommitted tracked changes; not syncing \
+                 it with {remote}/{branch}",
+                worktree.display()
+            )));
+        }
         // Asked of the remote, not read off `refs/remotes/`: that ref is what `workspace.repo`
         // last fetched, which is neither current nor anything this worktree took in.
         let full = format!("refs/heads/{branch}");
@@ -1280,7 +1298,23 @@ impl Publisher for GitWorktreeWorkspace {
         // and the push replaces it. A head the lease does not name is still merged (#163).
         let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &lease_ref])
             .unwrap_or_default();
-        let remote_unchanged = lease == remote_head;
+        // The lease misses a head the agent pushed itself, and a sync that fails before the gate
+        // rewrites it cannot record it (#269). The branch's own reflog names every head the
+        // worktree held, so a fetched head reachable from one of them was already incorporated.
+        // A reflog that cannot be read holds nothing, and the head is merged as before.
+        let held = || {
+            let Ok(log) = Self::git(worktree, &["log", "-g", "--format=%H", &full]) else {
+                return false;
+            };
+            let tips: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+            if tips.is_empty() {
+                return false;
+            }
+            let mut args = vec!["rev-list", "--count", remote_head.as_str(), "--not"];
+            args.extend(tips);
+            Self::git(worktree, &args).is_ok_and(|n| n.trim() == "0")
+        };
+        let remote_unchanged = lease == remote_head || held();
 
         let synced = if is_ancestor(&remote_head, "HEAD") || remote_unchanged {
             Synced::Current { remote_head: remote_head.clone() }
@@ -3179,6 +3213,140 @@ mod tests {
         assert_eq!(parents.split_whitespace().count(), 2, "the replaced head is not a merge");
 
         for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #269 syncs a worktree as the agent left it, before the gate has checked it. One left
+    /// mid-merge keeps its merge, so the gate still finds it and reports it `Stuck`.
+    #[test]
+    fn a_worktree_left_mid_merge_is_not_synced_and_keeps_its_merge() {
+        let root = tmp_root("wt-sync-mid-merge");
+        let (repo, bare) = repo_with_remote("wt-sync-mid-merge");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-mid-merge-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+
+        git_out(&p.path, &["checkout", "-q", "-b", "side", "HEAD~1"]).unwrap();
+        commit_in(&p.path, "a.txt", "the side's version");
+        git_out(&p.path, &["checkout", "-q", &branch]).unwrap();
+        assert!(git_out(&p.path, &["merge", "-q", "side"]).is_err(), "the agent's merge stops");
+
+        assert!(matches!(ws.sync(&p.path, &branch, "origin"), Err(ForgeError::Permanent(_))));
+        assert!(
+            git_out(&p.path, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_ok(),
+            "the agent's merge is still in progress for the gate to find"
+        );
+        assert!(!p.path.join("theirs.txt").exists(), "nothing was merged over it");
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #269: a head the agent pushed itself, never synced before the gate rewrote it, is the
+    /// worktree's own and is replaced, not merged back.
+    #[test]
+    fn a_head_the_agent_pushed_itself_and_the_gate_rebased_is_not_merged_back() {
+        let root = tmp_root("wt-rebase-agent-push");
+        let (repo, bare) = repo_with_remote("wt-rebase-agent-push");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the agent's change");
+        git_out(&p.path, &["push", "-q", "origin", &branch]).unwrap();
+        let pushed = head_of(&p.path);
+
+        commit_in(&repo, "base.txt", "base moved");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["fetch", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["rebase", "-q", "FETCH_HEAD"]).unwrap();
+        let rebased = head_of(&p.path);
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: pushed }
+        );
+        assert_eq!(head_of(&p.path), rebased, "the rebase is kept and nothing merged into it");
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.head_sha, rebased, "the push replaces the agent's own earlier head");
+
+        for d in [&root, &repo, &bare] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// As a mid-merge one: a merge onto a paused rebase's detached head would hide the rebase
+    /// from the gate that reports it `Stuck`.
+    #[test]
+    fn a_worktree_left_mid_rebase_is_not_synced_and_keeps_its_rebase() {
+        let root = tmp_root("wt-sync-mid-rebase");
+        let (repo, bare) = repo_with_remote("wt-sync-mid-rebase");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-mid-rebase-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+
+        git_out(&p.path, &["checkout", "-q", "-b", "side", "HEAD~1"]).unwrap();
+        commit_in(&p.path, "b.txt", "the side's change");
+        git_out(&p.path, &["checkout", "-q", &branch]).unwrap();
+        // Paused with a clean tree, so only the rebase markers can refuse the sync.
+        assert!(
+            git_out(&p.path, &["rebase", "-q", "--exec", "false", "side"]).is_err(),
+            "the agent's rebase pauses"
+        );
+        let head = head_of(&p.path);
+
+        assert!(matches!(ws.sync(&p.path, &branch, "origin"), Err(ForgeError::Permanent(_))));
+        let rebase_dir = git_out(
+            &p.path,
+            &["rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"],
+        )
+        .unwrap();
+        assert!(Path::new(&rebase_dir).exists(), "the rebase is still paused for the gate to find");
+        assert_eq!(head_of(&p.path), head, "nothing was merged onto its detached head");
+        assert!(!p.path.join("theirs.txt").exists());
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Review on #271: git merges a commit touching other files over tracked edits, moving
+    /// `HEAD` before the gate has reported those edits. Refused, the worktree stays as left.
+    #[test]
+    fn a_worktree_with_uncommitted_tracked_edits_is_not_synced() {
+        let root = tmp_root("wt-sync-dirty");
+        let (repo, bare) = repo_with_remote("wt-sync-dirty");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        let other = someone_else(&bare, &branch, "wt-sync-dirty-other");
+        commit_in(&other, "theirs.txt", "a commit someone else pushed");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+
+        std::fs::write(p.path.join("a.txt"), "an edit the agent never committed").unwrap();
+        let head = head_of(&p.path);
+
+        assert!(matches!(ws.sync(&p.path, &branch, "origin"), Err(ForgeError::Permanent(_))));
+        assert_eq!(head_of(&p.path), head, "HEAD did not move under the edit");
+        assert!(!p.path.join("theirs.txt").exists(), "nothing was merged under it");
+
+        for d in [&root, &repo, &bare, &other] {
             std::fs::remove_dir_all(d).ok();
         }
     }
