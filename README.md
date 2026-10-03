@@ -242,6 +242,8 @@ concrete defects in that design: a continuation loop that could respawn every se
 that could overflow, permanent failures retried forever, a workspace deleted under a live
 worker. Each is a row in [docs/invariants.md](docs/invariants.md) with the test that fails
 without its fix; the later rows came from crewd working its own backlog.
+[docs/symphony.md](docs/symphony.md) quotes the spec's passage behind each of them, the failure
+it causes, and the test that proves crewd does not have it.
 
 Where it is headed: crewd is built to hold the guarantees a service manager holds, applied to
 coding-agent sessions, the way systemd runs services and containerd runs containers.
