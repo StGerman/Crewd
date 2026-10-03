@@ -285,6 +285,21 @@ fn dispatch_order_is_priority_then_age() {
     assert_eq!(running[0].identifier, "MT-3");
 }
 
+/// `/api/v1` promises `last_tick_at` is when the scheduler last ticked (docs/api-v1.md, #245),
+/// and a snapshot is also published before the first tick and on every repaint.
+#[test]
+fn last_tick_at_is_when_the_last_tick_ran_not_when_the_snapshot_was_taken() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    assert_eq!(h.sched.snapshot().unwrap().last_tick_at, None, "no tick has run yet");
+
+    h.sched.tick().unwrap();
+    let ticked = h.sched.snapshot().unwrap().generated_at;
+    h.clock.advance_ms(5_000);
+    let snap = h.sched.snapshot().unwrap();
+    assert_eq!(snap.last_tick_at, Some(ticked));
+    assert_eq!(snap.generated_at, ticked + 5_000);
+}
+
 // ---- outcomes ---------------------------------------------------------------
 
 #[test]
