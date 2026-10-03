@@ -225,11 +225,13 @@ agent somewhere unexpected, while removing the wrong directory recursively delet
 the launch check would have refused (an identifier that sanitization mishandles, a root changed
 by a config reload between launch and cleanup) reaches `rm -rf` unchecked.
 
-**crewd.** Every path leaving a `Workspace` implementation passes `guard_within`
-([src/workspace.rs](../src/workspace.rs)), which canonicalises the path's *parent* and refuses
-one whose parent is not under the canonical root. `prepare` and `remove` both call it, in `DirWorkspace` and in
-`GitWorktreeWorkspace`, and so do delivery's operations on a worktree. A refused path is
-`ErrorClass::WorkspaceOutsideRoot`, which is permanent (section 3).
+**crewd.** `prepare` and `remove`, in `DirWorkspace` and in `GitWorktreeWorkspace`, both pass
+the path through `guard_within` ([src/workspace.rs](../src/workspace.rs)), which canonicalises
+the path's *parent* and refuses one whose parent is not under the canonical root. A refused path
+is `ErrorClass::WorkspaceOutsideRoot`, which is permanent (section 3). `Workspace::path_for`
+itself is not guarded: delivery computes the worktree path with it, and the forge's `sync`,
+`publish` and `carries` each guard the path they are handed, but the gate that delivery re-runs
+in that worktree is started on it without a check of its own.
 
 **Invariant:** "A workspace path cannot escape its root". **Guard test:**
 `hostile_identifiers_stay_inside_the_root` ([src/workspace.rs](../src/workspace.rs)), with
