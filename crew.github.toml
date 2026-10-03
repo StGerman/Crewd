@@ -41,16 +41,20 @@ repo = "."
 # list is set.
 [[workers]]
 kind = "claude"
-max_concurrent = 1
+# Two on the $100 Max plan (2026-10-03): about 5x the old five-hour window, and #184 pauses
+# dispatch at 95% of it. Not more while M7's branches share src/main.rs and src/config.rs.
+max_concurrent = 2
 # Pinned so dogfood runs are reproducible and every run row names what did the work (#36).
 model = "claude-opus-5-5"
 effort = "medium"
 
+# Off until the Grok Build balance is topped up: a 402 "usage balance exhausted" reads as a crash
+# and quarantines each issue it touches.
 [[workers]]
 kind = "grok"
 max_concurrent = 1
 model = "grok-4.7"
-effort = "medium"
+effort = "high"
 
 [agent]
 # Each concurrent agent brings its own rust-analyzer index and its own `cargo check` — budget
@@ -173,7 +177,10 @@ enabled = true
 base = "master"
 remote = "origin"
 reviewers = ["copilot-pull-request-reviewer[bot]"]
-max_rounds_per_pr = 3
+# 5 since 2026-10-03: Copilot raises findings an earlier review missed, and M7's PRs hit 3 on
+# rounds that #268 (cancelled CI read red) and #269 (a self-merge) wasted. The issue-wide 6 is
+# still the cap.
+max_rounds_per_pr = 5
 max_rounds_per_issue = 6
 # A read of the pull request, its CI, reviews and comments per open pull request per poll, on
 # top of the tracker budget above.
