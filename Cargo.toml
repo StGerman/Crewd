@@ -5,6 +5,10 @@ members = [".", "libcrew", "crewctl"]
 default-members = [".", "libcrew", "crewctl"]
 resolver = "3"
 
+# One version for every package, so the build string each binary prints cannot drift (#244).
+[workspace.package]
+version = "0.1.0"
+
 # `deny`, not `forbid`: `forbid` cannot be lifted locally, and one test must set an environment
 # variable, which Rust 2024 makes `unsafe` (#50). Every other `unsafe` is a build error.
 [workspace.lints.rust]
@@ -12,7 +16,7 @@ unsafe_code = "deny"
 
 [package]
 name = "crewd"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 # `cargo run` means the daemon, as the quickstart in CLAUDE.md and the README assumes, even
 # though `default-members` also builds `crewctl`.

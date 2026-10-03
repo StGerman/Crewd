@@ -554,6 +554,15 @@ start. A live init event with those flags lists no MCP server of source `user`, 
 `plugin` or `claudeai`. What remains is the loopback HTTP API serving the same routes, which a
 same-user process can still call; only OS confinement (#135) closes that.
 
+**The build string** is `<version> (<short sha>[-dirty])`, the one string every surface reports
+for the build that is running (#244): `crewd --version`, `crewctl --version`, the daemon's
+`starting` log line, `Snapshot.build` and so the `crewctl status` header, and
+`serverInfo.version` from both MCP servers (set once, in `src/broker/server.rs`). It lives in
+`libcrew::build` because both binaries print it. The version is the workspace's single
+`[workspace.package] version`; the commit comes from `vergen-gitcl` in `libcrew/build.rs`, and a
+build with no git, such as a `cargo install` from crates.io, reports the version alone, which
+names exactly one tag. Without it, a restart that silently kept the old binary took a process
+listing and a log dig to find.
 
 **`crewd init`** ([src/init/](../src/init/)) registers the operator's own GitHub App through the
 App Manifest flow (#65): a loopback page posts the manifest to GitHub, the operator clicks

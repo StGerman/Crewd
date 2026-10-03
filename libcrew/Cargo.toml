@@ -1,6 +1,6 @@
 [package]
 name = "libcrew"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 # What the daemon and `crewctl` both need, and nothing else: the published snapshot types, the
@@ -17,3 +17,6 @@ insta = "1.48.0"
 
 [lints]
 workspace = true
+
+[build-dependencies]
+vergen-gitcl = "10.0.3"

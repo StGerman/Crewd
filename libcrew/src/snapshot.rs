@@ -60,6 +60,10 @@ pub struct Row {
 /// lives on [`Row`] rather than being read back out of the database by whoever wants it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// The daemon's build string ([`crate::build()`]), so `status` names the build that is
+    /// running rather than the one last installed. Empty from a daemon before #244.
+    #[serde(default)]
+    pub build: String,
     pub generated_at: i64,
     pub rows: Vec<Row>,
     /// Runs holding a slot, gating ones included — the scheduler's own count, not the agents

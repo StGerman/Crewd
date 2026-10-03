@@ -975,3 +975,50 @@ async fn unblocking_over_mcp_returns_a_parked_issue_to_service_and_reports_a_no_
     assert!(is_error);
     assert!(body["error"].as_str().unwrap().contains("MT-404"), "{body}");
 }
+
+#[tokio::test]
+async fn the_snapshot_and_both_mcp_server_infos_carry_the_build_string() {
+    // #244: every surface an operator might ask names the same build, so a restart that kept
+    // the old binary shows wherever they look.
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+    let build = libcrew::build();
+    assert!(!build.is_empty());
+    assert_eq!(h.sched.snapshot().unwrap().build, build);
+    let (_, body) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(body["build"], build, "and it travels on the wire");
+
+    let listener = broker::server::bind().unwrap();
+    let broker_addr = listener.local_addr().unwrap();
+    let broker = Arc::new(
+        Broker::new(
+            Arc::new(FakeWrites::new()),
+            h.clock.clone(),
+            BrokerLimits::default(),
+            vec!["in progress".into()],
+            broker_addr,
+            h.root.join("mcp-configs"),
+        )
+        .unwrap(),
+    );
+    broker::server::serve(Arc::clone(&broker), listener).unwrap();
+    let session = broker.open(&issue(1, "In Progress"), "run-1").unwrap();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(&session.endpoint().config_path).unwrap()).unwrap();
+    let url = config["mcpServers"].as_object().unwrap().values().next().unwrap()["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let worker_path = format!("/{}", url.trim_start_matches("http://").split_once('/').unwrap().1);
+
+    let ops_addr = h.mcp_addr;
+    let versions = tokio::task::spawn_blocking(move || {
+        [(ops_addr, mcp::PATH.to_string()), (broker_addr, worker_path)].map(|(addr, path)| {
+            let init = McpConn::open(addr, &path).rpc("initialize", json!({}));
+            init["result"]["serverInfo"]["version"].clone()
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(versions, [json!(build), json!(build)], "the ops server, then the broker");
+}
