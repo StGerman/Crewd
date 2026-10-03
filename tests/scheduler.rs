@@ -5603,6 +5603,68 @@ fn a_handed_off_ticket_moved_between_active_states_is_not_dispatched() {
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
 }
 
+/// #266: an unblock resumes a handed-off delivery at `awaiting` or `pending` and keeps the
+/// ticket's park. Once the ticket has moved, a park guarded only while `handed_off` would be
+/// lifted by the next tick that waits on CI, and an ordinary worker would start beside the pull
+/// request without its review feedback and outside the round bounds.
+#[test]
+fn a_resumed_delivery_whose_ticket_moved_state_starts_no_ordinary_worker_while_ci_is_pending() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["alice".into()];
+            c.tracker.active_states = vec!["in progress".into(), "in review".into()];
+        },
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    h.tracker.set_state("iss-1", "In Review");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    forge.set_attach_reviewers(true);
+    forge.set_ci_default(Some(CiStatus::Pending { running: vec!["ci".into()] }));
+    assert!(h.sched.unblock("iss-1").unwrap().cleared());
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Awaiting, "{d:?}");
+    assert_eq!((d.rounds_pr, d.rounds_issue), (0, 0), "no round is charged");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "no ordinary worker starts");
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+}
+
+/// #266: a `ready` pull request is the operator's to merge. A ticket moved between active
+/// states while it waits does not lift the park; only a merge or a close releases the issue.
+#[test]
+fn a_ready_delivery_keeps_its_park_when_the_ticket_moves_between_active_states() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.tracker.active_states = vec!["in progress".into(), "in review".into()],
+    );
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    h.tracker.set_state("iss-1", "In Review");
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "no run is dispatched");
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+    assert_eq!(forge.open_prs().len(), 1);
+}
+
 /// Review on #264: a resumed delivery's round is a retry, and `dispatch_due_retries` drops one
 /// for a ticket that has lost its dispatch marker, leaving the delivery `redispatched` with
 /// nothing running and nothing polling it. So the unblock refuses, and the handoff stands.
