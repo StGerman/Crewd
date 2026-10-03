@@ -239,12 +239,19 @@ fn unit_safe(name: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' })
         .collect();
-    if safe == name && !safe.trim_matches('.').is_empty() {
+    if safe == name && !safe.trim_matches('.').is_empty() && safe.len() <= NAME_MAX {
         return safe;
     }
     let digest: String = blake3::hash(name.as_bytes()).to_hex().chars().take(8).collect();
-    format!("{}-{digest}", safe.trim_matches('.'))
+    // `safe` is ASCII, so any byte index is a char boundary.
+    let kept = &safe.trim_matches('.')[..safe.trim_matches('.').len().min(NAME_MAX - 9)];
+    format!("{kept}-{digest}")
 }
+
+/// The longest name [`unit_safe`] returns: systemd refuses a unit name over 255 bytes, and the
+/// definition's file name, `dev.crewd.<name>.service`, has to fit the same component limit
+/// most filesystems set, so a valid 255-byte directory name must not make it uncreatable.
+const NAME_MAX: usize = 255 - LABEL_PREFIX.len() - ".service".len();
 
 /// Everything the service definition says, before anything is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -730,6 +737,16 @@ mod tests {
             ["install dev.crewd.acme-api", "daemon-reload", "start dev.crewd.acme-api"]
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_name_too_long_for_a_unit_file_is_cut_and_keeps_its_digest() {
+        let long = "a".repeat(255);
+        let name = unit_safe(&long);
+        let file = format!("{LABEL_PREFIX}{name}.service");
+        assert_eq!(file.len(), 255, "{file}");
+        assert_ne!(unit_safe(&"a".repeat(254)), name, "two long names stay distinct");
+        assert_eq!(unit_safe("acme-api"), "acme-api");
     }
 
     #[test]
