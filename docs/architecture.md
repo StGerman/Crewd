@@ -672,7 +672,9 @@ The lease is a ref crewd owns, `refs/crew/lease/<branch>`, written by `Publisher
 worktree never had, so the push replaced an operator's merge instead of refusing. `sync` runs
 before every agent run (`launch`), every re-gate and every delivery push, and before the gate of
 a run that reported `Done`, because an agent can push its own branch and the lease would not
-name that head once the gate rebased it (#269). It fetches the branch.
+name that head once the gate rebased it (#269); a fetched head the branch's own reflog
+reaches was held by the worktree too, so a pre-gate sync that failed does not bring the defect
+back. It fetches the branch.
 When the fetched head is the one the lease already names, the remote has not moved since the
 last sync or publish. A divergence is a local rewrite of commits the worktree already held —
 the gate rebasing onto a base that moved — so the worktree

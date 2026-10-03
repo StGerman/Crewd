@@ -6212,10 +6212,7 @@ fn rebase_onto_moved_base(repo: &Path, worktree: &Path) -> String {
     git_out(worktree, &["rev-parse", "HEAD"]).unwrap()
 }
 
-/// #269 on #247: the agent pushed its own branch, the gate rebased it and failed, and the sync
-/// before the next run read that push as someone else's — the lease named only crewd's pushes —
-/// and merged the pre-rebase copy back in, so every later rebase replayed both and conflicted
-/// with itself. Synced when the run reports `Done`, the push is recorded before it is rewritten.
+/// #269: a head the agent pushed itself is not merged back after the gate rebases it.
 #[test]
 fn a_branch_the_gate_rebased_is_not_merged_with_its_own_earlier_push_at_the_next_dispatch() {
     let (dir, bare, repo, mut h, gate) = real_git_gated_delivery("gate-rebased-own-push");

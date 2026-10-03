@@ -65,14 +65,9 @@ impl Scheduler {
         publisher.sync(worktree, branch, &self.cfg.delivery.remote).map(Some)
     }
 
-    /// Sync the worktree of a run that reported `Done`, before the gate rebases it (#269).
-    ///
-    /// The lease names only heads crewd synced or published, and an agent can push its branch
-    /// itself: once the gate rewrote that push, the next sync read it as someone else's and
-    /// merged the pre-rebase copy back, so every later rebase replayed both. Synced now, while
-    /// the push is still an ancestor of the worktree's head, it is recorded as incorporated. A
-    /// conflict or a failure leaves the lease where it was, and the sync before the next run or
-    /// push reports it.
+    /// Sync the worktree of a run that reported `Done`, before the gate rebases it, so a head
+    /// the agent pushed itself is the lease before the rebase rewrites it (#269). A conflict or
+    /// a failure leaves the lease where it was for the sync before the next run or push.
     pub(super) fn sync_before_gate(&self, issue_id: &str, worktree: &Path) {
         let branch = match self.store.get(issue_id) {
             Ok(st) => st.and_then(|s| s.branch),

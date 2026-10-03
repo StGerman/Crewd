@@ -1298,7 +1298,23 @@ impl Publisher for GitWorktreeWorkspace {
         // and the push replaces it. A head the lease does not name is still merged (#163).
         let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &lease_ref])
             .unwrap_or_default();
-        let remote_unchanged = lease == remote_head;
+        // The lease misses a head the agent pushed itself, and a sync that fails before the gate
+        // rewrites it cannot record it (#269). The branch's own reflog names every head the
+        // worktree held, so a fetched head reachable from one of them was already incorporated.
+        // A reflog that cannot be read holds nothing, and the head is merged as before.
+        let held = || {
+            let Ok(log) = Self::git(worktree, &["log", "-g", "--format=%H", &full]) else {
+                return false;
+            };
+            let tips: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+            if tips.is_empty() {
+                return false;
+            }
+            let mut args = vec!["rev-list", "--count", remote_head.as_str(), "--not"];
+            args.extend(tips);
+            Self::git(worktree, &args).is_ok_and(|n| n.trim() == "0")
+        };
+        let remote_unchanged = lease == remote_head || held();
 
         let synced = if is_ancestor(&remote_head, "HEAD") || remote_unchanged {
             Synced::Current { remote_head: remote_head.clone() }
@@ -3230,6 +3246,38 @@ mod tests {
         assert!(!p.path.join("theirs.txt").exists(), "nothing was merged over it");
 
         for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// #269: a head the agent pushed itself, never synced before the gate rewrote it, is the
+    /// worktree's own and is replaced, not merged back.
+    #[test]
+    fn a_head_the_agent_pushed_itself_and_the_gate_rebased_is_not_merged_back() {
+        let root = tmp_root("wt-rebase-agent-push");
+        let (repo, bare) = repo_with_remote("wt-rebase-agent-push");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the agent's change");
+        git_out(&p.path, &["push", "-q", "origin", &branch]).unwrap();
+        let pushed = head_of(&p.path);
+
+        commit_in(&repo, "base.txt", "base moved");
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["fetch", "-q", "origin", "main"]).unwrap();
+        git_out(&p.path, &["rebase", "-q", "FETCH_HEAD"]).unwrap();
+        let rebased = head_of(&p.path);
+
+        assert_eq!(
+            ws.sync(&p.path, &branch, "origin").unwrap(),
+            Synced::Current { remote_head: pushed }
+        );
+        assert_eq!(head_of(&p.path), rebased, "the rebase is kept and nothing merged into it");
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.head_sha, rebased, "the push replaces the agent's own earlier head");
+
+        for d in [&root, &repo, &bare] {
             std::fs::remove_dir_all(d).ok();
         }
     }
